@@ -1,0 +1,23 @@
+[package]
+name = "ccstatus"
+version = "0.1.0"
+edition = "2024"
+description = "Fast Rust port of daniel3303/ClaudeCodeStatusLine"
+repository = "https://github.com/folded/ccstatus-rs"
+license = "MIT"
+keywords = ["claude", "claude-code", "statusline", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
