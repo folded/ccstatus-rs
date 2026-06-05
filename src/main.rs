@@ -5,6 +5,7 @@ mod color;
 mod format;
 mod git;
 mod heatmap;
+mod install;
 mod oauth;
 mod term;
 
@@ -27,6 +28,15 @@ const SELF_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn main() -> ExitCode {
     let cfg = match cli::parse_args(env::args().skip(1)) {
         ParseOutcome::Run(c) => c,
+        ParseOutcome::Install => {
+            return match install::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(msg) => {
+                    eprintln!("ccstatus: {msg}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         ParseOutcome::Help => {
             print!("{}", cli::HELP);
             return ExitCode::SUCCESS;

@@ -36,6 +36,7 @@ impl Default for Config {
 
 pub enum ParseOutcome {
     Run(Config),
+    Install,
     Help,
     Version,
     Error(String),
@@ -58,6 +59,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--heatmap" => cfg.heatmap = true,
             "--updates" => cfg.updates = true,
             "--no-updates" => cfg.updates = false,
+            "--install" => return ParseOutcome::Install,
             "-h" | "--help" => return ParseOutcome::Help,
             "-V" | "--version" => return ParseOutcome::Version,
             other => return ParseOutcome::Error(format!("unknown argument: {other}")),
@@ -83,6 +85,7 @@ Options:
   --no-heatmap      Hide the per-day token-usage heatmap rows
   --updates         Check for newer ccstatus releases (off by default)
   --no-updates      Disable update check (default)
+  --install         Wire this binary into ~/.claude/settings.json and exit
   -h, --help        Show this help and exit
   -V, --version     Show ccstatus version and exit
 

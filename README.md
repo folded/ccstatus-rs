@@ -8,37 +8,28 @@ two-row token-usage heatmap) on stdout.
 
 ## Install
 
-With a Rust toolchain (stable):
+Two steps with a Rust toolchain (stable):
 
 ```sh
 cargo install --git https://github.com/folded/ccstatus-rs --locked
+ccstatus --install
 ```
 
-This drops a `ccstatus` binary into `~/.cargo/bin/` (make sure that's on
-`PATH`).
+The first command drops a `ccstatus` binary into `~/.cargo/bin/` (make sure
+that's on `PATH`). The second writes `statusLine.command` into
+`~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`), preserving any
+other keys already in the file. Re-running `ccstatus --install` after an
+upgrade refreshes the path; it refuses to clobber a `statusLine` set to a
+non-`ccstatus` command.
 
-To update later, rerun the same command.
-
-## Wire into Claude Code
-
-Edit `~/.claude/settings.json` and point the status line at the binary:
+To customise which blocks render, edit `statusLine.command` in
+`settings.json` afterwards:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "ccstatus"
-  }
-}
-```
-
-Add CLI flags to disable features you don't want:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "ccstatus --no-heatmap --no-cli-version"
+    "command": "/Users/you/.cargo/bin/ccstatus --no-heatmap --no-cli-version"
   }
 }
 ```
@@ -54,6 +45,7 @@ Add CLI flags to disable features you don't want:
 --no-cli-version  Hide installed Claude CLI version
 --no-heatmap      Hide the per-day token-usage heatmap rows
 --updates         Check for newer ccstatus releases (off by default)
+--install         Wire this binary into ~/.claude/settings.json and exit
 -h, --help        Show help
 -V, --version     Show version
 ```
