@@ -10,6 +10,7 @@
 
 use std::process::ExitCode;
 
+use crate::color::{DIM, GREEN, RED, RESET, WHITE};
 use crate::format::shorten_model_name;
 use crate::state::{self, PaneState, SessionState};
 use crate::tmux;
@@ -22,7 +23,12 @@ const WARM_THRESHOLD_SECS: i64 = 270;
 
 #[derive(Debug, Clone, Copy)]
 pub enum RenderFlavor {
+    /// Compact warm/cold/idle line using tmux format strings.
     Row,
+    /// Nth pre-rendered line from pane state (raw ANSI, as produced by
+    /// the standard render). Line 0 additionally appends the current
+    /// warmth indicator.
+    Line(usize),
 }
 
 pub fn run(flavor: RenderFlavor, pane_id: &str) -> ExitCode {
@@ -43,7 +49,39 @@ fn build_line(flavor: RenderFlavor, pane_id: &str) -> String {
     let session = state::read_session(&pane.session_id).unwrap_or_default();
     match flavor {
         RenderFlavor::Row => format_row(&pane, &session),
+        RenderFlavor::Line(n) => format_stashed_line(&pane, &session, n),
     }
+}
+
+/// Pull the Nth pre-rendered line. Line 0 (the rich line) gets warmth
+/// appended; subsequent lines (heatmap rows) are emitted verbatim.
+fn format_stashed_line(pane: &PaneState, session: &SessionState, n: usize) -> String {
+    let Some(base) = pane.lines.get(n) else {
+        return String::new();
+    };
+    if n == 0 {
+        let mut out = base.clone();
+        if let Some(suffix) = warmth_ansi_suffix(session) {
+            out.push_str(&suffix);
+        }
+        out
+    } else {
+        base.clone()
+    }
+}
+
+fn warmth_ansi_suffix(session: &SessionState) -> Option<String> {
+    let ts = session.last_turn_ts?;
+    let idle = (now_unix() - ts).max(0);
+    let (label, color) = if idle < WARM_THRESHOLD_SECS {
+        ("warm", GREEN)
+    } else {
+        ("cold", RED)
+    };
+    Some(format!(
+        " {DIM}|{RESET} {WHITE}idle{RESET} {}  {DIM}|{RESET} {color}{label}{RESET}",
+        format_duration(idle)
+    ))
 }
 
 fn format_row(_pane: &PaneState, session: &SessionState) -> String {

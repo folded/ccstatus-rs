@@ -36,6 +36,11 @@ pub struct PaneState {
     pub transcript_path: Option<String>,
     pub registered_at: i64,
     pub last_warmth: Option<String>,
+    /// Pre-rendered output lines from the registrar, one per logical row
+    /// of the original statusline (rich line + any heatmap rows). The
+    /// tmux renderer can pull each line independently to populate a
+    /// separate status row.
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -63,6 +68,15 @@ pub fn session_path(session_id: &str) -> PathBuf {
 pub fn read_pane(server_id: &str, pane_id: &str) -> Option<PaneState> {
     let text = std::fs::read_to_string(pane_path(server_id, pane_id)).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
+    let lines = v
+        .get("lines")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(PaneState {
         session_id: v.get("session_id")?.as_str()?.to_string(),
         claude_pid: u32::try_from(v.get("claude_pid")?.as_u64()?).ok()?,
@@ -76,6 +90,7 @@ pub fn read_pane(server_id: &str, pane_id: &str) -> Option<PaneState> {
             .get("last_warmth")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        lines,
     })
 }
 
@@ -87,6 +102,7 @@ pub fn write_pane(server_id: &str, pane_id: &str, s: &PaneState) -> std::io::Res
         "transcript_path": s.transcript_path,
         "registered_at": s.registered_at,
         "last_warmth": s.last_warmth,
+        "lines": s.lines,
     });
     cache::write_atomic(&pane_path(server_id, pane_id), &v.to_string())
 }

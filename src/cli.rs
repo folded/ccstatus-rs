@@ -83,6 +83,24 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--render-tmux" => {
                 let flavor = match iter.next().as_deref() {
                     Some("row") => RenderFlavor::Row,
+                    Some("line") => {
+                        let n = match iter.next() {
+                            Some(s) => match s.parse::<usize>() {
+                                Ok(n) => n,
+                                Err(_) => {
+                                    return ParseOutcome::Error(format!(
+                                        "--render-tmux line: not an integer: {s}"
+                                    ));
+                                }
+                            },
+                            None => {
+                                return ParseOutcome::Error(
+                                    "--render-tmux line requires an index and pane id".into(),
+                                );
+                            }
+                        };
+                        RenderFlavor::Line(n)
+                    }
                     Some(other) => {
                         return ParseOutcome::Error(format!(
                             "unknown --render-tmux flavor: {other}"
@@ -132,7 +150,8 @@ Options:
   --install         Wire this binary into ~/.claude/settings.json and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop)
   --render-tmux <flavor> <pane_id>
-                    Emit a tmux status line for the given pane (flavors: row)
+                    Emit a tmux status line for the given pane.
+                    Flavors: row | line <N>
   -h, --help        Show this help and exit
   -V, --version     Show ccstatus version and exit
 

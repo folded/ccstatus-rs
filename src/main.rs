@@ -76,15 +76,16 @@ fn main() -> ExitCode {
 
     let _ = cache::ensure_cache_dir();
 
+    let out = render(&input, &cfg);
+
     if let Some(pane_id) = active_tmux_pane() {
-        register_pane(&input, &pane_id);
-        // Fall through and still render the full line. The Claude statusline
-        // and the tmux row 1 show complementary data: the rich, mostly-static
-        // fields (model, cwd, tokens, rate limits, heatmap) live here; the
-        // time-sensitive cache-warmth indicator lives in the tmux row.
+        let lines: Vec<String> = out.split('\n').map(str::to_string).collect();
+        register_pane(&input, &pane_id, lines);
+        // tmux owns the visible display via its own status rows; emit
+        // nothing here so the Claude statusline row stays clear.
+        return ExitCode::SUCCESS;
     }
 
-    let out = render(&input, &cfg);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let _ = handle.write_all(out.as_bytes());
@@ -103,7 +104,7 @@ fn active_tmux_pane() -> Option<String> {
 /// `status-interval`) can show a live indicator. Coalesces writes that
 /// arrive within 500 ms of an identical prior write so a streaming
 /// statusline call doesn't hammer the filesystem.
-fn register_pane(input: &Value, pane_id: &str) {
+fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) {
     let Some(session_id) = resolve_session_id(input) else {
         return;
     };
@@ -118,6 +119,7 @@ fn register_pane(input: &Value, pane_id: &str) {
     if let Some(existing) = state::read_pane(&server_id, pane_id) {
         if existing.session_id == session_id
             && existing.claude_pid == claude_pid
+            && existing.lines == lines
             && pane_recent(&server_id, pane_id, Duration::from_millis(500))
         {
             return;
@@ -131,6 +133,7 @@ fn register_pane(input: &Value, pane_id: &str) {
         transcript_path,
         registered_at: now_unix(),
         last_warmth: None,
+        lines,
     };
     let _ = state::write_pane(&server_id, pane_id, &pane_state);
 }
