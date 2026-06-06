@@ -10,7 +10,7 @@
 
 use std::process::ExitCode;
 
-use crate::color::{DIM, GREEN, RED, RESET, WHITE};
+use crate::color::{DIM, GREEN, RED, RESET};
 use crate::format::shorten_model_name;
 use crate::state::{self, PaneState, SessionState};
 use crate::tmux;
@@ -146,10 +146,7 @@ fn warmth_ansi_suffix(session: &SessionState) -> Option<String> {
     } else {
         ("cold", RED)
     };
-    Some(format!(
-        " {DIM}|{RESET} {WHITE}idle{RESET} {}  {DIM}|{RESET} {color}{label}{RESET}",
-        format_duration(idle)
-    ))
+    Some(format!(" {DIM}|{RESET} {color}{label}{RESET}"))
 }
 
 fn format_row(_pane: &PaneState, session: &SessionState) -> String {
@@ -175,8 +172,6 @@ fn format_row(_pane: &PaneState, session: &SessionState) -> String {
             ("cold", "red")
         };
         push_sep(&mut out);
-        out.push_str(&format!("idle {}", format_duration(idle)));
-        push_sep(&mut out);
         out.push_str(&format!("#[fg={color}]{warmth}#[default]"));
     }
 
@@ -185,12 +180,6 @@ fn format_row(_pane: &PaneState, session: &SessionState) -> String {
 
 fn push_sep(out: &mut String) {
     out.push_str(" #[fg=brightblack]|#[default] ");
-}
-
-fn format_duration(secs: i64) -> String {
-    let m = secs / 60;
-    let s = secs % 60;
-    format!("{m:02}:{s:02}")
 }
 
 /// Escape `#` so tmux doesn't reinterpret literal text as a format
@@ -202,15 +191,6 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn duration_formats_mm_ss() {
-        assert_eq!(format_duration(0), "00:00");
-        assert_eq!(format_duration(59), "00:59");
-        assert_eq!(format_duration(60), "01:00");
-        assert_eq!(format_duration(125), "02:05");
-        assert_eq!(format_duration(3725), "62:05");
-    }
 
     #[test]
     fn escape_doubles_hash() {
