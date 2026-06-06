@@ -1,6 +1,7 @@
 use std::env;
 
 use crate::hooks::HookKind;
+use crate::render_tmux::RenderFlavor;
 
 pub struct Config {
     pub cwd: bool,
@@ -39,6 +40,7 @@ impl Default for Config {
 pub enum ParseOutcome {
     Run(Config),
     Hook(HookKind),
+    Render(RenderFlavor, String),
     Install,
     Help,
     Version,
@@ -78,6 +80,30 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 };
                 return ParseOutcome::Hook(kind);
             }
+            "--render-tmux" => {
+                let flavor = match iter.next().as_deref() {
+                    Some("row") => RenderFlavor::Row,
+                    Some(other) => {
+                        return ParseOutcome::Error(format!(
+                            "unknown --render-tmux flavor: {other}"
+                        ));
+                    }
+                    None => {
+                        return ParseOutcome::Error(
+                            "--render-tmux requires <flavor> <pane_id>".into(),
+                        );
+                    }
+                };
+                let pane_id = match iter.next() {
+                    Some(p) if !p.is_empty() => p,
+                    _ => {
+                        return ParseOutcome::Error(
+                            "--render-tmux requires a <pane_id> argument".into(),
+                        );
+                    }
+                };
+                return ParseOutcome::Render(flavor, pane_id);
+            }
             "-h" | "--help" => return ParseOutcome::Help,
             "-V" | "--version" => return ParseOutcome::Version,
             other => return ParseOutcome::Error(format!("unknown argument: {other}")),
@@ -105,6 +131,8 @@ Options:
   --no-updates      Disable update check (default)
   --install         Wire this binary into ~/.claude/settings.json and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop)
+  --render-tmux <flavor> <pane_id>
+                    Emit a tmux status line for the given pane (flavors: row)
   -h, --help        Show this help and exit
   -V, --version     Show ccstatus version and exit
 

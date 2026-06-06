@@ -8,6 +8,7 @@ mod heatmap;
 mod hooks;
 mod install;
 mod oauth;
+mod render_tmux;
 mod state;
 mod term;
 mod util;
@@ -34,6 +35,7 @@ fn main() -> ExitCode {
     let cfg = match cli::parse_args(env::args().skip(1)) {
         ParseOutcome::Run(c) => c,
         ParseOutcome::Hook(kind) => return hooks::run(kind),
+        ParseOutcome::Render(flavor, pane_id) => return render_tmux::run(flavor, &pane_id),
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,
