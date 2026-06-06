@@ -258,7 +258,12 @@ fn render(input: &Value, cfg: &Config) -> String {
     }
 
     let cols = term::columns(120);
-    let heatmap_result = if cfg.heatmap { heatmap::render(cwd, cols) } else { None };
+    let transcript_path = input.get("transcript_path").and_then(|v| v.as_str());
+    let heatmap_result = if cfg.heatmap {
+        heatmap::render(cwd, transcript_path, cols)
+    } else {
+        None
+    };
 
     if cfg.tokens {
         let cache_pct = {

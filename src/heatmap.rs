@@ -47,7 +47,7 @@ impl Default for Aggregates {
     }
 }
 
-pub fn render(cwd: &str, term_cols: u16) -> Option<HeatmapResult> {
+pub fn render(cwd: &str, transcript_path: Option<&str>, term_cols: u16) -> Option<HeatmapResult> {
     if cwd.is_empty() {
         return None;
     }
@@ -63,7 +63,8 @@ pub fn render(cwd: &str, term_cols: u16) -> Option<HeatmapResult> {
     let data = match cached {
         Some(c) => c,
         None => {
-            let aggs = scan_project(cwd, today)?;
+            let dir = resolve_project_dir(cwd, transcript_path)?;
+            let aggs = scan_project(&dir, today)?;
             let computed = CachedHeatmap::from_aggregates(aggs);
             let _ = cache::write_atomic(&cache_path, &computed.serialize());
             computed
@@ -127,17 +128,31 @@ fn project_subdir(cwd: &str) -> PathBuf {
         .join(encoded)
 }
 
-fn scan_project(cwd: &str, today: NaiveDate) -> Option<Aggregates> {
-    let dir = project_subdir(cwd);
-    if !dir.exists() {
-        return None;
+/// Pick the project directory whose transcripts we'll scan. `transcript_path`
+/// from the per-render payload is authoritative — it's exactly where Claude
+/// Code is writing this session's records, regardless of `/add-dir` or any
+/// later cwd changes. If that's missing or malformed, fall back to the
+/// cwd-encoded path (Claude's own naming convention) so isolated invocations
+/// still work.
+fn resolve_project_dir(cwd: &str, transcript_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(t) = transcript_path {
+        if let Some(parent) = PathBuf::from(t).parent() {
+            if parent.exists() {
+                return Some(parent.to_path_buf());
+            }
+        }
     }
+    let sub = project_subdir(cwd);
+    if sub.exists() { Some(sub) } else { None }
+}
+
+fn scan_project(dir: &Path, today: NaiveDate) -> Option<Aggregates> {
     let mut aggs = Aggregates::default();
-    walk(&dir, cwd, today, &mut aggs);
+    walk(dir, today, &mut aggs);
     Some(aggs)
 }
 
-fn walk(dir: &Path, cwd: &str, today: NaiveDate, aggs: &mut Aggregates) {
+fn walk(dir: &Path, today: NaiveDate, aggs: &mut Aggregates) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -149,7 +164,7 @@ fn walk(dir: &Path, cwd: &str, today: NaiveDate, aggs: &mut Aggregates) {
             Err(_) => continue,
         };
         if ft.is_dir() {
-            walk(&path, cwd, today, aggs);
+            walk(&path, today, aggs);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             let file = match fs::File::open(&path) {
                 Ok(f) => f,
@@ -157,20 +172,17 @@ fn walk(dir: &Path, cwd: &str, today: NaiveDate, aggs: &mut Aggregates) {
             };
             let reader = BufReader::new(file);
             for line in reader.lines().map_while(Result::ok) {
-                ingest_line(&line, cwd, today, aggs);
+                ingest_line(&line, today, aggs);
             }
         }
     }
 }
 
-fn ingest_line(line: &str, cwd: &str, today: NaiveDate, aggs: &mut Aggregates) {
+fn ingest_line(line: &str, today: NaiveDate, aggs: &mut Aggregates) {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return,
     };
-    if v.get("cwd").and_then(|x| x.as_str()) != Some(cwd) {
-        return;
-    }
     let ts_str = match v.get("timestamp").and_then(|x| x.as_str()) {
         Some(s) => s,
         None => return,
