@@ -41,6 +41,9 @@ pub enum ParseOutcome {
     Run(Config),
     Hook(HookKind),
     Render(RenderFlavor, String),
+    /// Recompute the tmux status-row count for the focused pane and tell
+    /// the running tmux server. Argument is `#{pane_id}`.
+    TmuxOnFocus(String),
     Install,
     Help,
     Version,
@@ -66,6 +69,17 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--updates" => cfg.updates = true,
             "--no-updates" => cfg.updates = false,
             "--install" => return ParseOutcome::Install,
+            "--tmux-on-focus" => {
+                let pane_id = match iter.next() {
+                    Some(p) if !p.is_empty() => p,
+                    _ => {
+                        return ParseOutcome::Error(
+                            "--tmux-on-focus requires a <pane_id> argument".into(),
+                        );
+                    }
+                };
+                return ParseOutcome::TmuxOnFocus(pane_id);
+            }
             "--hook" => {
                 let kind = match iter.next().as_deref() {
                     Some("stop") => HookKind::Stop,
@@ -152,6 +166,10 @@ Options:
   --render-tmux <flavor> <pane_id>
                     Emit a tmux status line for the given pane.
                     Flavors: row | line <N>
+  --tmux-on-focus <pane_id>
+                    Resize the tmux status bar based on whether the focused
+                    pane has a registered Claude session. Run from a tmux
+                    pane-focus-in hook.
   -h, --help        Show this help and exit
   -V, --version     Show ccstatus version and exit
 

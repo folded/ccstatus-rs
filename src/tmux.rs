@@ -1,8 +1,20 @@
 //! Helpers for inspecting the tmux environment.
 
 use std::env;
+use std::process::{Command, ExitCode};
 
 use sha2::{Digest, Sha256};
+
+use crate::state;
+
+/// Number of status rows when the focused pane is hosting a Claude
+/// session: 1 row for the existing powerline window list, plus 3 rows of
+/// ccstatus rich output.
+const ROWS_WITH_CLAUDE: u32 = 4;
+
+/// Number of status rows when there's no Claude session: just the
+/// powerline window list. The ccstatus rows collapse out of view.
+const ROWS_WITHOUT_CLAUDE: u32 = 1;
 
 /// Stable 8-char identifier for the current tmux server, derived from the
 /// socket path in `$TMUX` (`socket_path,server_pid,session_id`).
@@ -17,6 +29,31 @@ pub fn server_id() -> Option<String> {
         return None;
     }
     Some(short_hash(socket))
+}
+
+/// Set the tmux server's `status` option to match whether the focused
+/// pane carries a Claude session. Invoked from a `pane-focus-in` hook so
+/// that the rich ccstatus rows only consume vertical space when they
+/// have something to show.
+pub fn on_focus(pane_id: &str) -> ExitCode {
+    let target = if pane_has_claude(pane_id) {
+        ROWS_WITH_CLAUDE
+    } else {
+        ROWS_WITHOUT_CLAUDE
+    };
+    // tmux short-circuits if the value already matches, so this is cheap
+    // to call on every focus event.
+    let _ = Command::new("tmux")
+        .args(["set-option", "-g", "status", &target.to_string()])
+        .status();
+    ExitCode::SUCCESS
+}
+
+fn pane_has_claude(pane_id: &str) -> bool {
+    match server_id() {
+        Some(s) => state::read_pane(&s, pane_id).is_some(),
+        None => false,
+    }
 }
 
 fn short_hash(s: &str) -> String {

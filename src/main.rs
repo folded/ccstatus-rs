@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         ParseOutcome::Run(c) => c,
         ParseOutcome::Hook(kind) => return hooks::run(kind),
         ParseOutcome::Render(flavor, pane_id) => return render_tmux::run(flavor, &pane_id),
+        ParseOutcome::TmuxOnFocus(pane_id) => return tmux::on_focus(&pane_id),
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,
