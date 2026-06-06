@@ -12,6 +12,7 @@ use std::process::ExitCode;
 
 use crate::format::shorten_model_name;
 use crate::state::{self, PaneState, SessionState};
+use crate::tmux;
 use crate::util::now_unix;
 
 /// Threshold at which we flip the indicator from `warm` to `cold`. Sits a
@@ -33,7 +34,10 @@ pub fn run(flavor: RenderFlavor, pane_id: &str) -> ExitCode {
 }
 
 fn build_line(flavor: RenderFlavor, pane_id: &str) -> String {
-    let Some(pane) = state::read_pane(pane_id) else {
+    let Some(server_id) = tmux::server_id() else {
+        return String::new();
+    };
+    let Some(pane) = state::read_pane(&server_id, pane_id) else {
         return String::new();
     };
     let session = state::read_session(&pane.session_id).unwrap_or_default();
@@ -109,7 +113,16 @@ mod tests {
     }
 
     #[test]
-    fn row_when_no_pane_state_is_empty() {
-        assert_eq!(build_line(RenderFlavor::Row, "%nonexistent-pane-xyz"), "");
+    fn row_when_no_tmux_env_is_empty() {
+        // build_line short-circuits when $TMUX is unset; running tests
+        // outside of tmux should produce no output regardless of pane id.
+        let saved = std::env::var("TMUX").ok();
+        // Safety: tests run single-threaded by default for env mutation here.
+        unsafe { std::env::remove_var("TMUX") };
+        let out = build_line(RenderFlavor::Row, "%nonexistent-pane-xyz");
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("TMUX", v) };
+        }
+        assert_eq!(out, "");
     }
 }

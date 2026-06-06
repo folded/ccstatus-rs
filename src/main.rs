@@ -11,6 +11,7 @@ mod oauth;
 mod render_tmux;
 mod state;
 mod term;
+mod tmux;
 mod util;
 
 use std::env;
@@ -102,10 +103,10 @@ fn active_tmux_pane() -> Option<String> {
 /// arrive within 500 ms of an identical prior write so a streaming
 /// statusline call doesn't hammer the filesystem.
 fn register_pane(input: &Value, pane_id: &str) {
-    let session_id = match resolve_session_id(input) {
-        Some(s) => s,
-        None => return,
+    let Some(session_id) = resolve_session_id(input) else {
+        return;
     };
+    let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
     let claude_pid = resolve_claude_pid();
     let pane_tty = query_pane_tty(pane_id);
     let transcript_path = input
@@ -113,10 +114,10 @@ fn register_pane(input: &Value, pane_id: &str) {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    if let Some(existing) = state::read_pane(pane_id) {
+    if let Some(existing) = state::read_pane(&server_id, pane_id) {
         if existing.session_id == session_id
             && existing.claude_pid == claude_pid
-            && pane_recent(pane_id, Duration::from_millis(500))
+            && pane_recent(&server_id, pane_id, Duration::from_millis(500))
         {
             return;
         }
@@ -130,7 +131,7 @@ fn register_pane(input: &Value, pane_id: &str) {
         registered_at: now_unix(),
         last_warmth: None,
     };
-    let _ = state::write_pane(pane_id, &pane_state);
+    let _ = state::write_pane(&server_id, pane_id, &pane_state);
 }
 
 /// Walk up the process tree from our parent until `comm` matches `claude`,
@@ -186,8 +187,8 @@ fn query_pane_tty(pane_id: &str) -> String {
     }
 }
 
-fn pane_recent(pane_id: &str, window: Duration) -> bool {
-    let meta = match fs::metadata(state::pane_path(pane_id)) {
+fn pane_recent(server_id: &str, pane_id: &str, window: Duration) -> bool {
+    let meta = match fs::metadata(state::pane_path(server_id, pane_id)) {
         Ok(m) => m,
         Err(_) => return false,
     };

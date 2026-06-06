@@ -1,12 +1,17 @@
 //! Persistent per-pane and per-session state shared between the registrar,
 //! hook, and tmux-renderer modes.
 //!
-//! Files live under [`crate::cache::cache_dir`] (`/tmp/claude`):
+//! Files live under [`crate::cache::cache_dir`] (`/tmp/ccstatus-<uid>`):
 //!
 //! ```text
-//! /tmp/claude/pane/<TMUX_PANE>.json     written by registrar mode
-//! /tmp/claude/session/<session_id>.json written by hook mode
+//! pane/<server_id>/<TMUX_PANE>.json    written by registrar mode
+//! session/<session_id>.json            written by hook mode
 //! ```
+//!
+//! `<server_id>` is an 8-char hash of the tmux socket path so pane ids
+//! from different tmux servers (which share a `%N` namespace) can't
+//! collide. Session ids are UUIDs and globally unique, so they don't
+//! need additional scoping.
 //!
 //! Both files are JSON objects written atomically via
 //! [`crate::cache::write_atomic`]. Reads tolerate missing/corrupt files by
@@ -42,9 +47,10 @@ pub struct SessionState {
     pub cache_read_pct: Option<u32>,
 }
 
-pub fn pane_path(pane_id: &str) -> PathBuf {
+pub fn pane_path(server_id: &str, pane_id: &str) -> PathBuf {
     cache::cache_dir()
         .join("pane")
+        .join(sanitize(server_id))
         .join(format!("{}.json", sanitize(pane_id)))
 }
 
@@ -54,8 +60,8 @@ pub fn session_path(session_id: &str) -> PathBuf {
         .join(format!("{}.json", sanitize(session_id)))
 }
 
-pub fn read_pane(pane_id: &str) -> Option<PaneState> {
-    let text = std::fs::read_to_string(pane_path(pane_id)).ok()?;
+pub fn read_pane(server_id: &str, pane_id: &str) -> Option<PaneState> {
+    let text = std::fs::read_to_string(pane_path(server_id, pane_id)).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     Some(PaneState {
         session_id: v.get("session_id")?.as_str()?.to_string(),
@@ -73,7 +79,7 @@ pub fn read_pane(pane_id: &str) -> Option<PaneState> {
     })
 }
 
-pub fn write_pane(pane_id: &str, s: &PaneState) -> std::io::Result<()> {
+pub fn write_pane(server_id: &str, pane_id: &str, s: &PaneState) -> std::io::Result<()> {
     let v = json!({
         "session_id": s.session_id,
         "claude_pid": s.claude_pid,
@@ -82,7 +88,7 @@ pub fn write_pane(pane_id: &str, s: &PaneState) -> std::io::Result<()> {
         "registered_at": s.registered_at,
         "last_warmth": s.last_warmth,
     });
-    cache::write_atomic(&pane_path(pane_id), &v.to_string())
+    cache::write_atomic(&pane_path(server_id, pane_id), &v.to_string())
 }
 
 pub fn read_session(session_id: &str) -> Option<SessionState> {
@@ -120,8 +126,8 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
     cache::write_atomic(&session_path(session_id), &v.to_string())
 }
 
-pub fn remove_pane(pane_id: &str) {
-    let _ = std::fs::remove_file(pane_path(pane_id));
+pub fn remove_pane(server_id: &str, pane_id: &str) {
+    let _ = std::fs::remove_file(pane_path(server_id, pane_id));
 }
 
 /// Strip path separators and other awkward characters so that an externally
