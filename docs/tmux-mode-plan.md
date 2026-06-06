@@ -24,9 +24,12 @@ keeps updating while idle.
   all current blocks preserved).
 - Inside tmux: ccstatus becomes a two-role tool sharing one binary:
   - **registrar**: invoked by Claude Code via `statusLine.command`, writes
-    per-pane state, emits empty stdout (tmux owns the display).
+    per-pane state *and* still renders the rich line to stdout (model, cwd,
+    tokens, rate limits, heatmap). Claude's statusline holds the
+    mostly-static fields that don't benefit from idle ticking.
   - **renderer**: invoked by tmux via `status-format` / `pane-border-format`
-    / `pane-border-format` shell substitutions, reads state, formats line.
+    shell substitutions, reads state, formats a tick-driven line (cache
+    warmth, idle time).
 - Cache-warmth indicator that keeps ticking when the session is idle and
   when Claude has been suspended (`Ctrl-Z`), and that disappears once Claude
   has exited.
@@ -170,7 +173,11 @@ New behaviour, only when `$TMUX` is set:
 4. Atomically write `pane/<TMUX_PANE>.json`. Rate-limit: skip the write if
    the existing file is <500 ms old and the session_id/pid match (statusline
    can fire on every streamed chunk; we don't want a write storm).
-5. Emit empty string on stdout (tmux owns the visible row), exit 0.
+5. Fall through and render the rich line to stdout. The Claude
+   statusline and the tmux row are complementary: rich, mostly-static
+   fields (model, cwd, tokens, rates, heatmap) belong in Claude's row;
+   time-sensitive fields (cache warmth, idle time) belong in the tmux
+   row which ticks on `status-interval`.
 
 When `$TMUX` is unset, fall through to the existing `render()` path
 unchanged.

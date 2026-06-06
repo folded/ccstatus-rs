@@ -78,9 +78,10 @@ fn main() -> ExitCode {
 
     if let Some(pane_id) = active_tmux_pane() {
         register_pane(&input, &pane_id);
-        // tmux owns the visible display via its own status-format renderer;
-        // emit nothing here so the Claude statusline row stays clear.
-        return ExitCode::SUCCESS;
+        // Fall through and still render the full line. The Claude statusline
+        // and the tmux row 1 show complementary data: the rich, mostly-static
+        // fields (model, cwd, tokens, rate limits, heatmap) live here; the
+        // time-sensitive cache-warmth indicator lives in the tmux row.
     }
 
     let out = render(&input, &cfg);
