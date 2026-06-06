@@ -5,17 +5,19 @@ mod color;
 mod format;
 mod git;
 mod heatmap;
+mod hooks;
 mod install;
 mod oauth;
 mod state;
 mod term;
+mod util;
 
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_json::Value;
@@ -24,12 +26,14 @@ use cli::{Config, ParseOutcome};
 use color::*;
 use format::{format_tokens, push, push_fmt, shorten_model_name};
 use state::PaneState;
+use util::{now_unix, resolve_session_id};
 
 const SELF_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
     let cfg = match cli::parse_args(env::args().skip(1)) {
         ParseOutcome::Run(c) => c,
+        ParseOutcome::Hook(kind) => return hooks::run(kind),
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -127,23 +131,6 @@ fn register_pane(input: &Value, pane_id: &str) {
     let _ = state::write_pane(pane_id, &pane_state);
 }
 
-fn resolve_session_id(input: &Value) -> Option<String> {
-    if let Some(s) = input.get("session_id").and_then(|v| v.as_str()) {
-        if !s.is_empty() {
-            return Some(s.to_string());
-        }
-    }
-    // Fallback: derive from transcript_path basename (`<session_id>.jsonl`).
-    let path = input.get("transcript_path").and_then(|v| v.as_str())?;
-    let basename = path.rsplit('/').next()?;
-    let stem = basename.rsplit_once('.').map(|(s, _)| s).unwrap_or(basename);
-    if stem.is_empty() {
-        None
-    } else {
-        Some(stem.to_string())
-    }
-}
-
 /// Walk up the process tree from our parent until `comm` matches `claude`,
 /// then return that pid. Falls back to `$PPID` after a bounded number of
 /// hops. Bound prevents pathological loops on weird systems.
@@ -210,13 +197,6 @@ fn pane_recent(pane_id: &str, window: Duration) -> bool {
         .duration_since(mtime)
         .map(|age| age < window)
         .unwrap_or(false)
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 fn render(input: &Value, cfg: &Config) -> String {

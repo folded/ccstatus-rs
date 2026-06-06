@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::hooks::HookKind;
+
 pub struct Config {
     pub cwd: bool,
     pub git: bool,
@@ -36,6 +38,7 @@ impl Default for Config {
 
 pub enum ParseOutcome {
     Run(Config),
+    Hook(HookKind),
     Install,
     Help,
     Version,
@@ -44,7 +47,8 @@ pub enum ParseOutcome {
 
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
     let mut cfg = Config::default();
-    for arg in args {
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--no-cwd" => {
                 cfg.cwd = false;
@@ -60,6 +64,20 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--updates" => cfg.updates = true,
             "--no-updates" => cfg.updates = false,
             "--install" => return ParseOutcome::Install,
+            "--hook" => {
+                let kind = match iter.next().as_deref() {
+                    Some("stop") => HookKind::Stop,
+                    Some(other) => {
+                        return ParseOutcome::Error(format!("unknown hook kind: {other}"));
+                    }
+                    None => {
+                        return ParseOutcome::Error(
+                            "--hook requires a kind (e.g. --hook stop)".into(),
+                        );
+                    }
+                };
+                return ParseOutcome::Hook(kind);
+            }
             "-h" | "--help" => return ParseOutcome::Help,
             "-V" | "--version" => return ParseOutcome::Version,
             other => return ParseOutcome::Error(format!("unknown argument: {other}")),
@@ -86,6 +104,7 @@ Options:
   --updates         Check for newer ccstatus releases (off by default)
   --no-updates      Disable update check (default)
   --install         Wire this binary into ~/.claude/settings.json and exit
+  --hook <kind>     Run as a Claude Code hook (kinds: stop)
   -h, --help        Show this help and exit
   -V, --version     Show ccstatus version and exit
 
