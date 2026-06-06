@@ -7,6 +7,7 @@ mod git;
 mod heatmap;
 mod install;
 mod oauth;
+mod state;
 mod term;
 
 use std::env;
