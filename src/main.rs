@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_json::Value;
@@ -23,6 +23,7 @@ use serde_json::Value;
 use cli::{Config, ParseOutcome};
 use color::*;
 use format::{format_tokens, push, push_fmt, shorten_model_name};
+use state::PaneState;
 
 const SELF_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -68,11 +69,154 @@ fn main() -> ExitCode {
 
     let _ = cache::ensure_cache_dir();
 
+    if let Some(pane_id) = active_tmux_pane() {
+        register_pane(&input, &pane_id);
+        // tmux owns the visible display via its own status-format renderer;
+        // emit nothing here so the Claude statusline row stays clear.
+        return ExitCode::SUCCESS;
+    }
+
     let out = render(&input, &cfg);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let _ = handle.write_all(out.as_bytes());
     ExitCode::SUCCESS
+}
+
+/// Returns `Some(pane_id)` if Claude Code was launched inside tmux. Both
+/// `$TMUX` and `$TMUX_PANE` must be set; either one missing means we render
+/// for stdout as usual.
+fn active_tmux_pane() -> Option<String> {
+    env::var("TMUX").ok().filter(|s| !s.is_empty())?;
+    env::var("TMUX_PANE").ok().filter(|s| !s.is_empty())
+}
+
+/// Write per-pane state so the tmux-side renderer (running on
+/// `status-interval`) can show a live indicator. Coalesces writes that
+/// arrive within 500 ms of an identical prior write so a streaming
+/// statusline call doesn't hammer the filesystem.
+fn register_pane(input: &Value, pane_id: &str) {
+    let session_id = match resolve_session_id(input) {
+        Some(s) => s,
+        None => return,
+    };
+    let claude_pid = resolve_claude_pid();
+    let pane_tty = query_pane_tty(pane_id);
+    let transcript_path = input
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    if let Some(existing) = state::read_pane(pane_id) {
+        if existing.session_id == session_id
+            && existing.claude_pid == claude_pid
+            && pane_recent(pane_id, Duration::from_millis(500))
+        {
+            return;
+        }
+    }
+
+    let pane_state = PaneState {
+        session_id,
+        claude_pid,
+        pane_tty,
+        transcript_path,
+        registered_at: now_unix(),
+        last_warmth: None,
+    };
+    let _ = state::write_pane(pane_id, &pane_state);
+}
+
+fn resolve_session_id(input: &Value) -> Option<String> {
+    if let Some(s) = input.get("session_id").and_then(|v| v.as_str()) {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    // Fallback: derive from transcript_path basename (`<session_id>.jsonl`).
+    let path = input.get("transcript_path").and_then(|v| v.as_str())?;
+    let basename = path.rsplit('/').next()?;
+    let stem = basename.rsplit_once('.').map(|(s, _)| s).unwrap_or(basename);
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
+}
+
+/// Walk up the process tree from our parent until `comm` matches `claude`,
+/// then return that pid. Falls back to `$PPID` after a bounded number of
+/// hops. Bound prevents pathological loops on weird systems.
+fn resolve_claude_pid() -> u32 {
+    let ppid = unsafe { libc::getppid() } as u32;
+    let mut pid = ppid;
+    for _ in 0..8 {
+        if process_is_claude(pid) {
+            return pid;
+        }
+        match parent_of(pid) {
+            Some(p) if p > 1 => pid = p,
+            _ => break,
+        }
+    }
+    ppid
+}
+
+fn process_is_claude(pid: u32) -> bool {
+    let Some(comm) = ps_field(pid, "comm=") else {
+        return false;
+    };
+    let leaf = comm.rsplit('/').next().unwrap_or(&comm);
+    leaf == "claude" || leaf.starts_with("claude-") || leaf.starts_with("claude ")
+}
+
+fn parent_of(pid: u32) -> Option<u32> {
+    ps_field(pid, "ppid=")?.trim().parse().ok()
+}
+
+fn ps_field(pid: u32, field: &str) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", field])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn query_pane_tty(pane_id: &str) -> String {
+    let out = Command::new("tmux")
+        .args(["display", "-t", pane_id, "-p", "#{pane_tty}"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+fn pane_recent(pane_id: &str, window: Duration) -> bool {
+    let meta = match fs::metadata(state::pane_path(pane_id)) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    SystemTime::now()
+        .duration_since(mtime)
+        .map(|age| age < window)
+        .unwrap_or(false)
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn render(input: &Value, cfg: &Config) -> String {
