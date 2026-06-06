@@ -46,7 +46,7 @@ keeps updating while idle.
 - `main.rs` — entry point. Reads stdin, parses JSON, calls `render()`,
   prints to stdout. ~510 lines.
 - `cli.rs` — argument parser, `Config` struct of feature toggles.
-- `cache.rs` — `/tmp/claude` cache dir, `write_atomic`, `read_if_fresh`,
+- `cache.rs` — `/tmp/ccstatus-&lt;uid&gt;` cache dir, `write_atomic`, `read_if_fresh`,
   `read_stale`, `touch`, `remove_if_empty`. Reusable for the new state
   files.
 - `install.rs` — writes `statusLine.command` into `~/.claude/settings.json`
@@ -87,12 +87,12 @@ Filesystem is the contract.
 
 ## State layout
 
-Lives under `cache::cache_dir()` (currently `/tmp/claude`) — survives
+Lives under `cache::cache_dir()` (currently `/tmp/ccstatus-&lt;uid&gt;`) — survives
 suspend, evaporates on reboot, which is the right lifetime for "who is
 currently running" data.
 
 ```
-/tmp/claude/
+/tmp/ccstatus-&lt;uid&gt;/
   pane/<TMUX_PANE>.json       written by registrar mode
   session/<session_id>.json   written by hook mode
 ```
@@ -283,7 +283,7 @@ Each step is a separate commit per global preferences.
 - **`session_id` location in stdin JSON.** Check real payloads from
   current Claude Code; the registrar relies on this and a fallback strategy
   (e.g. derive from transcript_path) may be needed.
-- **Where to store pane/session state.** Reusing `/tmp/claude` (current
+- **Where to store pane/session state.** Reusing `/tmp/ccstatus-&lt;uid&gt;` (current
   `cache_dir`) is the obvious answer; if there's any chance of multiple
   Claude processes on multi-user machines, namespace by `$UID`. For a
   single-user laptop, this doesn't matter.
@@ -293,7 +293,7 @@ Each step is a separate commit per global preferences.
 - **Cost source.** `cost_so_far_usd` is wishful unless a hook payload
   provides it. Confirm what `Stop` and `PostToolUse` actually deliver
   before committing to the field.
-- **Existing `cache::cache_dir()` returns `/tmp/claude`.** State files
+- **Existing `cache::cache_dir()` returns `/tmp/ccstatus-&lt;uid&gt;`.** State files
   share that root. Fine, but worth a docstring on each new file path.
 
 ## Open risks

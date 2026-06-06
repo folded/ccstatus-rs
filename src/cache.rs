@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn cache_dir() -> PathBuf {
-    PathBuf::from("/tmp/claude")
+    // Per-user root so multiple users on the same machine don't fight over
+    // ownership of the cache directory. `geteuid` is the right id here
+    // (cache state belongs to whoever is actually executing ccstatus, not
+    // the login user). Named `ccstatus-` rather than `claude-` to avoid
+    // colliding with Claude Code's own `/tmp/claude-<uid>/` task directory.
+    let uid = unsafe { libc::geteuid() };
+    PathBuf::from(format!("/tmp/ccstatus-{uid}"))
 }
 
 pub fn ensure_cache_dir() -> io::Result<()> {
