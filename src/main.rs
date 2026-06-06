@@ -525,6 +525,9 @@ fn render_extra_usage(data: &str, sep: &str, out: &mut String) {
     if has_used && has_limit {
         let used = used_cents / 100.0;
         let limit = limit_cents / 100.0;
+        if used == 0.0 && limit == 0.0 {
+            return;
+        }
         out.push_str(sep);
         push_fmt(
             out,
