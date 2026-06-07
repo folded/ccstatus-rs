@@ -1,18 +1,24 @@
 //! Long-lived ccstatus process driving tmux via control mode.
 //!
-//! Milestone 2 scope: snapshot the user's status-bar options on start,
-//! demonstrate a visible mutation, then restore on exit. Subsequent
-//! milestones add lockfile/socket, registrar integration, focus tracking,
-//! and reload detection.
+//! Milestone 4 scope: accept registrar pings over the per-server Unix
+//! socket and log them. Subsequent milestones add focus tracking and
+//! the real row injection.
 
+use std::io::{BufRead, BufReader};
 use std::process::ExitCode;
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::control;
 use crate::server_dir::ServerDir;
 use crate::snapshot::{self, Snapshot};
 use crate::tmux;
+
+/// Demo lifetime for milestones 2–4: daemon runs for this long after the
+/// last message, then restores and exits. Replaced by event-driven
+/// shutdown criteria in milestone 9.
+const IDLE_EXIT_AFTER: Duration = Duration::from_secs(20);
 
 pub fn run() -> ExitCode {
     let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
@@ -39,13 +45,29 @@ pub fn run() -> ExitCode {
         }
     };
 
-    let _socket = match dir.bind_socket() {
+    let socket = match dir.bind_socket() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ccstatus daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
+
+    // Push registrar messages onto a channel so the main loop can
+    // multiplex them with timeouts (and, in later milestones, tmux
+    // events).
+    let (msg_tx, msg_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for stream in socket.incoming() {
+            let Ok(s) = stream else { continue };
+            let reader = BufReader::new(s);
+            for line in reader.lines().map_while(Result::ok) {
+                if msg_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        }
+    });
 
     let mut conn = match control::Connection::attach() {
         Ok(c) => c,
@@ -73,16 +95,24 @@ pub fn run() -> ExitCode {
         snap.status, snap.status_position
     );
 
-    // Visible mutation so the operator can verify the daemon is driving
-    // tmux. Replaced with the real focus-driven row injection in a
-    // later milestone.
-    if let Err(e) = mutate_for_demo(&mut conn) {
-        eprintln!("ccstatus daemon: mutate failed: {e}");
-        let _ = snap.restore(&mut conn);
-        return ExitCode::FAILURE;
+    eprintln!("ccstatus daemon: ready, awaiting registrar pings");
+    let mut last_message = Instant::now();
+    loop {
+        let elapsed = last_message.elapsed();
+        let remaining = IDLE_EXIT_AFTER.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            break;
+        }
+        match msg_rx.recv_timeout(remaining) {
+            Ok(line) => {
+                eprintln!("ccstatus daemon: registrar msg: {line}");
+                last_message = Instant::now();
+                // Milestone 5 will parse the message and act on it.
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
-
-    thread::sleep(Duration::from_secs(5));
 
     if let Err(e) = snap.restore(&mut conn) {
         eprintln!("ccstatus daemon: restore failed: {e}");
@@ -90,22 +120,4 @@ pub fn run() -> ExitCode {
     }
     eprintln!("ccstatus daemon: restored, exiting");
     ExitCode::SUCCESS
-}
-
-fn mutate_for_demo(conn: &mut control::Connection) -> Result<(), String> {
-    let r = conn.cmd("set-option -g status 2")?;
-    if !r.ok {
-        return Err(r.output);
-    }
-    let r = conn.cmd(
-        "set-option -g 'status-format[1]' '#[fg=red,bold]ccstatus daemon demo row#[default]'",
-    )?;
-    if !r.ok {
-        return Err(r.output);
-    }
-    let r = conn.cmd("refresh-client -S")?;
-    if !r.ok {
-        return Err(r.output);
-    }
-    Ok(())
 }

@@ -10,6 +10,7 @@ mod heatmap;
 mod hooks;
 mod install;
 mod oauth;
+mod ipc;
 mod render_tmux;
 mod server_dir;
 mod snapshot;
@@ -86,9 +87,13 @@ fn main() -> ExitCode {
 
     if let Some(pane_id) = active_tmux_pane() {
         let lines: Vec<String> = out.split('\n').map(str::to_string).collect();
-        register_pane(&input, &pane_id, lines);
-        // tmux owns the visible display via its own status rows; emit
-        // nothing here so the Claude statusline row stays clear.
+        if let Some(session_id) = register_pane(&input, &pane_id, lines) {
+            let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
+            ipc::notify_register(&server_id, &pane_id, &session_id);
+        }
+        // tmux owns the visible display via the daemon's control-channel
+        // injection; emit nothing here so the Claude statusline row
+        // stays clear.
         return ExitCode::SUCCESS;
     }
 
@@ -110,10 +115,10 @@ fn active_tmux_pane() -> Option<String> {
 /// `status-interval`) can show a live indicator. Coalesces writes that
 /// arrive within 500 ms of an identical prior write so a streaming
 /// statusline call doesn't hammer the filesystem.
-fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) {
-    let Some(session_id) = resolve_session_id(input) else {
-        return;
-    };
+/// Returns the session id that was registered (so the caller can ping the
+/// daemon with it), or None if the input lacked one.
+fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) -> Option<String> {
+    let session_id = resolve_session_id(input)?;
     let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
     let claude_pid = resolve_claude_pid();
     let pane_tty = query_pane_tty(pane_id);
@@ -128,12 +133,12 @@ fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) {
             && existing.lines == lines
             && pane_recent(&server_id, pane_id, Duration::from_millis(500))
         {
-            return;
+            return Some(session_id);
         }
     }
 
     let pane_state = PaneState {
-        session_id,
+        session_id: session_id.clone(),
         claude_pid,
         pane_tty,
         transcript_path,
@@ -142,6 +147,7 @@ fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) {
         lines,
     };
     let _ = state::write_pane(&server_id, pane_id, &pane_state);
+    Some(session_id)
 }
 
 /// Walk up the process tree from our parent until `comm` matches `claude`,
