@@ -11,7 +11,7 @@
 //! Hand-rolled raw-mode TUI (termios + ANSI), matching the crate's no-TUI-deps
 //! style. The terminal is always restored on exit through an RAII guard.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -245,6 +245,7 @@ fn is_tty(fd: i32) -> bool {
 
 // ---- input ---------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
 enum Key {
     Up,
     Down,
@@ -259,41 +260,43 @@ fn read_key_pending() -> bool {
 }
 
 /// Block up to `timeout` for a keystroke. Returns `None` on timeout (caller
-/// should refresh). Decodes the few keys we use, including arrow escapes.
+/// should refresh). Reads the whole burst in one `libc::read` so a multi-byte
+/// escape (e.g. arrow = `ESC [ A`) arrives intact — going through buffered
+/// `io::stdin` would swallow the tail of the sequence and mis-read every arrow
+/// as a lone Esc.
 fn read_key(timeout: Duration) -> Option<Key> {
     if !poll_stdin(timeout.as_millis() as i32) {
         return None;
     }
-    let mut buf = [0u8; 1];
-    if io::stdin().read(&mut buf).ok()? == 0 {
-        return Some(Key::Quit); // EOF
+    let mut buf = [0u8; 8];
+    let n = unsafe {
+        libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+    };
+    if n <= 0 {
+        return Some(Key::Quit); // EOF / error
     }
-    match buf[0] {
-        b'q' => Some(Key::Quit),
-        b'j' => Some(Key::Down),
-        b'k' => Some(Key::Up),
-        b'r' => Some(Key::Refresh),
-        b'\r' | b'\n' => Some(Key::Jump),
-        0x1b => {
-            // Esc alone quits; Esc [ A/B is an arrow key.
-            if !poll_stdin(0) {
-                return Some(Key::Quit);
-            }
-            let mut seq = [0u8; 2];
-            let n = io::stdin().read(&mut seq).ok()?;
-            match (n, seq[0], seq.get(1)) {
-                (2, b'[', Some(b'A')) => Some(Key::Up),
-                (2, b'[', Some(b'B')) => Some(Key::Down),
-                _ => Some(Key::Refresh),
-            }
-        }
-        _ => Some(Key::Refresh),
+    Some(decode(&buf[..n as usize]))
+}
+
+/// Decode a raw input burst into a key. Pure, so the escape handling is
+/// testable. A lone `Esc` quits; `Esc [ A/B` is an arrow.
+fn decode(b: &[u8]) -> Key {
+    match b {
+        [b'q', ..] => Key::Quit,
+        [b'j', ..] => Key::Down,
+        [b'k', ..] => Key::Up,
+        [b'r', ..] => Key::Refresh,
+        [b'\r', ..] | [b'\n', ..] => Key::Jump,
+        [0x1b, b'[', b'A', ..] => Key::Up,
+        [0x1b, b'[', b'B', ..] => Key::Down,
+        [0x1b] => Key::Quit,
+        _ => Key::Refresh,
     }
 }
 
 fn poll_stdin(timeout_ms: i32) -> bool {
     let mut fds = [libc::pollfd {
-        fd: io::stdin().as_raw_fd(),
+        fd: libc::STDIN_FILENO,
         events: libc::POLLIN,
         revents: 0,
     }];
@@ -317,6 +320,22 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdefgh", 4), "abc…");
         assert_eq!(truncate("x", 1), "x");
+    }
+
+    #[test]
+    fn decode_arrows_and_keys() {
+        assert_eq!(decode(b"q"), Key::Quit);
+        assert_eq!(decode(b"j"), Key::Down);
+        assert_eq!(decode(b"k"), Key::Up);
+        assert_eq!(decode(b"r"), Key::Refresh);
+        assert_eq!(decode(b"\r"), Key::Jump);
+        assert_eq!(decode(b"\n"), Key::Jump);
+        // Arrow escape sequences arrive as one burst.
+        assert_eq!(decode(&[0x1b, b'[', b'A']), Key::Up);
+        assert_eq!(decode(&[0x1b, b'[', b'B']), Key::Down);
+        // Lone Esc quits; an unknown escape just refreshes.
+        assert_eq!(decode(&[0x1b]), Key::Quit);
+        assert_eq!(decode(&[0x1b, b'[', b'C']), Key::Refresh);
     }
 
     #[test]
