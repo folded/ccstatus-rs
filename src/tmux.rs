@@ -46,6 +46,13 @@ pub fn on_focus(pane_id: &str) -> ExitCode {
     let _ = Command::new("tmux")
         .args(["set-option", "-g", "status", &target.to_string()])
         .status();
+    // Force an immediate status redraw — otherwise the new pane's #()
+    // substitutions wouldn't appear until the next status-interval tick,
+    // and the row-count change wouldn't apply visually until something
+    // else triggered a redraw.
+    let _ = Command::new("tmux")
+        .args(["refresh-client", "-S"])
+        .status();
     ExitCode::SUCCESS
 }
 
