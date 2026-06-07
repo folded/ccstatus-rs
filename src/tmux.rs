@@ -51,7 +51,7 @@ pub fn on_focus(hint: Option<&str>) -> ExitCode {
         ROWS_WITHOUT_CLAUDE
     };
     let _ = Command::new("tmux")
-        .args(["set-option", "-g", "status", &target.to_string()])
+        .args(["set-option", "-g", "status", &status_value(target)])
         .status();
     // Force an immediate redraw — without this the row-count change and
     // the per-pane #() substitutions wouldn't reflect visually until the
@@ -60,6 +60,17 @@ pub fn on_focus(hint: Option<&str>) -> ExitCode {
         .args(["refresh-client", "-S"])
         .status();
     ExitCode::SUCCESS
+}
+
+/// Convert a row count to the spelling tmux's `status` option accepts.
+/// Tmux is a choice option (`off`/`on`/`2`/`3`/`4`/`5`), so `"1"` is
+/// rejected with "unknown value: 1" — you have to say `on`.
+fn status_value(rows: u32) -> String {
+    match rows {
+        0 => "off".to_string(),
+        1 => "on".to_string(),
+        n => n.to_string(),
+    }
 }
 
 fn current_pane() -> Option<String> {
