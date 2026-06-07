@@ -9,7 +9,8 @@
 //! that touches network and filesystem; `format_segment` is pure and is the
 //! test surface.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
@@ -19,6 +20,75 @@ use crate::color::*;
 use crate::format::push_fmt;
 use crate::render_tmux;
 use crate::{api, cache, oauth};
+
+/// The account-global usage snapshot, read from the freshest on-disk usage
+/// cache (no network). Account usage is identical across every session, so
+/// aggregate surfaces show it once rather than per-session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageSummary {
+    pub five_hour_pct: Option<i64>,
+    pub seven_day_pct: Option<i64>,
+    /// Extra-usage credits in dollars, when enabled with a known balance.
+    pub extra_used: Option<f64>,
+    pub extra_limit: Option<f64>,
+    pub extra_enabled: bool,
+}
+
+/// Read the freshest usage cache and parse it into a [`UsageSummary`], or
+/// `None` when no usable cache exists. Pure parse ([`parse_summary`]) behind a
+/// thin freshest-file read.
+pub fn summary() -> Option<UsageSummary> {
+    let path = freshest_usage_cache()?;
+    let text = fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    parse_summary(&v)
+}
+
+/// PURE: a usage-cache JSON value -> summary. Requires the `five_hour` key
+/// (otherwise it's an error/empty body, not real usage).
+fn parse_summary(v: &Value) -> Option<UsageSummary> {
+    v.get("five_hour")?;
+    let pct = |k: &str| {
+        v.pointer(&format!("/{k}/utilization"))
+            .and_then(|x| x.as_f64())
+            .map(|n| n.round() as i64)
+    };
+    let extra = v.get("extra_usage");
+    let extra_enabled = extra
+        .and_then(|e| e.get("is_enabled"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let dollars = |k: &str| {
+        extra
+            .and_then(|e| e.get(k))
+            .and_then(|x| x.as_f64())
+            .map(|c| c / 100.0)
+    };
+    Some(UsageSummary {
+        five_hour_pct: pct("five_hour"),
+        seven_day_pct: pct("seven_day"),
+        extra_used: dollars("used_credits"),
+        extra_limit: dollars("monthly_limit"),
+        extra_enabled,
+    })
+}
+
+/// The most recently written `statusline-usage-cache-*.json` (there is one per
+/// config dir; the freshest is the most relevant).
+fn freshest_usage_cache() -> Option<PathBuf> {
+    let dir = cache::cache_dir();
+    fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with("statusline-usage-cache-") && n.ends_with(".json")
+        })
+        .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(path, _)| path)
+}
 
 /// The rate-limit / quota segment as raw ANSI, or `None` when empty. Owns the
 /// fetch, the cache, the branching, and the formatting.
@@ -367,6 +437,26 @@ mod tests {
         let s = format_segment(&input, Some(&usage));
         assert!(s.contains("extra"));
         assert!(s.contains("enabled"));
+    }
+
+    #[test]
+    fn parse_summary_reads_pcts_and_extra() {
+        let v = json!({
+            "five_hour": { "utilization": 62.4 },
+            "seven_day": { "utilization": 8.0 },
+            "extra_usage": { "is_enabled": true, "used_credits": 150.0, "monthly_limit": 1000.0 }
+        });
+        let s = parse_summary(&v).unwrap();
+        assert_eq!(s.five_hour_pct, Some(62));
+        assert_eq!(s.seven_day_pct, Some(8));
+        assert!(s.extra_enabled);
+        assert_eq!(s.extra_used, Some(1.50));
+        assert_eq!(s.extra_limit, Some(10.0));
+    }
+
+    #[test]
+    fn parse_summary_requires_five_hour() {
+        assert!(parse_summary(&json!({ "error": "rate limited" })).is_none());
     }
 
     #[test]

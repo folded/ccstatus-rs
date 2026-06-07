@@ -20,6 +20,7 @@ use crate::color::*;
 use crate::fleet::{self, Activity, SessionView};
 use crate::ipc;
 use crate::tmux::{self, Tmux};
+use crate::usage;
 
 /// How often the table re-reads the state dir when idle (also the input poll
 /// timeout, so keys stay responsive).
@@ -102,8 +103,9 @@ fn render(views: &[SessionView], selected: usize, my_server: Option<&str>) -> St
     let working = views.iter().filter(|v| v.activity == Activity::Working).count();
     let waiting = views.iter().filter(|v| v.activity == Activity::Waiting).count();
     out.push_str(&format!(
-        "{BLUE}ccstatus{RESET} {DIM}·{RESET} {} session(s) {DIM}·{RESET} {GREEN}{working} working{RESET} {DIM}·{RESET} {ORANGE}{waiting} waiting{RESET}\r\n",
-        views.len()
+        "{BLUE}ccstatus{RESET} {DIM}·{RESET} {} session(s) {DIM}·{RESET} {GREEN}{working} working{RESET} {DIM}·{RESET} {ORANGE}{waiting} waiting{RESET}{}\r\n",
+        views.len(),
+        usage_header(),
     ));
     out.push_str(&format!(
         "{DIM}{}{RESET}\r\n",
@@ -123,6 +125,31 @@ fn render(views: &[SessionView], selected: usize, my_server: Option<&str>) -> St
         "\r\n{DIM}j/k or ↑/↓ move · Enter jump · r refresh · q quit{RESET}\r\n"
     ));
     out
+}
+
+/// The account-global usage tail of the header (5h/7d/extra), or empty when no
+/// usage cache exists. Account usage is identical across sessions, so it lives
+/// once in the header rather than per row.
+fn usage_header() -> String {
+    let Some(u) = usage::summary() else {
+        return String::new();
+    };
+    let mut s = String::new();
+    if let Some(p) = u.five_hour_pct {
+        s.push_str(&format!(" {DIM}·{RESET} {WHITE}5h{RESET} {}{p}%{RESET}", usage_color(p)));
+    }
+    if let Some(p) = u.seven_day_pct {
+        s.push_str(&format!(" {DIM}·{RESET} {WHITE}7d{RESET} {}{p}%{RESET}", usage_color(p)));
+    }
+    if u.extra_enabled {
+        match (u.extra_used, u.extra_limit) {
+            (Some(used), Some(limit)) if used > 0.0 || limit > 0.0 => s.push_str(&format!(
+                " {DIM}·{RESET} {WHITE}extra{RESET} {GREEN}${used:.2}/${limit:.2}{RESET}"
+            )),
+            _ => s.push_str(&format!(" {DIM}·{RESET} {WHITE}extra{RESET} {GREEN}enabled{RESET}")),
+        }
+    }
+    s
 }
 
 fn row(v: &SessionView, selected: bool, my_server: Option<&str>, cols: usize) -> String {
