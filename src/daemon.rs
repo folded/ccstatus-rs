@@ -280,14 +280,26 @@ impl Daemon {
 
 fn spawn_tmux_reader(mut events: EventStream, tx: mpsc::Sender<Incoming>) {
     thread::spawn(move || loop {
-        match events.next_event() {
-            Ok(ev) => {
-                let exit = matches!(ev, control::Event::Exit);
-                if tx.send(Incoming::Tmux(ev)).is_err() || exit {
-                    return;
-                }
-            }
+        let ev = match events.next_event() {
+            Ok(ev) => ev,
             Err(_) => return,
+        };
+        // Drop pane-output notifications in the reader thread. tmux
+        // mirrors every byte of every pane's output to its control
+        // clients as `%output`; if we let those queue onto the main
+        // channel they fill it, backpressure into the reader's recv,
+        // and ultimately throttle tmux itself — which paints the
+        // user's panes line-by-line. We never inspect pane bytes so
+        // dropping them here is harmless.
+        if let control::Event::Notification { name, .. } = &ev {
+            match name.as_str() {
+                "output" | "extended-output" | "pause" | "continue" => continue,
+                _ => {}
+            }
+        }
+        let exit = matches!(ev, control::Event::Exit);
+        if tx.send(Incoming::Tmux(ev)).is_err() || exit {
+            return;
         }
     });
 }
