@@ -339,6 +339,11 @@ impl Daemon {
     fn activate(&mut self, pane_id: &str) {
         self.write_rows_for(pane_id);
         let _ = self.writer.send("set-option -g status 4");
+        // Sentinel: any later daemon that starts up with this option
+        // still set knows the previous daemon (us) crashed without
+        // restoring, and will ignore captured values that are likely
+        // our leftovers rather than the user's true config.
+        let _ = self.writer.send("set-option -g @ccstatus-active 1");
         let _ = self.writer.send("refresh-client -S");
     }
 

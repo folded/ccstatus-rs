@@ -25,13 +25,27 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn capture(conn: &mut Connection) -> Result<Self, String> {
-        let status = read_option(conn, "status")?.unwrap_or_else(|| "on".to_string());
+        // Detect pollution from a crashed predecessor daemon. When the
+        // daemon enters Active state it sets @ccstatus-active=1; on
+        // graceful Deactivate / shutdown it unsets the option. A
+        // surviving value means a previous daemon was killed without
+        // restoring the user's bar — every status/status-format value
+        // we'd read right now might be our own leftover rather than
+        // the user's true config.
+        let polluted = read_option(conn, "@ccstatus-active")?.is_some();
+        let status = if polluted {
+            "on".to_string()
+        } else {
+            read_option(conn, "status")?.unwrap_or_else(|| "on".to_string())
+        };
         let status_position = read_option(conn, "status-position")?
             .unwrap_or_else(|| "bottom".to_string());
         let mut status_format: [Option<String>; STATUS_FORMAT_SLOTS] =
             Default::default();
-        for (i, slot) in status_format.iter_mut().enumerate() {
-            *slot = read_indexed(conn, "status-format", i)?;
+        if !polluted {
+            for (i, slot) in status_format.iter_mut().enumerate() {
+                *slot = read_indexed(conn, "status-format", i)?;
+            }
         }
         Ok(Self {
             status,
@@ -43,21 +57,26 @@ impl Snapshot {
     /// Fire-and-forget restore via the split Writer half (the
     /// event-driven daemon path). Errors are swallowed individually —
     /// if a single set-option fails, the rest still get attempted.
+    ///
+    /// Always unsets status-format[0..N] regardless of captured value:
+    /// the captured values can't be trusted to be the user's true
+    /// intent (a crashed predecessor daemon may have left its own
+    /// content in those slots). Unsetting them returns tmux to its
+    /// built-in default rendering, which is what the user got from
+    /// their config in the first place.
+    ///
+    /// Also clears the @ccstatus-active sentinel so the next daemon
+    /// start sees a clean shutdown and trusts its captured values.
     pub fn apply_via_writer(&self, w: &mut crate::control::Writer) {
         let _ = w.send(&format!("set-option -g status {}", quoted(&self.status)));
         let _ = w.send(&format!(
             "set-option -g status-position {}",
             quoted(&self.status_position)
         ));
-        for (i, slot) in self.status_format.iter().enumerate() {
-            let _ = match slot {
-                Some(v) => w.send(&format!(
-                    "set-option -g 'status-format[{i}]' \"{}\"",
-                    escape_for_tmux(v)
-                )),
-                None => w.send(&format!("set-option -gu 'status-format[{i}]'")),
-            };
+        for i in 0..STATUS_FORMAT_SLOTS {
+            let _ = w.send(&format!("set-option -gu 'status-format[{i}]'"));
         }
+        let _ = w.send("set-option -gu @ccstatus-active");
     }
 
     pub fn to_json(&self) -> Value {
