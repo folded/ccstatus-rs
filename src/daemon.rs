@@ -212,7 +212,10 @@ impl Daemon {
         }
     }
 
-    /// Reconcile every tmux session's bar against current Claude panes.
+    /// Reconcile every tmux session's bar against its currently-focused
+    /// Claude pane. A session shows ccstatus only while its focused pane (the
+    /// active pane of its active window) is a registered Claude pane;
+    /// switching focus to any other pane clears it.
     fn reconcile(&mut self) -> Reconcile {
         let Some(live) = list_panes() else {
             return Reconcile::ServerGone;
@@ -222,7 +225,7 @@ impl Daemon {
         // Claude process has exited. The latter is what makes the bar
         // collapse when the user quits Claude but leaves the shell pane
         // open — "last Claude exited", not "pane closed".
-        let live_pane_ids: HashSet<&str> = live.iter().map(|(p, _)| p.as_str()).collect();
+        let live_pane_ids: HashSet<&str> = live.iter().map(|p| p.id.as_str()).collect();
         let server_id = self.server_id.clone();
         let keep: HashSet<String> = self
             .panes
@@ -248,31 +251,25 @@ impl Daemon {
             self.last_activity = Instant::now();
         }
 
-        // pane_id -> tmux session for live panes.
-        let pane_session: HashMap<&str, &str> =
-            live.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
-
-        // For each tmux session, the registered Claude panes it contains.
-        let mut session_panes: HashMap<String, Vec<String>> = HashMap::new();
-        for pane in self.panes.keys() {
-            if let Some(session) = pane_session.get(pane.as_str()) {
-                session_panes
-                    .entry((*session).to_string())
-                    .or_default()
-                    .push(pane.clone());
+        // The pane each session currently has focused, and whether it's a
+        // registered Claude pane. Only focus-on-Claude activates a session.
+        let mut target: HashMap<String, String> = HashMap::new();
+        for p in &live {
+            if p.focused && self.panes.contains_key(&p.id) {
+                target.insert(p.session.clone(), p.id.clone());
             }
         }
 
-        // Deactivate sessions that no longer have a Claude pane.
+        // Deactivate sessions whose focused pane is no longer Claude.
         let stale: Vec<String> = self
             .active
             .iter()
-            .filter(|s| !session_panes.contains_key(*s))
+            .filter(|s| !target.contains_key(*s))
             .cloned()
             .collect();
         let mut changed = false;
         for session in stale {
-            self.log.write(&format!("deactivate session {session}"));
+            self.log.write(&format!("deactivate session {session} (focus left Claude)"));
             restore_session(&session);
             self.active.remove(&session);
             self.last_warmth.remove(&session);
@@ -282,20 +279,17 @@ impl Daemon {
         // A config reload re-renders every active session this pass.
         let force = std::mem::take(&mut self.force_rerender);
 
-        // Activate / refresh sessions that have a Claude pane.
-        for (session, panes) in &session_panes {
-            let Some(pane_id) = self.pick_pane(panes) else {
-                continue;
-            };
-            let warmth = self.pane_warmth(&pane_id);
+        // Activate / refresh sessions focused on a Claude pane.
+        for (session, pane_id) in &target {
+            let warmth = self.pane_warmth(pane_id);
             if !self.active.contains(session) {
-                self.log.write(&format!("activate session {session} via {pane_id}"));
-                self.write_rows(session, &pane_id);
+                self.log.write(&format!("activate session {session} via focused {pane_id}"));
+                self.write_rows(session, pane_id);
                 self.active.insert(session.clone());
                 self.last_activity = Instant::now();
                 changed = true;
             } else if force || self.last_warmth.get(session).copied() != warmth {
-                self.write_rows(session, &pane_id);
+                self.write_rows(session, pane_id);
                 changed = true;
             }
             match warmth {
@@ -313,20 +307,6 @@ impl Daemon {
             refresh_clients();
         }
         Reconcile::Ok
-    }
-
-    /// Choose which Claude pane drives a session's rows: the most recently
-    /// registered one (registrar rewrites `registered_at` on each render,
-    /// so this tracks the pane the user is actively using).
-    fn pick_pane(&self, panes: &[String]) -> Option<String> {
-        panes
-            .iter()
-            .max_by_key(|p| {
-                state::read_pane(&self.server_id, p)
-                    .map(|s| s.registered_at)
-                    .unwrap_or(0)
-            })
-            .cloned()
     }
 
     fn pane_warmth(&self, pane_id: &str) -> Option<&'static str> {
@@ -518,12 +498,24 @@ fn global_powerline_row() -> String {
     }
 }
 
-/// All live panes as `(pane_id, session_id)`. `None` means the tmux server
-/// is gone (the command failed), which the caller treats as a shutdown
-/// signal.
-fn list_panes() -> Option<Vec<(String, String)>> {
+/// A live tmux pane and whether it's the focused pane of its session (the
+/// active pane of the session's active window).
+struct LivePane {
+    id: String,
+    session: String,
+    focused: bool,
+}
+
+/// All live panes. `None` means the tmux server is gone (the command
+/// failed), which the caller treats as a shutdown signal.
+fn list_panes() -> Option<Vec<LivePane>> {
     let out = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id} #{session_id}"])
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{session_id} #{pane_active} #{window_active}",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -532,9 +524,13 @@ fn list_panes() -> Option<Vec<(String, String)>> {
     let s = String::from_utf8_lossy(&out.stdout);
     let mut v = Vec::new();
     for line in s.lines() {
-        let mut it = line.split_whitespace();
-        if let (Some(pane), Some(session)) = (it.next(), it.next()) {
-            v.push((pane.to_string(), session.to_string()));
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if let [pane, session, pane_active, window_active] = f.as_slice() {
+            v.push(LivePane {
+                id: pane.to_string(),
+                session: session.to_string(),
+                focused: *pane_active == "1" && *window_active == "1",
+            });
         }
     }
     Some(v)

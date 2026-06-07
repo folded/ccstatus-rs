@@ -55,6 +55,11 @@ heatmap elements are full-width rows.
 
 ## Notes
 
+- **The bar shows only while the focused pane is running Claude.** Switching
+  to any other pane in the session clears the ccstatus content. For
+  `left`/`right`-routed elements this is reflow-free; for `row*` elements the
+  status height changes, so that session's panes reflow on the switch — route
+  to `left`/`right` if you want zero reflow.
 - **`warmth` only ticks live on a tmux surface** (`row*`, `left`, `right`).
   Routed to `claude` it can't update on its own, so it's best on `right` or
   a row.

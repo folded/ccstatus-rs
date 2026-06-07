@@ -59,9 +59,10 @@ height on pane focus. This produced several defects:
   - prunes registered panes whose tmux pane is gone **or whose `claude_pid`
     has exited** — so the bar collapses when the user quits Claude even if
     the shell pane stays open ("last Claude exited", not "pane closed");
-  - reconciles each session's bar against whether it currently holds a
-    registered Claude pane;
-  - rewrites live elements (warmth) for sessions that have one.
+  - reconciles each session's bar against its **focused** pane (the active
+    pane of its active window): the bar shows only while focus is on a
+    registered Claude pane, and that pane drives the content;
+  - rewrites live elements (warmth) for active sessions.
 - All bar mutations are **session-local** (`set -t <session> …`), composed with
   the user's captured values, and removed with `set -u -t <session> …` on
   teardown. **The global config is never written**, so:
@@ -69,11 +70,14 @@ height on pane focus. This produced several defects:
     `status-format[0]`);
   - pollution detection is deleted — a crash leaves at most a session-local
     override, cleared on next startup by unsetting our own overrides.
-- **Fixed height, keyed to Claude presence, not focus.** A session's bar grows
-  when it gains its *first* Claude pane and shrinks when it loses its *last*;
-  switching between panes within a session never reflows. Height = (number of
-  rendered lines/elements routed to a dedicated tmux row) + 1 for the
-  powerline row.
+- **Focus-driven.** A session's bar shows ccstatus only while its focused
+  pane is a registered Claude pane; switching to any other pane clears it
+  (reverts to just the powerline). Height = (elements routed to dedicated
+  rows) + 1 powerline row. Consequence: for `row*`-routed content, focus
+  changes between a Claude and non-Claude pane change the height and so
+  reflow that session's panes — inherent to a per-session status height.
+  Elements routed to `left`/`right` clear with **no reflow** (the powerline
+  row count is unchanged), so route there to avoid reflow entirely.
 - **Lifecycle.** Spawn on first registrar ping. Exit when the server is gone
   (`list-panes` fails) or no Claude panes remain after a short grace (5s).
   Bar deactivation is decoupled from process exit — a session's bar collapses
@@ -121,7 +125,8 @@ Routed to `claude` it updates only when Claude re-renders.
 - Polling daemon (control mode dropped; `control.rs` removed).
 - Per-session session-local overrides; restore by whole-array unset, reverting
   to the inherited global. No global write, no captured snapshot needed.
-- Fixed height keyed to Claude presence per session.
+- Focus-driven per session: the bar shows only while the focused pane is a
+  Claude pane.
 - Pollution detection deleted; crash recovery = unset our own session
   overrides on startup, tracked via an `active-sessions` marker file.
 - Routing at line granularity (the 3 existing lines) via `config.json`, read
