@@ -55,6 +55,12 @@ const IDLE_EXIT_AFTER: Duration = Duration::from_secs(60);
 /// near-instantly without busy-waiting.
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
+/// Threshold (seconds) at which the cache-warmth label flips from warm
+/// to cold. Sits a little under Claude's ~5-minute prompt-cache TTL so
+/// the indicator changes before the user is about to pay for a re-warm.
+/// Mirrors the constant in `render_tmux.rs`.
+const WARM_THRESHOLD_SECS: i64 = 270;
+
 /// tmux's built-in default value for `status-format[0]`. The default
 /// isn't stored as an option (so `show-options -gv` returns empty), it's
 /// implicit in tmux's renderer. When the user's snapshot captures `None`
@@ -147,6 +153,16 @@ pub fn run() -> ExitCode {
         "startup: snapshot status={} pos={} initial_focus={:?}",
         &snap.status, &snap.status_position, initial_focus
     ));
+    for (i, slot) in snap.status_format.iter().enumerate() {
+        match slot {
+            Some(s) => log.write(&format!(
+                "  status-format[{i}] = (len {}) {}",
+                s.len(),
+                preview(s, 120)
+            )),
+            None => log.write(&format!("  status-format[{i}] = (unset)")),
+        }
+    }
     let mut daemon = Daemon {
         server_id: server_id.clone(),
         writer,
@@ -155,6 +171,7 @@ pub fn run() -> ExitCode {
         focused_pane: initial_focus,
         state: BarState::Idle,
         last_activity: Instant::now(),
+        last_warmth: None,
         log,
     };
     daemon.main_loop(rx);
@@ -172,6 +189,9 @@ struct Daemon {
     focused_pane: Option<String>,
     state: BarState,
     last_activity: Instant,
+    /// Warmth label last applied to the rendered rows. Used to skip
+    /// unnecessary re-writes when nothing has changed.
+    last_warmth: Option<&'static str>,
     log: DaemonLog,
 }
 
@@ -314,6 +334,7 @@ impl Daemon {
             (BarState::Idle, Some(pane)) => {
                 self.log.write(&format!("reconcile: Idle -> Active({pane})"));
                 self.activate(&pane);
+                self.last_warmth = self.current_warmth(&pane);
                 self.state = BarState::Active(pane);
             }
             (BarState::Active(_), None) => {
@@ -322,22 +343,46 @@ impl Daemon {
                     self.focused_pane, self.panes.keys().collect::<Vec<_>>()
                 ));
                 self.deactivate();
+                self.last_warmth = None;
                 self.state = BarState::Idle;
             }
             (BarState::Active(active), Some(pane)) if active != &pane => {
                 self.log.write(&format!("reconcile: Active({active}) -> Active({pane})"));
                 self.activate(&pane);
+                self.last_warmth = self.current_warmth(&pane);
                 self.state = BarState::Active(pane);
             }
             (BarState::Active(active), Some(pane)) if active == &pane => {
-                self.refresh_rows(&pane);
+                // Same pane still focused. Only re-render when the
+                // warmth indicator would actually flip — re-writing 4
+                // status-format slots every IDLE_POLL is wasteful and
+                // can swamp tmux's stdin pipe.
+                let warmth = self.current_warmth(&pane);
+                if warmth != self.last_warmth {
+                    self.log.write(&format!(
+                        "warmth flip: {:?} -> {:?}",
+                        self.last_warmth, warmth
+                    ));
+                    self.refresh_rows(&pane);
+                    self.last_warmth = warmth;
+                }
             }
             _ => {}
         }
     }
 
+    fn current_warmth(&self, pane_id: &str) -> Option<&'static str> {
+        let pane = state::read_pane(&self.server_id, pane_id)?;
+        let session = state::read_session(&pane.session_id)?;
+        let last_turn = session.last_turn_ts?;
+        let idle = crate::util::now_unix().saturating_sub(last_turn);
+        Some(if idle < WARM_THRESHOLD_SECS { "warm" } else { "cold" })
+    }
+
     fn activate(&mut self, pane_id: &str) {
+        self.log.write(&format!("activate pane={pane_id}"));
         self.write_rows_for(pane_id);
+        self.log.write("write status=4");
         let _ = self.writer.send("set-option -g status 4");
         // Sentinel: any later daemon that starts up with this option
         // still set knows the previous daemon (us) crashed without
@@ -381,6 +426,11 @@ impl Daemon {
 
     fn set_format(&mut self, i: usize, value: &str) {
         let escaped = snapshot::escape_for_tmux(value);
+        self.log.write(&format!(
+            "write status-format[{i}] (len {}) {}",
+            value.len(),
+            preview(value, 120)
+        ));
         let _ = self.writer.send(&format!(
             "set-option -g 'status-format[{i}]' \"{escaped}\""
         ));
@@ -396,6 +446,18 @@ impl Daemon {
             && matches!(self.state, BarState::Idle)
             && self.last_activity.elapsed() > IDLE_EXIT_AFTER
     }
+}
+
+/// Truncate a (possibly multi-line, possibly unicode) format value to
+/// the first `n` characters for log output, replacing whitespace runs
+/// so the log stays grep-friendly.
+fn preview(s: &str, n: usize) -> String {
+    let mut out: String = s.chars().take(n).collect();
+    out = out.replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+    if s.chars().count() > n {
+        out.push_str(" …");
+    }
+    out
 }
 
 fn spawn_tmux_reader(mut events: EventStream, tx: mpsc::Sender<Incoming>) {
