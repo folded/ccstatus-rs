@@ -41,12 +41,7 @@ pub enum ParseOutcome {
     Run(Config),
     Hook(HookKind),
     Render(RenderFlavor, String),
-    /// Recompute the tmux status-row count for the focused pane and tell
-    /// the running tmux server. Optional pane id is treated as a hint
-    /// only — the handler queries tmux for the actually-focused pane
-    /// because not every hook event reports the new focus correctly.
-    TmuxOnFocus(Option<String>),
-    /// Run the long-lived tmux control-mode daemon.
+    /// Run the long-lived tmux daemon that drives the status bar.
     Daemon,
     /// Manually reset the tmux bar to defaults (unset every
     /// `status-format[N]`, clear the `@ccstatus-active` sentinel, set
@@ -80,10 +75,6 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--install" => return ParseOutcome::Install,
             "--daemon" => return ParseOutcome::Daemon,
             "--tmux-reset" => return ParseOutcome::TmuxReset,
-            "--tmux-on-focus" => {
-                let hint = iter.next().filter(|s| !s.is_empty());
-                return ParseOutcome::TmuxOnFocus(hint);
-            }
             "--hook" => {
                 let kind = match iter.next().as_deref() {
                     Some("stop") => HookKind::Stop,
@@ -167,19 +158,14 @@ Options:
   --no-updates      Disable update check (default)
   --install         Wire this binary into ~/.claude/settings.json and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop)
-  --daemon          Run the long-lived tmux control-mode daemon that
-                    drives the status bar while Claude sessions are active
-  --tmux-reset      Unset all status-format[*] slots, clear the
-                    @ccstatus-active sentinel, and set status=on. Cleans
-                    up a polluted bar when no daemon is running.
+  --daemon          Run the long-lived tmux daemon that drives the status
+                    bar per session while Claude sessions are active
+  --tmux-reset      Restore the global status bar to tmux defaults
+                    (status-format[0] window list, higher slots unset,
+                    status=on). Cleans up after a crashed daemon.
   --render-tmux <flavor> <pane_id>
                     Emit a tmux status line for the given pane.
                     Flavors: row | line <N>
-  --tmux-on-focus [<pane_id>]
-                    Resize the tmux status bar based on whether the focused
-                    pane has a registered Claude session. Run from tmux
-                    focus-related hooks. The pane id is a hint only; the
-                    handler queries tmux for the actually-focused pane.
   -h, --help        Show this help and exit
   -V, --version     Show ccstatus version and exit
 
