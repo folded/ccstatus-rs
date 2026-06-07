@@ -1,163 +1,181 @@
-//! Long-lived ccstatus process that drives the tmux status bar for the
-//! sessions that contain a Claude pane.
+//! Per-session, event-driven status-bar handler.
 //!
-//! One daemon per tmux *server* (keyed by the server-socket hash; see
-//! [`crate::server_dir`]). It does **not** hold a persistent control-mode
-//! connection — a control client dies when its attached session is killed,
-//! even if other sessions remain, which would collapse every session's
-//! bar. Instead it polls:
+//! One handler per tmux *session* that hosts Claude. It attaches a control
+//! client to exactly that session (`tmux -C attach -t <session>`), so:
+//!
+//! - focus and pane events arrive as **events** (no polling) and are
+//!   naturally scoped to the session;
+//! - when the session is killed the control client gets `%exit`, which is
+//!   the handler's shutdown signal — no re-attach, the death *is* the
+//!   signal. Other sessions are driven by their own handlers, spawned on
+//!   demand when Claude first renders there.
 //!
 //! ```text
-//! +------------------+   register <pane> <claude-session>   +-----------+
-//! | socket thread    | <----------------------------------- | registrar |
-//! |  -> mpsc::Sender |                                       +-----------+
-//! +------------------+
-//!          | mpsc
-//!          v
-//! +-------------------------------------------------+
-//! | main loop (wakes on ping or POLL timeout)       |   one-shot
-//! |  - `tmux list-panes -a` -> live panes+sessions  |---------------> tmux
-//! |  - reconcile each session's bar (set -t / -u)   |   `tmux ...`
-//! |  - rewrite live rows (warmth) on threshold flip |
-//! +-------------------------------------------------+
+//!  registrar (Claude pane in session X) --register %pane--> per-session socket
+//!  tmux -C attach -t X  --%subscription-changed (focus)-->  +-----------+
+//!                       --%exit (session gone)----------->  |  handler  |
+//!                                                           |  (one mpsc|
+//!  timer (warmth / Claude-PID death)  --------------------> |   loop)   |
+//!                                                           +-----------+
+//!                                                                 | one-shot
+//!                                                                 v  tmux set -t X
 //! ```
 //!
-//! ## Per-session, never global
-//!
-//! All bar mutations are session-local (`set-option -t <session> …`) and
-//! removed with `set-option -u -t <session> …`, which reverts the session
-//! to inheriting the user's global config. The global `status` /
-//! `status-format` are never written, so the user's powerline can never be
-//! blanked and there is nothing to "pollute". Sessions we have overridden
-//! are tracked in a marker file so a crashed daemon's leftovers are cleared
-//! on the next startup.
+//! The handler must never send `refresh-client -C` on the control
+//! connection: a control client without a size doesn't participate in
+//! session sizing, so it can't resize the user's real client. All bar
+//! mutations are session-local (`set -t X …`) and reverted with
+//! `set -u -t X …`, so the global config is never written.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::config::{self, Dest, Element};
+use crate::control::{self, Connection, EventStream, Writer};
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
 use crate::state;
 use crate::tmux;
 
-/// Grace period after the last Claude pane goes before the daemon exits.
-/// The bar is already restored at that point (deactivation is decoupled
-/// from process exit), so this only governs respawn cost: short enough that
-/// cleanup is prompt and frequently exercised, long enough to absorb a
-/// quick session restart without churning the process. The registrar
-/// respawns the daemon the next time a Claude pane renders.
+/// Grace after the last Claude pane goes before the handler exits. The bar
+/// is already restored by then; this only governs respawn cost.
 const IDLE_EXIT_AFTER: Duration = Duration::from_secs(5);
 
-/// Maximum time the main loop blocks when nothing is happening. Registrar
-/// pings wake it immediately; this bounds how quickly we notice a closed
-/// Claude pane (bar collapse) and re-evaluate the warmth threshold. Bar
-/// height only changes on Claude start/stop now, so a couple of seconds of
-/// latency is invisible.
-const POLL: Duration = Duration::from_secs(2);
+/// Timer tick. Focus is event-driven (instant); this only paces the
+/// time-based work with no event source: the warmth threshold and
+/// Claude-PID-death detection (Claude exits but the shell pane stays open,
+/// which tmux doesn't signal).
+const TICK: Duration = Duration::from_secs(3);
 
 /// Threshold (seconds) at which the cache-warmth label flips warm->cold.
-/// Mirrors the constant in `render_tmux.rs`; sits under Claude's ~5-minute
-/// prompt-cache TTL.
 const WARM_THRESHOLD_SECS: i64 = 270;
 
-pub fn run() -> ExitCode {
+#[derive(Debug)]
+enum Incoming {
+    Tmux(control::Event),
+    Registrar(String),
+}
+
+pub fn run(session: String) -> ExitCode {
     let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
 
     let dir = match ServerDir::for_current(&server_id) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ccstatus daemon: {e}");
+            eprintln!("ccstatus handler: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let _lock = match dir.try_lock() {
+    let _lock = match dir.try_lock(&session) {
         Ok(Some(l)) => l,
-        Ok(None) => return ExitCode::SUCCESS,
+        Ok(None) => return ExitCode::SUCCESS, // another handler owns this session
         Err(e) => {
-            eprintln!("ccstatus daemon: {e}");
+            eprintln!("ccstatus handler: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let socket = match dir.bind_socket() {
+    let socket = match dir.bind_socket(&session) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ccstatus daemon: {e}");
+            eprintln!("ccstatus handler: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let log = DaemonLog::for_server(&server_id);
-    log.write("daemon process started (polling)");
+    let log = DaemonLog::for_session(&server_id, &session);
+    log.write(&format!("handler started for session {session}"));
 
-    // Crash recovery: clear bar overrides left on any session by a
-    // predecessor that didn't shut down cleanly. We only touch sessions we
-    // recorded ourselves, so a user's legitimate per-session config is
-    // never disturbed.
-    let leftover = read_active(&server_id);
-    if !leftover.is_empty() {
-        log.write(&format!("clearing {} leftover session(s)", leftover.len()));
-        for session in &leftover {
-            restore_session(session);
+    // Crash recovery: a predecessor handler may have died mid-active,
+    // leaving this session's bar overridden. Clear it before we start; the
+    // reconcile below re-applies the correct state.
+    restore_session(&session);
+
+    let mut conn = match Connection::attach(&session) {
+        Ok(c) => c,
+        Err(e) => {
+            log.write(&format!("attach failed: {e}"));
+            return ExitCode::FAILURE;
         }
-        refresh_clients();
-    }
-    write_active(&server_id, &HashSet::new());
+    };
+    // Capture the initial focused pane. We don't use `refresh-client -B`
+    // subscriptions: `%window-pane-changed` (in-window pane switch) and
+    // `%session-window-changed` (active-window change) already fire in
+    // control mode without one, and we re-query the focused pane on those
+    // events (and on the timer) rather than parsing it out of them.
+    let initial_focus = conn
+        .cmd(&format!("display-message -t {session} -p '#{{pane_id}}'"))
+        .ok()
+        .filter(|r| r.ok)
+        .map(|r| r.output.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (writer, events) = conn.split();
 
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<Incoming>();
+    spawn_tmux_reader(events, tx.clone());
     spawn_socket_reader(socket, tx);
 
-    let routing = config::Routing::load();
-
-    let mut daemon = Daemon {
+    let mut handler = Handler {
+        session,
         server_id,
-        routing,
+        routing: config::Routing::load(),
         config_mtime: config::mtime(),
         force_rerender: false,
-        panes: HashMap::new(),
-        active: HashSet::new(),
-        last_warmth: HashMap::new(),
+        panes: HashSet::new(),
+        focused_pane: initial_focus,
+        active: false,
+        last_warmth: None,
         last_activity: Instant::now(),
+        writer,
         log,
     };
-    daemon.main_loop(rx);
-
+    handler.main_loop(rx);
     ExitCode::SUCCESS
 }
 
-struct Daemon {
+struct Handler {
+    /// The tmux session id (e.g. `$1`) this handler drives.
+    session: String,
+    /// Server hash, for pane-state file paths.
     server_id: String,
-    /// Where each element is routed. Reloaded when the config file changes.
     routing: config::Routing,
-    /// Last-seen config mtime, for hot-reload detection.
-    config_mtime: Option<SystemTime>,
-    /// Set when the config reloaded; forces a re-render of active sessions
-    /// on the next reconcile even if nothing else changed.
+    config_mtime: Option<std::time::SystemTime>,
     force_rerender: bool,
-    /// Registered Claude panes: tmux pane_id -> claude session id (uuid).
-    panes: HashMap<String, String>,
-    /// tmux session ids we currently hold a bar override on.
-    active: HashSet<String>,
-    /// Per-tmux-session warmth label last rendered, to skip no-op rewrites.
-    last_warmth: HashMap<String, &'static str>,
+    /// Registered Claude pane ids in this session.
+    panes: HashSet<String>,
+    /// The session's currently-focused pane (from control events).
+    focused_pane: Option<String>,
+    /// Whether the bar is currently showing ccstatus for this session.
+    active: bool,
+    last_warmth: Option<&'static str>,
     last_activity: Instant,
+    /// The control connection's write half: used to send `refresh-client`
+    /// and to keep the connection (and thus the event stream) alive —
+    /// dropping it detaches the control client.
+    writer: Writer,
     log: DaemonLog,
 }
 
-impl Daemon {
-    fn main_loop(&mut self, rx: mpsc::Receiver<String>) {
+impl Handler {
+    fn main_loop(&mut self, rx: mpsc::Receiver<Incoming>) {
         loop {
-            match rx.recv_timeout(POLL) {
+            match rx.recv_timeout(TICK) {
                 Ok(first) => {
-                    self.handle_register(first);
+                    if self.dispatch(first) {
+                        // %exit: session gone, nothing to restore.
+                        self.log.write("session exited; shutting down");
+                        return;
+                    }
                     while let Ok(more) = rx.try_recv() {
-                        self.handle_register(more);
+                        if self.dispatch(more) {
+                            self.log.write("session exited; shutting down");
+                            return;
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -165,32 +183,65 @@ impl Daemon {
             }
 
             self.maybe_reload_config();
-
-            match self.reconcile() {
-                Reconcile::ServerGone => {
-                    // The tmux server is gone; its options went with it.
-                    // Nothing to restore — just exit.
-                    self.log.write("tmux server gone; exiting");
-                    self.active.clear();
-                    break;
-                }
-                Reconcile::Ok => {}
-            }
-
+            self.requery_focus();
+            self.prune_dead_panes();
+            self.reconcile();
             if self.should_exit() {
                 self.log.write("idle with no Claude panes; exiting");
-                self.restore_all();
                 break;
             }
         }
-        // Persist whatever override set we ended on (empty after a clean
-        // restore_all; on a Disconnected break it reflects the live state
-        // so the next daemon can clean up).
-        write_active(&self.server_id, &self.active);
+        // Graceful exit (session still alive): revert our overrides.
+        restore_session(&self.session);
+        self.refresh();
     }
 
-    /// Reload routing if the config file's mtime changed since last seen,
-    /// and flag active sessions for re-render.
+    /// Refresh status on all clients via the control connection (no fork).
+    fn refresh(&mut self) {
+        let _ = self.writer.send("refresh-client -S");
+    }
+
+    /// Returns true if the session exited (caller should shut down). Focus
+    /// notifications just wake the loop, which re-queries focus before
+    /// reconciling, so the only event we act on directly is `%exit`.
+    fn dispatch(&mut self, ev: Incoming) -> bool {
+        match ev {
+            Incoming::Tmux(control::Event::Exit) => true,
+            Incoming::Tmux(_) => false,
+            Incoming::Registrar(line) => {
+                self.handle_register(line);
+                false
+            }
+        }
+    }
+
+    /// Re-query the session's focused pane (active pane of the active
+    /// window). Cheap one-shot; triggered by focus events and the timer.
+    fn requery_focus(&mut self) {
+        let out = Command::new("tmux")
+            .args(["display-message", "-t", &self.session, "-p", "#{pane_id}"])
+            .output();
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !p.is_empty() && Some(p.as_str()) != self.focused_pane.as_deref() {
+                self.log.write(&format!("focus -> {p}"));
+                self.focused_pane = Some(p);
+            }
+        }
+    }
+
+    fn handle_register(&mut self, line: String) {
+        let mut parts = line.split_whitespace();
+        if let (Some("register"), Some(pane)) = (parts.next(), parts.next()) {
+            if self.panes.insert(pane.to_string()) {
+                self.log.write(&format!("register pane {pane}"));
+            }
+            self.last_activity = Instant::now();
+        }
+    }
+
     fn maybe_reload_config(&mut self) {
         let m = config::mtime();
         if m != self.config_mtime {
@@ -201,112 +252,64 @@ impl Daemon {
         }
     }
 
-    fn handle_register(&mut self, line: String) {
-        self.log.write(&format!("registrar: {line}"));
-        let mut parts = line.split_whitespace();
-        if let (Some("register"), Some(pane), Some(session)) =
-            (parts.next(), parts.next(), parts.next())
-        {
-            self.panes.insert(pane.to_string(), session.to_string());
+    /// Drop registered panes whose Claude process has exited or whose pane
+    /// state vanished. Runs on the timer (no tmux event for a Claude that
+    /// exits while its shell pane stays open).
+    fn prune_dead_panes(&mut self) {
+        let server_id = self.server_id.clone();
+        let before = self.panes.len();
+        self.panes.retain(|pane| {
+            state::read_pane(&server_id, pane)
+                .map(|p| pid_alive(p.claude_pid))
+                .unwrap_or(false)
+        });
+        if self.panes.len() != before {
+            self.log.write(&format!(
+                "pruned {} pane(s) (Claude exited); {} remain",
+                before - self.panes.len(),
+                self.panes.len()
+            ));
             self.last_activity = Instant::now();
         }
     }
 
-    /// Reconcile every tmux session's bar against its currently-focused
-    /// Claude pane. A session shows ccstatus only while its focused pane (the
-    /// active pane of its active window) is a registered Claude pane;
-    /// switching focus to any other pane clears it.
-    fn reconcile(&mut self) -> Reconcile {
-        let Some(live) = list_panes() else {
-            return Reconcile::ServerGone;
-        };
-
-        // Drop registrations whose tmux pane no longer exists OR whose
-        // Claude process has exited. The latter is what makes the bar
-        // collapse when the user quits Claude but leaves the shell pane
-        // open — "last Claude exited", not "pane closed".
-        let live_pane_ids: HashSet<&str> = live.iter().map(|p| p.id.as_str()).collect();
-        let server_id = self.server_id.clone();
-        let keep: HashSet<String> = self
-            .panes
-            .keys()
-            .filter(|pane| live_pane_ids.contains(pane.as_str()))
-            .filter(|pane| {
-                state::read_pane(&server_id, pane)
-                    .map(|p| pid_alive(p.claude_pid))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        let before = self.panes.len();
-        self.panes.retain(|pane, _| keep.contains(pane));
-        if self.panes.len() != before {
-            self.log.write(&format!(
-                "pruned {} pane(s) (closed or Claude exited); {} remain",
-                before - self.panes.len(),
-                self.panes.len()
-            ));
-            // Reset the idle clock so the exit grace runs from when the
-            // last pane actually went, not the last registrar ping.
-            self.last_activity = Instant::now();
-        }
-
-        // The pane each session currently has focused, and whether it's a
-        // registered Claude pane. Only focus-on-Claude activates a session.
-        let mut target: HashMap<String, String> = HashMap::new();
-        for p in &live {
-            if p.focused && self.panes.contains_key(&p.id) {
-                target.insert(p.session.clone(), p.id.clone());
-            }
-        }
-
-        // Deactivate sessions whose focused pane is no longer Claude.
-        let stale: Vec<String> = self
-            .active
-            .iter()
-            .filter(|s| !target.contains_key(*s))
-            .cloned()
-            .collect();
-        let mut changed = false;
-        for session in stale {
-            self.log.write(&format!("deactivate session {session} (focus left Claude)"));
-            restore_session(&session);
-            self.active.remove(&session);
-            self.last_warmth.remove(&session);
-            changed = true;
-        }
-
-        // A config reload re-renders every active session this pass.
+    /// Show ccstatus iff the focused pane is a registered Claude pane.
+    fn reconcile(&mut self) {
+        let focus_is_claude = self
+            .focused_pane
+            .as_deref()
+            .map(|p| self.panes.contains(p))
+            .unwrap_or(false);
         let force = std::mem::take(&mut self.force_rerender);
 
-        // Activate / refresh sessions focused on a Claude pane.
-        for (session, pane_id) in &target {
-            let warmth = self.pane_warmth(pane_id);
-            if !self.active.contains(session) {
-                self.log.write(&format!("activate session {session} via focused {pane_id}"));
-                self.write_rows(session, pane_id);
-                self.active.insert(session.clone());
+        match (self.active, focus_is_claude) {
+            (false, true) => {
+                let pane = self.focused_pane.clone().unwrap();
+                self.log.write(&format!("activate via focused {pane}"));
+                self.write_rows(&pane);
+                self.active = true;
+                self.last_warmth = self.pane_warmth(&pane);
                 self.last_activity = Instant::now();
-                changed = true;
-            } else if force || self.last_warmth.get(session).copied() != warmth {
-                self.write_rows(session, pane_id);
-                changed = true;
+                self.refresh();
             }
-            match warmth {
-                Some(w) => {
-                    self.last_warmth.insert(session.clone(), w);
-                }
-                None => {
-                    self.last_warmth.remove(session);
+            (true, false) => {
+                self.log.write("deactivate (focus left Claude)");
+                restore_session(&self.session);
+                self.active = false;
+                self.last_warmth = None;
+                self.refresh();
+            }
+            (true, true) => {
+                let pane = self.focused_pane.clone().unwrap();
+                let warmth = self.pane_warmth(&pane);
+                if force || warmth != self.last_warmth {
+                    self.write_rows(&pane);
+                    self.last_warmth = warmth;
+                    self.refresh();
                 }
             }
+            (false, false) => {}
         }
-
-        if changed {
-            write_active(&self.server_id, &self.active);
-            refresh_clients();
-        }
-        Reconcile::Ok
     }
 
     fn pane_warmth(&self, pane_id: &str) -> Option<&'static str> {
@@ -317,20 +320,13 @@ impl Daemon {
         Some(if idle < WARM_THRESHOLD_SECS { "warm" } else { "cold" })
     }
 
-    /// Write the session-local status-format rows and row count from the
-    /// routing config. Each used row (ascending; `row0` nearest the panes)
-    /// gets the elements routed to it, joined inline and translated to tmux
-    /// format; the powerline window list sits below them. Setting any index
-    /// replaces the whole session-local array, so we write each row
-    /// explicitly. Higher indices left over from a previous layout are
-    /// harmless: the `status` row count gates what renders.
-    fn write_rows(&self, session: &str, pane_id: &str) {
+    /// Write the session-local rows + powerline sides from the routing
+    /// config, driven by the given (focused, Claude) pane's content.
+    fn write_rows(&self, pane_id: &str) {
         let Some(pane) = state::read_pane(&self.server_id, pane_id) else {
             return;
         };
         let sess = state::read_session(&pane.session_id).unwrap_or_default();
-        // `warmth` is computed live here; all other elements come from the
-        // registrar's pane state.
         let warmth = render_tmux::warmth_segment(&sess);
         let content = |e: Element| -> Option<String> {
             if e.is_live() {
@@ -351,26 +347,18 @@ impl Daemon {
                 .collect();
             let joined = render_tmux::join_segments(parts.iter().map(String::as_str));
             let tmux = render_tmux::ansi_to_tmux(&joined);
-            set_session(session, &format!("status-format[{idx}]"), &tmux);
+            set_session(&self.session, &format!("status-format[{idx}]"), &tmux);
             idx += 1;
         }
-        set_session(session, &format!("status-format[{idx}]"), &global_powerline_row());
-        set_session(session, "status", &status_value(idx + 1));
+        set_session(&self.session, &format!("status-format[{idx}]"), &global_powerline_row());
+        set_session(&self.session, "status", &status_value(idx + 1));
 
-        // Powerline sides: inject the left/right-routed elements into the
-        // powerline row's status-left/status-right, composed with the
-        // user's (global) value. Zero added height.
-        self.write_powerline_side(session, Dest::Left, "status-left", &content);
-        self.write_powerline_side(session, Dest::Right, "status-right", &content);
+        self.write_powerline_side(Dest::Left, "status-left", &content);
+        self.write_powerline_side(Dest::Right, "status-right", &content);
     }
 
-    /// Compose the elements routed to a powerline side and set the
-    /// session-local `status-left`/`status-right`, keeping the user's
-    /// global value at the screen edge. Leaves the option untouched (so it
-    /// keeps inheriting the global) when nothing is routed there.
     fn write_powerline_side(
         &self,
-        session: &str,
         dest: Dest,
         option: &str,
         content: &dyn Fn(Element) -> Option<String>,
@@ -383,11 +371,10 @@ impl Daemon {
             .filter(|s| !s.is_empty())
             .collect();
         if parts.is_empty() {
-            // Nothing routed here now — revert to inheriting the global so a
-            // hot-reload that removed the elements doesn't leave our value
-            // stuck. Harmless on first activate (already inheriting).
+            // Revert to inheriting the global (handles a hot-reload that
+            // removed the elements; no-op on a fresh activate).
             let _ = Command::new("tmux")
-                .args(["set-option", "-u", "-t", session, option])
+                .args(["set-option", "-u", "-t", &self.session, option])
                 .status();
             return;
         }
@@ -397,55 +384,14 @@ impl Daemon {
         let user = global_option(option);
         let combined = match (user.is_empty(), dest) {
             (true, _) => mine,
-            // Our segment sits at the screen edge; the user's value next to
-            // the window list.
             (false, Dest::Left) => format!("{mine} {user}"),
             (false, _) => format!("{user} {mine}"),
         };
-        set_session(session, option, &combined);
-    }
-
-    fn restore_all(&mut self) {
-        for session in self.active.drain() {
-            restore_session(&session);
-        }
-        self.last_warmth.clear();
-        refresh_clients();
+        set_session(&self.session, option, &combined);
     }
 
     fn should_exit(&self) -> bool {
-        self.panes.is_empty()
-            && self.active.is_empty()
-            && self.last_activity.elapsed() > IDLE_EXIT_AFTER
-    }
-}
-
-enum Reconcile {
-    Ok,
-    ServerGone,
-}
-
-/// Whether a process is still alive. `kill(pid, 0)` sends no signal but
-/// performs the permission/existence checks: `0` means it exists; `EPERM`
-/// means it exists but we can't signal it (still alive); `ESRCH` means
-/// gone.
-fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    if unsafe { libc::kill(pid as i32, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// tmux's `status` is a choice option (`off`/`on`/`2`..`5`); `"1"` is
-/// rejected, so a single row must be spelled `on`.
-fn status_value(rows: usize) -> String {
-    match rows {
-        0 => "off".to_string(),
-        1 => "on".to_string(),
-        n => n.to_string(),
+        self.panes.is_empty() && !self.active && self.last_activity.elapsed() > IDLE_EXIT_AFTER
     }
 }
 
@@ -457,9 +403,7 @@ fn set_session(session: &str, name: &str, value: &str) {
 }
 
 /// Drop all bar overrides for a session, reverting it to inheriting the
-/// user's global config. `status-format` is unset as a whole array (no
-/// index) so every row reverts at once; `status-left`/`status-right` revert
-/// the powerline-side injections.
+/// user's global config.
 fn restore_session(session: &str) {
     for opt in ["status-format", "status", "status-left", "status-right"] {
         let _ = Command::new("tmux")
@@ -468,13 +412,8 @@ fn restore_session(session: &str) {
     }
 }
 
-fn refresh_clients() {
-    let _ = Command::new("tmux").args(["refresh-client", "-S"]).status();
-}
-
-/// Read a global (user) option value. We always read the *global* value,
-/// never the session-effective one, so our own session-local overrides
-/// can't feed back into a later compose (double-injection).
+/// Read a global (user) option value — never the session-effective one, so
+/// our own session-local overrides can't feed back into a later compose.
 fn global_option(name: &str) -> String {
     let out = Command::new("tmux")
         .args(["show-options", "-gv", name])
@@ -487,8 +426,8 @@ fn global_option(name: &str) -> String {
     }
 }
 
-/// The effective global `status-format[0]` — the user's powerline window
-/// list. Falls back to tmux's built-in default template when empty.
+/// The effective global `status-format[0]` (the powerline window list),
+/// falling back to tmux's built-in default template when empty.
 fn global_powerline_row() -> String {
     let value = global_option("status-format[0]");
     if value.is_empty() {
@@ -498,82 +437,78 @@ fn global_powerline_row() -> String {
     }
 }
 
-/// A live tmux pane and whether it's the focused pane of its session (the
-/// active pane of the session's active window).
-struct LivePane {
-    id: String,
-    session: String,
-    focused: bool,
+/// tmux's `status` is a choice option (`off`/`on`/`2`..`5`); `"1"` is
+/// rejected, so a single row must be spelled `on`.
+fn status_value(rows: usize) -> String {
+    match rows {
+        0 => "off".to_string(),
+        1 => "on".to_string(),
+        n => n.to_string(),
+    }
 }
 
-/// All live panes. `None` means the tmux server is gone (the command
-/// failed), which the caller treats as a shutdown signal.
-fn list_panes() -> Option<Vec<LivePane>> {
-    let out = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_id} #{session_id} #{pane_active} #{window_active}",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// Whether a process is still alive (`kill(pid, 0)`: 0 = exists, EPERM =
+/// exists but unsignalable, ESRCH = gone).
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut v = Vec::new();
-    for line in s.lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if let [pane, session, pane_active, window_active] = f.as_slice() {
-            v.push(LivePane {
-                id: pane.to_string(),
-                session: session.to_string(),
-                focused: *pane_active == "1" && *window_active == "1",
-            });
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn spawn_tmux_reader(mut events: EventStream, tx: mpsc::Sender<Incoming>) {
+    thread::spawn(move || loop {
+        let ev = match events.next_event() {
+            Ok(ev) => ev,
+            Err(_) => return,
+        };
+        // Forward only what the handler reacts to; tmux emits a lot of
+        // chatter (%output, command frames) that would just backpressure.
+        let forward = match &ev {
+            control::Event::Notification { name, .. } => matches!(
+                name.as_str(),
+                "window-pane-changed" | "session-window-changed"
+            ),
+            control::Event::Exit => true,
+            _ => false,
+        };
+        if !forward {
+            continue;
         }
-    }
-    Some(v)
+        let exit = matches!(ev, control::Event::Exit);
+        if tx.send(Incoming::Tmux(ev)).is_err() || exit {
+            return;
+        }
+    });
 }
 
-// --- active-session marker file (crash recovery) ---------------------------
-
-fn active_path(server_id: &str) -> PathBuf {
-    crate::cache::cache_dir()
-        .join("server")
-        .join(server_id)
-        .join("active-sessions")
+fn spawn_socket_reader(socket: std::os::unix::net::UnixListener, tx: mpsc::Sender<Incoming>) {
+    thread::spawn(move || {
+        for stream in socket.incoming() {
+            let Ok(s) = stream else { continue };
+            let reader = BufReader::new(s);
+            for line in reader.lines().map_while(Result::ok) {
+                if tx.send(Incoming::Registrar(line)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
 }
-
-fn read_active(server_id: &str) -> HashSet<String> {
-    match std::fs::read_to_string(active_path(server_id)) {
-        Ok(text) => text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
-        Err(_) => HashSet::new(),
-    }
-}
-
-fn write_active(server_id: &str, sessions: &HashSet<String>) {
-    let body = sessions.iter().cloned().collect::<Vec<_>>().join("\n");
-    let _ = crate::cache::write_atomic(&active_path(server_id), &body);
-}
-
-// --- diagnostics -----------------------------------------------------------
 
 struct DaemonLog {
     path: PathBuf,
 }
 
 impl DaemonLog {
-    fn for_server(server_id: &str) -> Self {
+    fn for_session(server_id: &str, session: &str) -> Self {
         let path = crate::cache::cache_dir()
             .join("server")
             .join(server_id)
-            .join("daemon.log");
+            .join(format!("handler{}.log", sanitize_session(session)));
         Self { path }
     }
 
@@ -589,16 +524,9 @@ impl DaemonLog {
     }
 }
 
-fn spawn_socket_reader(socket: std::os::unix::net::UnixListener, tx: mpsc::Sender<String>) {
-    thread::spawn(move || {
-        for stream in socket.incoming() {
-            let Ok(s) = stream else { continue };
-            let reader = BufReader::new(s);
-            for line in reader.lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    return;
-                }
-            }
-        }
-    });
+/// Session ids (`$1`) → a filename-safe suffix.
+fn sanitize_session(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }

@@ -39,8 +39,9 @@ impl Default for Config {
 pub enum ParseOutcome {
     Run(Config),
     Hook(HookKind),
-    /// Run the long-lived tmux daemon that drives the status bar.
-    Daemon,
+    /// Run the per-session control-mode handler that drives the status bar
+    /// for the given tmux session. Spawned on demand by the registrar.
+    Handler(String),
     /// Manually reset the tmux bar to defaults (unset every
     /// `status-format[N]`, clear the `@ccstatus-active` sentinel, set
     /// `status` to `on`). For cleaning up a polluted bar when no
@@ -71,7 +72,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--updates" => cfg.updates = true,
             "--no-updates" => cfg.updates = false,
             "--install" => return ParseOutcome::Install,
-            "--daemon" => return ParseOutcome::Daemon,
+            "--session" => match iter.next() {
+                Some(s) if !s.is_empty() => return ParseOutcome::Handler(s),
+                _ => return ParseOutcome::Error("--session requires a tmux session id".into()),
+            },
             "--tmux-reset" => return ParseOutcome::TmuxReset,
             "--hook" => {
                 let kind = match iter.next().as_deref() {
@@ -114,8 +118,9 @@ Options:
   --no-updates      Disable update check (default)
   --install         Wire this binary into ~/.claude/settings.json and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop)
-  --daemon          Run the long-lived tmux daemon that drives the status
-                    bar per session while Claude sessions are active
+  --session <id>    Run the per-session control-mode handler for tmux
+                    session <id>. Spawned automatically by the registrar;
+                    not meant to be run by hand.
   --tmux-reset      Restore the global status bar to tmux defaults
                     (status-format[0] window list, higher slots unset,
                     status=on). Cleans up after a crashed daemon.

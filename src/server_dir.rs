@@ -4,9 +4,9 @@
 //!
 //! ```text
 //! /tmp/ccstatus-<uid>/server/<server-hash>/
-//!   daemon.lock      flock-held by the live daemon; contains its pid
-//!   daemon.sock      Unix socket the registrar pings
-//!   active-sessions  tmux sessions we hold a bar override on (crash marker)
+//!   handler<sess>.lock   flock-held by the live per-session handler
+//!   handler<sess>.sock   Unix socket the registrar pings for that session
+//!   handler<sess>.log    that handler's diagnostics
 //! ```
 
 use std::fs::{self, File, OpenOptions};
@@ -38,21 +38,21 @@ impl ServerDir {
         Ok(Self { root })
     }
 
-    pub fn lock_path(&self) -> PathBuf {
-        self.root.join("daemon.lock")
+    pub fn lock_path(&self, session: &str) -> PathBuf {
+        self.root.join(format!("handler{}.lock", sanitize_session(session)))
     }
 
-    pub fn socket_path(&self) -> PathBuf {
-        self.root.join("daemon.sock")
+    pub fn socket_path(&self, session: &str) -> PathBuf {
+        self.root.join(format!("handler{}.sock", sanitize_session(session)))
     }
 
-    /// Try to acquire the per-server daemon lock. Returns
-    /// `Ok(Some(lock))` if we got it, `Ok(None)` if another live daemon
+    /// Try to acquire the per-session handler lock. Returns
+    /// `Ok(Some(lock))` if we got it, `Ok(None)` if another live handler
     /// holds it. Stale lock files (whose owner died) are taken over
     /// automatically because `flock` releases on FD close, including
     /// process exit.
-    pub fn try_lock(&self) -> Result<Option<DaemonLock>, String> {
-        let path = self.lock_path();
+    pub fn try_lock(&self, session: &str) -> Result<Option<DaemonLock>, String> {
+        let path = self.lock_path(session);
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -75,15 +75,23 @@ impl ServerDir {
         Ok(Some(DaemonLock { _file: file }))
     }
 
-    /// Bind the per-server Unix socket. Removes any stale socket file
+    /// Bind the per-session Unix socket. Removes any stale socket file
     /// first — only safe because we hold the lock by the time this is
-    /// called, so no other live daemon could be listening.
-    pub fn bind_socket(&self) -> Result<UnixListener, String> {
-        let path = self.socket_path();
+    /// called, so no other live handler could be listening.
+    pub fn bind_socket(&self, session: &str) -> Result<UnixListener, String> {
+        let path = self.socket_path(session);
         let _ = fs::remove_file(&path);
         UnixListener::bind(&path)
             .map_err(|e| format!("binding {}: {e}", path.display()))
     }
+}
+
+/// Session ids (`$1`) → a filename-safe suffix (shared with the handler's
+/// log naming so a session's lock, socket, and log line up).
+fn sanitize_session(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn sanitize(s: &str) -> String {

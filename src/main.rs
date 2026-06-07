@@ -3,6 +3,7 @@ mod cache;
 mod cli;
 mod color;
 mod config;
+mod control;
 mod daemon;
 mod format;
 mod git;
@@ -41,7 +42,7 @@ fn main() -> ExitCode {
     let cfg = match cli::parse_args(env::args().skip(1)) {
         ParseOutcome::Run(c) => c,
         ParseOutcome::Hook(kind) => return hooks::run(kind),
-        ParseOutcome::Daemon => return daemon::run(),
+        ParseOutcome::Handler(session) => return daemon::run(session),
         ParseOutcome::TmuxReset => return tmux_reset(),
         ParseOutcome::Install => {
             return match install::run() {
@@ -96,10 +97,11 @@ fn main() -> ExitCode {
     // at least one element is routed to a tmux surface.
     if let Some(pane_id) = &pane_id
         && routing.any_tmux()
-        && let Some(session_id) = register_pane(&input, pane_id, &elements)
+        && register_pane(&input, pane_id, &elements).is_some()
+        && let Some(tmux_session) = tmux_session_of(pane_id)
     {
         let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
-        ipc::notify_register(&server_id, pane_id, &session_id);
+        ipc::notify_register(&server_id, &tmux_session, pane_id);
     }
 
     // Print the elements routed to Claude's own statusline.
@@ -248,6 +250,20 @@ fn ps_field(pid: u32, field: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The tmux session id (e.g. `$1`) that contains the given pane, used to
+/// address its per-session handler.
+fn tmux_session_of(pane_id: &str) -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["display", "-t", pane_id, "-p", "#{session_id}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn query_pane_tty(pane_id: &str) -> String {

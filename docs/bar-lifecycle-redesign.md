@@ -38,51 +38,61 @@ height on pane focus. This produced several defects:
   `set -t <session>` writes a session-local override; `set -u -t <session>`
   drops the override back to inheriting the global. The global is never touched
   by per-session overrides.
-- A control-mode client (`tmux -C attach`) always has a *current* session and
-  **dies when that session is killed**, even if other sessions remain
-  (`%session-changed` → `%exit`, no migration). There is no "global attach".
+- A control-mode client (`tmux -C attach -t X`) always has a *current*
+  session and **dies (`%exit`) when that session is killed**. We turn this
+  into a feature: one handler per session, so `%exit` *is* its shutdown
+  signal (Phase 3).
+- A control client does **not** resize the session unless it sends
+  `refresh-client -C`; attaching alone is size-neutral. So the handler must
+  never send `-C`.
+- `%window-pane-changed` and `%session-window-changed` fire in control mode
+  **without** a `-B` subscription, so focus is event-driven for free.
+- The focused pane of a session is `display -t <session> -p '#{pane_id}'`
+  (the target resolves to the session's active window's active pane);
+  `#{window_active_pane}` is not a valid format.
 - Changing `status` height changes the pane row budget for the displayed
   window → SIGWINCH reflow.
 
 ## Architecture
 
-**One polling daemon per tmux server.** No persistent control-mode attach.
+**One event-driven handler per tmux *session* that hosts Claude.** Each
+handler attaches a control client to exactly its session
+(`tmux -C attach -t <session>`).
 
-- The registrar (statusline render in a Claude pane) writes per-pane state and
-  pings the daemon over the per-server unix socket, spawning it if absent
-  (unchanged transport).
-- The daemon wakes on a timer (a few seconds; warmth/cache-expiry flips on a
-  time threshold, so sub-second resolution is unnecessary) and on socket pings.
-  Each tick it:
-  - enumerates panes + their tmux sessions in one `tmux list-panes -a -F …`
-    call (also detects closed panes);
-  - prunes registered panes whose tmux pane is gone **or whose `claude_pid`
-    has exited** — so the bar collapses when the user quits Claude even if
-    the shell pane stays open ("last Claude exited", not "pane closed");
-  - reconciles each session's bar against its **focused** pane (the active
-    pane of its active window): the bar shows only while focus is on a
-    registered Claude pane, and that pane drives the content;
-  - rewrites live elements (warmth) for active sessions.
-- All bar mutations are **session-local** (`set -t <session> …`), composed with
-  the user's captured values, and removed with `set -u -t <session> …` on
-  teardown. **The global config is never written**, so:
-  - the black bar is structurally impossible (we never blank the global
-    `status-format[0]`);
-  - pollution detection is deleted — a crash leaves at most a session-local
-    override, cleared on next startup by unsetting our own overrides.
-- **Focus-driven.** A session's bar shows ccstatus only while its focused
-  pane is a registered Claude pane; switching to any other pane clears it
-  (reverts to just the powerline). Height = (elements routed to dedicated
-  rows) + 1 powerline row. Consequence: for `row*`-routed content, focus
-  changes between a Claude and non-Claude pane change the height and so
-  reflow that session's panes — inherent to a per-session status height.
-  Elements routed to `left`/`right` clear with **no reflow** (the powerline
-  row count is unchanged), so route there to avoid reflow entirely.
-- **Lifecycle.** Spawn on first registrar ping. Exit when the server is gone
-  (`list-panes` fails) or no Claude panes remain after a short grace (5s).
-  Bar deactivation is decoupled from process exit — a session's bar collapses
-  the moment its last Claude pane goes, regardless of when the daemon exits —
-  so the grace only governs respawn cost, not bar correctness.
+- The registrar (statusline render in a Claude pane) writes per-pane state,
+  derives its tmux session (`display -t $TMUX_PANE -p '#{session_id}'`), and
+  pings that session's handler over a per-**session** unix socket — spawning
+  `ccstatus --session <id>` if none holds the per-session lock.
+- The handler runs one `mpsc` loop fed by three sources:
+  - the **control connection** — `%window-pane-changed` /
+    `%session-window-changed` wake it on focus changes (no `-B` subscription
+    needed); `%exit` means its session was killed → it exits (the death *is*
+    the shutdown signal, no re-attach);
+  - the **registrar socket** — `register <pane>` marks a Claude pane;
+  - a **timer** (3s) for the only work with no event source: the warmth
+    threshold and Claude-PID-death (Claude exits while its shell pane stays
+    open, which tmux doesn't signal).
+- On any wake it re-queries the session's focused pane
+  (`display -t <session> -p '#{pane_id}'`), prunes panes whose `claude_pid`
+  died, and reconciles: the bar shows ccstatus **iff the focused pane is a
+  registered Claude pane**, which also drives the content.
+- All bar mutations are **session-local** (`set -t <session> …`), composed
+  with the user's global values, and removed with `set -u -t <session> …`.
+  **The global config is never written**, so the black bar is structurally
+  impossible and there is nothing to "pollute" — a crashed handler leaves at
+  most a session-local override, cleared when the next handler for that
+  session starts (it restores once before reconciling). The control client
+  **never sends `refresh-client -C`**, so it can't resize the user's view.
+- **Focus-driven, event-driven.** Switching to a Claude pane shows the bar;
+  switching away clears it — on the control event, so effectively instant.
+  Height = (elements routed to dedicated rows) + 1 powerline row.
+  Consequence: for `row*`-routed content the height changes on focus, so that
+  session's panes reflow; `left`/`right`-routed content clears with **no
+  reflow**.
+- **Lifecycle.** Spawn on first registrar ping for a session. Exit on `%exit`
+  (session killed — nothing to restore, the options died with it) or when no
+  Claude panes remain after a short grace (5s, graceful restore). Each
+  session is independent; one closing never disturbs another.
 
 ## Routing
 
@@ -166,3 +176,13 @@ Sub-phases:
 - **2c** (done): config-file hot reload — the daemon re-reads on mtime
   change each loop and re-renders active sessions, so editing `config.json`
   re-lays-out the bar with no restart.
+
+### Phase 3 — event-driven per-session handlers (done)
+
+Replaces Phase 1's per-server polling daemon (and its `active-sessions`
+marker) with one control-mode handler per session, matching tmux's own
+organisation. See the Architecture section above — this is the current
+model. Focus is now event-driven (instant) instead of polled; the only
+remaining timer work is the warmth threshold and Claude-PID-death. `control.rs`
+is restored (a control client per session); the registrar keys its
+spawn/ping by session.
