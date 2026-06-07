@@ -10,10 +10,43 @@ use std::thread;
 use std::time::Duration;
 
 use crate::control;
+use crate::server_dir::ServerDir;
 use crate::snapshot::{self, Snapshot};
 use crate::tmux;
 
 pub fn run() -> ExitCode {
+    let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
+
+    let dir = match ServerDir::for_current(&server_id) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ccstatus daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let _lock = match dir.try_lock() {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            // Another daemon already owns this server. Exit silently so
+            // registrar pings (the thing that spawns us) treat this as
+            // "already running" rather than an error.
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("ccstatus daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let _socket = match dir.bind_socket() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ccstatus daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut conn = match control::Connection::attach() {
         Ok(c) => c,
         Err(e) => {
@@ -21,8 +54,6 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
 
     let snap = match Snapshot::capture(&mut conn) {
         Ok(s) => s,
@@ -38,7 +69,7 @@ pub fn run() -> ExitCode {
         // for crash recovery.
     }
     eprintln!(
-        "ccstatus daemon: snapshot captured (status={}, position={})",
+        "ccstatus daemon: lock + socket acquired (server={server_id}), snapshot captured (status={}, position={})",
         snap.status, snap.status_position
     );
 
