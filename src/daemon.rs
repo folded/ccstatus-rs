@@ -359,6 +359,47 @@ impl Daemon {
         }
         set_session(session, &format!("status-format[{idx}]"), &global_powerline_row());
         set_session(session, "status", &status_value(idx + 1));
+
+        // Powerline sides: inject the left/right-routed elements into the
+        // powerline row's status-left/status-right, composed with the
+        // user's (global) value. Zero added height.
+        self.write_powerline_side(session, Dest::Left, "status-left", &content);
+        self.write_powerline_side(session, Dest::Right, "status-right", &content);
+    }
+
+    /// Compose the elements routed to a powerline side and set the
+    /// session-local `status-left`/`status-right`, keeping the user's
+    /// global value at the screen edge. Leaves the option untouched (so it
+    /// keeps inheriting the global) when nothing is routed there.
+    fn write_powerline_side(
+        &self,
+        session: &str,
+        dest: Dest,
+        option: &str,
+        content: &dyn Fn(Element) -> Option<String>,
+    ) {
+        let parts: Vec<String> = self
+            .routing
+            .elements_for(dest)
+            .into_iter()
+            .filter_map(content)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return;
+        }
+        let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(
+            parts.iter().map(String::as_str),
+        ));
+        let user = global_option(option);
+        let combined = match (user.is_empty(), dest) {
+            (true, _) => mine,
+            // Our segment sits at the screen edge; the user's value next to
+            // the window list.
+            (false, Dest::Left) => format!("{mine} {user}"),
+            (false, _) => format!("{user} {mine}"),
+        };
+        set_session(session, option, &combined);
     }
 
     fn restore_all(&mut self) {
@@ -414,32 +455,39 @@ fn set_session(session: &str, name: &str, value: &str) {
 
 /// Drop all bar overrides for a session, reverting it to inheriting the
 /// user's global config. `status-format` is unset as a whole array (no
-/// index) so every row reverts at once.
+/// index) so every row reverts at once; `status-left`/`status-right` revert
+/// the powerline-side injections.
 fn restore_session(session: &str) {
-    let _ = Command::new("tmux")
-        .args(["set-option", "-u", "-t", session, "status-format"])
-        .status();
-    let _ = Command::new("tmux")
-        .args(["set-option", "-u", "-t", session, "status"])
-        .status();
+    for opt in ["status-format", "status", "status-left", "status-right"] {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-u", "-t", session, opt])
+            .status();
+    }
 }
 
 fn refresh_clients() {
     let _ = Command::new("tmux").args(["refresh-client", "-S"]).status();
 }
 
-/// The effective global `status-format[0]` — the user's powerline window
-/// list. Falls back to tmux's built-in default template when empty.
-fn global_powerline_row() -> String {
+/// Read a global (user) option value. We always read the *global* value,
+/// never the session-effective one, so our own session-local overrides
+/// can't feed back into a later compose (double-injection).
+fn global_option(name: &str) -> String {
     let out = Command::new("tmux")
-        .args(["show-options", "-gv", "status-format[0]"])
+        .args(["show-options", "-gv", name])
         .output();
-    let value = match out {
+    match out {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
         }
         _ => String::new(),
-    };
+    }
+}
+
+/// The effective global `status-format[0]` — the user's powerline window
+/// list. Falls back to tmux's built-in default template when empty.
+fn global_powerline_row() -> String {
+    let value = global_option("status-format[0]");
     if value.is_empty() {
         tmux::DEFAULT_STATUS_FORMAT_0.to_string()
     } else {

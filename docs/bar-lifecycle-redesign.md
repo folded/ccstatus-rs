@@ -153,6 +153,9 @@ Sub-phases:
   pane state stores named elements. Default routing reproduces the Phase 1
   look (segments→row2, heatmap_main→row1, heatmap_sub→row0, warmth→row2).
   Removed the now-dead `--render-tmux` subprocess path.
-- **2b**: `left`/`right` via per-session `status-left`/`status-right`
-  composition (capture the user's value, compose, restore by unset).
+- **2b** (done): `left`/`right` via per-session `status-left`/`status-right`
+  composition. The daemon reads the user's *global* value (never the
+  session-effective one, to avoid double-injection), puts the ccstatus
+  segment at the screen edge with the user's value beside the window list,
+  and reverts by unsetting on teardown. Zero added height.
 - **2c**: config-file hot reload (daemon re-reads on mtime change).

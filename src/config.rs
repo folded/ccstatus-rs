@@ -119,6 +119,10 @@ pub enum Dest {
     Off,
     Claude,
     Row(u8),
+    /// The powerline row's `status-left` (zero added height).
+    Left,
+    /// The powerline row's `status-right` (zero added height).
+    Right,
 }
 
 impl Dest {
@@ -126,11 +130,18 @@ impl Dest {
         match s {
             "off" => Some(Dest::Off),
             "claude" => Some(Dest::Claude),
+            "left" => Some(Dest::Left),
+            "right" => Some(Dest::Right),
             _ => s
                 .strip_prefix("row")
                 .and_then(|n| n.parse::<u8>().ok())
                 .map(Dest::Row),
         }
+    }
+
+    /// A daemon-driven tmux surface (row or powerline side).
+    pub fn is_tmux(self) -> bool {
+        matches!(self, Dest::Row(_) | Dest::Left | Dest::Right)
     }
 }
 
@@ -162,13 +173,11 @@ impl Routing {
         self.dests[e as usize]
     }
 
-    /// Any element routed to a daemon-driven tmux surface (a row; in 2b also
-    /// left/right). Determines whether the registrar registers/spawns the
-    /// daemon at all.
+    /// Any element routed to a daemon-driven tmux surface (a row or a
+    /// powerline side). Determines whether the registrar registers/spawns
+    /// the daemon at all.
     pub fn any_tmux(&self) -> bool {
-        Element::ALL
-            .iter()
-            .any(|&e| matches!(self.dest(e), Dest::Row(_)))
+        Element::ALL.iter().any(|&e| self.dest(e).is_tmux())
     }
 
     /// Distinct row numbers used, ascending (row0 nearest the panes).
