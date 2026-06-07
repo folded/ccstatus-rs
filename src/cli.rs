@@ -42,8 +42,10 @@ pub enum ParseOutcome {
     Hook(HookKind),
     Render(RenderFlavor, String),
     /// Recompute the tmux status-row count for the focused pane and tell
-    /// the running tmux server. Argument is `#{pane_id}`.
-    TmuxOnFocus(String),
+    /// the running tmux server. Optional pane id is treated as a hint
+    /// only — the handler queries tmux for the actually-focused pane
+    /// because not every hook event reports the new focus correctly.
+    TmuxOnFocus(Option<String>),
     Install,
     Help,
     Version,
@@ -70,15 +72,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--no-updates" => cfg.updates = false,
             "--install" => return ParseOutcome::Install,
             "--tmux-on-focus" => {
-                let pane_id = match iter.next() {
-                    Some(p) if !p.is_empty() => p,
-                    _ => {
-                        return ParseOutcome::Error(
-                            "--tmux-on-focus requires a <pane_id> argument".into(),
-                        );
-                    }
-                };
-                return ParseOutcome::TmuxOnFocus(pane_id);
+                let hint = iter.next().filter(|s| !s.is_empty());
+                return ParseOutcome::TmuxOnFocus(hint);
             }
             "--hook" => {
                 let kind = match iter.next().as_deref() {
@@ -166,10 +161,11 @@ Options:
   --render-tmux <flavor> <pane_id>
                     Emit a tmux status line for the given pane.
                     Flavors: row | line <N>
-  --tmux-on-focus <pane_id>
+  --tmux-on-focus [<pane_id>]
                     Resize the tmux status bar based on whether the focused
-                    pane has a registered Claude session. Run from a tmux
-                    pane-focus-in hook.
+                    pane has a registered Claude session. Run from tmux
+                    focus-related hooks. The pane id is a hint only; the
+                    handler queries tmux for the actually-focused pane.
   -h, --help        Show this help and exit
   -V, --version     Show ccstatus version and exit
 

@@ -35,25 +35,43 @@ pub fn server_id() -> Option<String> {
 /// pane carries a Claude session. Invoked from a `pane-focus-in` hook so
 /// that the rich ccstatus rows only consume vertical space when they
 /// have something to show.
-pub fn on_focus(pane_id: &str) -> ExitCode {
-    let target = if pane_has_claude(pane_id) {
+pub fn on_focus(hint: Option<&str>) -> ExitCode {
+    // Don't trust the pane id the hook passed via `#{pane_id}` — some hook
+    // events (`client-session-changed`, `session-window-changed`, …) fire
+    // with the *previously*-active pane id, which would race against the
+    // earlier `pane-focus-in` firing and ratchet status back to 4. Always
+    // ask tmux which pane the client currently considers focused.
+    let pane_id = match current_pane().or_else(|| hint.map(str::to_string)) {
+        Some(p) => p,
+        None => return ExitCode::SUCCESS,
+    };
+    let target = if pane_has_claude(&pane_id) {
         ROWS_WITH_CLAUDE
     } else {
         ROWS_WITHOUT_CLAUDE
     };
-    // tmux short-circuits if the value already matches, so this is cheap
-    // to call on every focus event.
     let _ = Command::new("tmux")
         .args(["set-option", "-g", "status", &target.to_string()])
         .status();
-    // Force an immediate status redraw — otherwise the new pane's #()
-    // substitutions wouldn't appear until the next status-interval tick,
-    // and the row-count change wouldn't apply visually until something
-    // else triggered a redraw.
+    // Force an immediate redraw — without this the row-count change and
+    // the per-pane #() substitutions wouldn't reflect visually until the
+    // next status-interval tick.
     let _ = Command::new("tmux")
         .args(["refresh-client", "-S"])
         .status();
     ExitCode::SUCCESS
+}
+
+fn current_pane() -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["display-message", "-p", "#{pane_id}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn pane_has_claude(pane_id: &str) -> bool {
