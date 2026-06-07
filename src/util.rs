@@ -13,6 +13,18 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether a process is still alive (`kill(pid, 0)`: 0 = exists, EPERM =
+/// exists but unsignalable, ESRCH = gone). `pid == 0` is treated as dead.
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Extract the Claude session id from a stdin payload. Prefers an explicit
 /// `session_id` top-level field; falls back to the basename (without
 /// extension) of `transcript_path` so older / leaner payloads still work.

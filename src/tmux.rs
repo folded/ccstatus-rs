@@ -37,6 +37,12 @@ pub trait Tmux {
     /// Repaint all clients. One-shot fork — used by `--tmux-reset` ONLY. The
     /// handler refreshes over its control connection (`Writer`), not here.
     fn refresh(&self);
+
+    /// Focus a pane: make it the active pane of its (active) window and switch
+    /// the attached client to its session. The "take me to this Claude" jump.
+    /// Pane ids are server-unique, so this addresses the right pane as long as
+    /// the command runs against the pane's own tmux server.
+    fn focus_pane(&self, pane: &str);
 }
 
 /// Production adapter: each method builds args and spawns `tmux`.
@@ -101,6 +107,15 @@ impl Tmux for CliTmux {
 
     fn refresh(&self) {
         let _ = Command::new("tmux").arg("refresh-client").status();
+    }
+
+    fn focus_pane(&self, pane: &str) {
+        // select-pane sets the active pane within its window; select-window
+        // makes that the active window of its session; switch-client moves the
+        // attached client onto that session. Together: jump to the pane.
+        let _ = Command::new("tmux").args(["select-pane", "-t", pane]).status();
+        let _ = Command::new("tmux").args(["select-window", "-t", pane]).status();
+        let _ = Command::new("tmux").args(["switch-client", "-t", pane]).status();
     }
 }
 
@@ -208,6 +223,7 @@ pub enum Write {
     SetGlobal(String, String),
     UnsetGlobal(String),
     Refresh,
+    Focus(String),
 }
 
 /// Test adapter: records writes, serves canned reads.
@@ -273,6 +289,10 @@ impl Tmux for FakeTmux {
 
     fn refresh(&self) {
         self.writes.borrow_mut().push(Write::Refresh);
+    }
+
+    fn focus_pane(&self, pane: &str) {
+        self.writes.borrow_mut().push(Write::Focus(pane.to_string()));
     }
 }
 

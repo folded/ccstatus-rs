@@ -1,15 +1,17 @@
-//! Registrar → handler notifications over the per-session Unix socket.
+//! Notifications to a handler over its per-session Unix socket.
 //!
 //! Protocol is one line per message:
 //!
 //! ```text
-//! register <pane_id>
+//! register <pane_id>     from the registrar: this pane is a Claude pane
+//! focus <pane_id>        from an aggregate surface: jump to this pane
 //! ```
 //!
 //! The socket is already per session, so the session isn't in the message.
 //! No reply — fire and forget. If no handler is listening the registrar
 //! spawns one (`tmux -C attach -t <session>`, detached) and retries the
-//! connect briefly.
+//! connect briefly. A `focus` is *not* spawned on demand: a jump only makes
+//! sense for a session a handler is already driving.
 
 use std::env;
 use std::io::Write;

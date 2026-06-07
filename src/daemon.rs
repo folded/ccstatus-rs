@@ -210,7 +210,7 @@ impl Handler {
             Incoming::Tmux(control::Event::Exit) => true,
             Incoming::Tmux(_) => false,
             Incoming::Registrar(line) => {
-                self.handle_register(line);
+                self.handle_message(&line);
                 false
             }
         }
@@ -227,13 +227,25 @@ impl Handler {
         }
     }
 
-    fn handle_register(&mut self, line: String) {
+    /// Handle a one-line socket message from a registrar or an aggregate
+    /// surface. `register <pane>` adds a Claude pane; `focus <pane>` is the
+    /// "take me to this Claude" jump — actuated only by the daemon that owns
+    /// the pane (broadcasts to sibling daemons on the same server no-op), so
+    /// exactly one client switch happens.
+    fn handle_message(&mut self, line: &str) {
         let mut parts = line.split_whitespace();
-        if let (Some("register"), Some(pane)) = (parts.next(), parts.next()) {
-            if self.panes.insert(pane.to_string()) {
-                self.log.write(&format!("register pane {pane}"));
+        match (parts.next(), parts.next()) {
+            (Some("register"), Some(pane)) => {
+                if self.panes.insert(pane.to_string()) {
+                    self.log.write(&format!("register pane {pane}"));
+                }
+                self.last_activity = Instant::now();
             }
-            self.last_activity = Instant::now();
+            (Some("focus"), Some(pane)) if self.panes.contains(pane) => {
+                self.log.write(&format!("focus pane {pane}"));
+                self.tmux.focus_pane(pane);
+            }
+            _ => {}
         }
     }
 
@@ -255,7 +267,7 @@ impl Handler {
         let before = self.panes.len();
         self.panes.retain(|pane| {
             state::read_pane(&server_id, pane)
-                .map(|p| pid_alive(p.claude_pid))
+                .map(|p| crate::util::pid_alive(p.claude_pid))
                 .unwrap_or(false)
         });
         if self.panes.len() != before {
@@ -466,18 +478,6 @@ fn should_exit(panes_empty: bool, active: bool, idle: Duration) -> bool {
     panes_empty && !active && idle > IDLE_EXIT_AFTER
 }
 
-/// Whether a process is still alive (`kill(pid, 0)`: 0 = exists, EPERM =
-/// exists but unsignalable, ESRCH = gone).
-fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    if unsafe { libc::kill(pid as i32, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 fn spawn_tmux_reader(mut events: EventStream, tx: mpsc::Sender<Incoming>) {
     thread::spawn(move || loop {
         let ev = match events.next_event() {
@@ -650,6 +650,13 @@ mod tests {
                 Write::UnsetSession("$1".into(), "status-right".into()),
             ]
         );
+    }
+
+    #[test]
+    fn focus_pane_round_trips_through_the_seam() {
+        let t = FakeTmux::new();
+        t.focus_pane("%7");
+        assert_eq!(*t.writes.borrow(), vec![Write::Focus("%7".into())]);
     }
 
     #[test]
