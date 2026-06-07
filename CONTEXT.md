@@ -16,6 +16,10 @@ nouns below are specific to ccstatus.
   `%exit` (session killed) or after an idle grace with no Claude panes.
 - **hook** — `ccstatus --hook stop` (`hooks.rs`). Updates per-session
   **state** (last turn timestamp, model) on Claude's Stop event.
+- **top** — `ccstatus top` (`top.rs`). An interactive aggregate surface over
+  **all** live Claude sessions (not one tmux session): reads the **fleet**,
+  renders a table, and **jumps** to a selected session. Pull-based — it needs
+  no focus events, just the on-disk **state**.
 
 ## Concepts
 
@@ -36,8 +40,18 @@ nouns below are specific to ccstatus.
   the handler so it ticks while idle.
 - **state** — the on-disk data contract under `/tmp/ccstatus-<uid>/`:
   `pane/<server>/<pane>.json` (registrar) and `session/<id>.json` (hook).
+- **fleet** — the aggregate read model over **all** sessions' **state**
+  (`fleet.rs`). Enumerates the state dir, drops dead panes, probes handler
+  liveness, and folds into sorted `SessionView`s. Pure core (`build_views`) +
+  IO shell (`collect`). Disk state is display-only; liveness/addressing are
+  probed, never trusted from a file. Substrate for **top** and future
+  aggregate surfaces.
+- **jump** — "take me to this Claude": focus a session's tmux window + pane
+  from an aggregate surface. Actuated via `Tmux::focus_pane`; same-server jumps
+  go direct, cross-server jumps route through that server's **handler** (a
+  `focus <pane>` IPC message). See `docs/aggregate-surfaces-design.md`.
 
-## Modules being deepened (see docs/deepening-design.md)
+## Deepened modules
 
 - **tmux seam** (`Tmux` trait) — the single owner of one-shot tmux commands
   (option get/set/unset, focused-pane / session / tty queries, refresh,

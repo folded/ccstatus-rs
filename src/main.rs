@@ -5,6 +5,7 @@ mod color;
 mod config;
 mod control;
 mod daemon;
+mod fleet;
 mod format;
 mod git;
 mod heatmap;
@@ -17,6 +18,7 @@ mod server_dir;
 mod state;
 mod term;
 mod tmux;
+mod top;
 mod usage;
 mod util;
 
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
             println!("ccstatus: bar reset to defaults");
             return ExitCode::SUCCESS;
         }
+        ParseOutcome::Top => return top::run(),
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,

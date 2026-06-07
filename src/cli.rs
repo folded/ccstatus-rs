@@ -48,6 +48,9 @@ pub enum ParseOutcome {
     /// daemon is running.
     TmuxReset,
     Install,
+    /// Interactive aggregate view of every live Claude session, with
+    /// jump-to-session.
+    Top,
     Help,
     Version,
     Error(String),
@@ -77,6 +80,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 _ => return ParseOutcome::Error("--session requires a tmux session id".into()),
             },
             "--tmux-reset" => return ParseOutcome::TmuxReset,
+            "top" => return ParseOutcome::Top,
             "--hook" => {
                 let kind = match iter.next().as_deref() {
                     Some("stop") => HookKind::Stop,
@@ -116,6 +120,8 @@ Options:
   --no-heatmap      Hide the per-day token-usage heatmap rows
   --updates         Check for newer ccstatus releases (off by default)
   --no-updates      Disable update check (default)
+  top               Interactive table of every live Claude session, with
+                    jump-to-session (Enter). Quit with q.
   --install         Wire this binary into ~/.claude/settings.json and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop)
   --session <id>    Run the per-session control-mode handler for tmux

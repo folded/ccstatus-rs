@@ -49,6 +49,27 @@ pub fn notify_register(server_id: &str, tmux_session: &str, pane_id: &str) {
     }
 }
 
+/// Ask the handler that owns `pane_id` to jump to it, by sending `focus` to
+/// every handler socket on its server. Pane ids are server-unique, so only the
+/// owning handler acts (others no-op). Used for cross-server jumps, where the
+/// caller can't address the target tmux server directly but the handler —
+/// running in that server's environment — can.
+pub fn notify_focus(server_id: &str, pane_id: &str) {
+    let Ok(dir) = ServerDir::for_current(server_id) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir.root) else {
+        return;
+    };
+    let msg = format!("focus {pane_id}\n");
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) == Some("sock") {
+            try_send(&path, &msg);
+        }
+    }
+}
+
 fn try_send(socket_path: &Path, msg: &str) -> bool {
     match UnixStream::connect(socket_path) {
         Ok(mut s) => {
