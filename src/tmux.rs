@@ -45,21 +45,57 @@ pub fn on_focus(hint: Option<&str>) -> ExitCode {
         Some(p) => p,
         None => return ExitCode::SUCCESS,
     };
-    let target = if pane_has_claude(&pane_id) {
+    let has_claude = pane_has_claude(&pane_id);
+
+    // status-format[0] is the always-visible row (the only row when
+    // `status=on`). When the focused pane has Claude we want it to carry
+    // the ccstatus heatmap; otherwise it carries the powerline window
+    // list captured at tmux config time.
+    if has_claude {
+        set_option("status-format[0]", &ccstatus_format0());
+    } else if let Some(powerline) = get_option("@powerline-format") {
+        set_option("status-format[0]", &powerline);
+    }
+    let rows = if has_claude {
         ROWS_WITH_CLAUDE
     } else {
         ROWS_WITHOUT_CLAUDE
     };
-    let _ = Command::new("tmux")
-        .args(["set-option", "-g", "status", &status_value(target)])
-        .status();
-    // Force an immediate redraw — without this the row-count change and
-    // the per-pane #() substitutions wouldn't reflect visually until the
-    // next status-interval tick.
+    set_option("status", &status_value(rows));
+
     let _ = Command::new("tmux")
         .args(["refresh-client", "-S"])
         .status();
     ExitCode::SUCCESS
+}
+
+/// The format string used for status-format[0] when the focused pane has
+/// a Claude session: the sub-heatmap row, drawn closest to the panes (at
+/// the top of the status area when status-position is bottom).
+fn ccstatus_format0() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "ccstatus".to_string());
+    format!("#({exe} --render-tmux line 2 #{{pane_id}})")
+}
+
+fn set_option(name: &str, value: &str) {
+    let _ = Command::new("tmux")
+        .args(["set-option", "-g", name, value])
+        .status();
+}
+
+fn get_option(name: &str) -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["show-options", "-gv", name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Convert a row count to the spelling tmux's `status` option accepts.
