@@ -50,10 +50,10 @@ const IDLE_EXIT_AFTER: Duration = Duration::from_secs(60);
 
 /// Maximum time the main loop waits when nothing is happening. Events
 /// (tmux notifications, registrar pings) wake the loop immediately;
-/// this is the *idle* poll interval, used solely to refresh the warmth
-/// indicator in row content. Short enough that warm→cold flips appear
-/// near-instantly without busy-waiting.
-const IDLE_POLL: Duration = Duration::from_millis(100);
+/// this is the *idle* poll interval, used to (a) refresh the warmth
+/// indicator and (b) fall back on polling tmux for the focused pane in
+/// case subscription notifications didn't fire.
+const IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// Threshold (seconds) at which the cache-warmth label flips from warm
 /// to cold. Sits a little under Claude's ~5-minute prompt-cache TTL so
@@ -114,6 +114,7 @@ pub fn run() -> ExitCode {
     // reached this point.
     let log = DaemonLog::for_server(&server_id);
     log.write("daemon process started");
+    log.write(&format!("binary: {}", std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()));
 
     let mut conn = match Connection::attach() {
         Ok(c) => c,
@@ -141,8 +142,13 @@ pub fn run() -> ExitCode {
     //   - session's active window changes (which makes a different
     //     pane visible without an in-window switch).
     // Without this subscription, neither case generates any
-    // notification we'd see in control mode.
-    let _ = conn.cmd("refresh-client -B 'focus=:#{window_active_pane}'");
+    // notification we'd see in control mode. Log the response so
+    // syntax errors don't get silently swallowed.
+    match conn.cmd("refresh-client -B focus:#{window_active_pane}") {
+        Ok(r) if r.ok => log.write("subscribed: focus:#{window_active_pane}"),
+        Ok(r) => log.write(&format!("subscribe rejected: {}", r.output)),
+        Err(e) => log.write(&format!("subscribe error: {e}")),
+    }
     // Capture the initial focused pane synchronously so we don't start
     // in an "unknown focus" state and miss the first reconcile.
     let initial_focus = conn
@@ -250,6 +256,7 @@ impl Daemon {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            self.poll_focus();
             self.reconcile();
             if self.should_exit() {
                 break;
@@ -260,6 +267,21 @@ impl Daemon {
         // Tell tmux we're done so the server cleans up our client slot
         // promptly. Without this it lingers until the OS reaps the pipe.
         let _ = self.writer.send("detach-client");
+    }
+
+    /// Belt-and-braces backup for the subscription notifications: shell
+    /// out to `tmux display-message` and ask which pane is currently
+    /// active. Cheap-ish (a fork+exec per IDLE_POLL) and catches the
+    /// case where subscriptions don't fire for in-window pane switches.
+    fn poll_focus(&mut self) {
+        let p = match query_focused_pane() {
+            Some(p) => p,
+            None => return,
+        };
+        if Some(p.as_str()) != self.focused_pane.as_deref() {
+            self.log.write(&format!("focus (poll) -> {p}"));
+            self.focused_pane = Some(p);
+        }
     }
 
     fn dispatch(&mut self, ev: Incoming) {
@@ -456,6 +478,22 @@ impl Daemon {
             && matches!(self.state, BarState::Idle)
             && self.last_activity.elapsed() > IDLE_EXIT_AFTER
     }
+}
+
+/// Shell out to a fresh `tmux display-message` client to ask which pane
+/// is currently active. Bypasses our control-mode connection entirely —
+/// each invocation is its own short-lived tmux client. Used as the
+/// fallback for missed subscription notifications.
+fn query_focused_pane() -> Option<String> {
+    let out = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{window_active_pane}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Truncate a (possibly multi-line, possibly unicode) format value to
