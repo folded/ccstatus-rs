@@ -207,6 +207,17 @@ impl Routing {
         Self::from_value(read_config())
     }
 
+    /// Test-only: a routing starting from the defaults with the given
+    /// element→dest overrides applied.
+    #[cfg(test)]
+    pub fn from_pairs(pairs: &[(Element, Dest)]) -> Self {
+        let mut r = Routing::default();
+        for &(e, d) in pairs {
+            r.dests[e as usize] = d;
+        }
+        r
+    }
+
     fn from_value(v: Option<Value>) -> Self {
         let mut r = Routing::default();
         let Some(route) = v.as_ref().and_then(|v| v.get("route")) else {

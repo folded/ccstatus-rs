@@ -12,9 +12,9 @@ use crate::state::SessionState;
 use crate::util::now_unix;
 
 /// Threshold at which the warmth indicator flips warm->cold. Sits a little
-/// under Claude's documented ~5-minute prompt-cache TTL. Mirrors the
-/// constant in `daemon.rs`.
-const WARM_THRESHOLD_SECS: i64 = 270;
+/// under Claude's documented ~5-minute prompt-cache TTL. The single owner;
+/// `daemon` reads it from here too.
+pub const WARM_THRESHOLD_SECS: i64 = 270;
 
 /// The inline separator between segments on one surface: ` | ` dimmed.
 pub fn sep() -> String {

@@ -53,9 +53,6 @@ const IDLE_EXIT_AFTER: Duration = Duration::from_secs(5);
 /// which tmux doesn't signal).
 const TICK: Duration = Duration::from_secs(3);
 
-/// Threshold (seconds) at which the cache-warmth label flips warm->cold.
-const WARM_THRESHOLD_SECS: i64 = 270;
-
 #[derive(Debug)]
 enum Incoming {
     Tmux(control::Event),
@@ -190,7 +187,7 @@ impl Handler {
             self.requery_focus();
             self.prune_dead_panes();
             self.reconcile();
-            if self.should_exit() {
+            if should_exit(self.panes.is_empty(), self.active, self.last_activity.elapsed()) {
                 self.log.write("idle with no Claude panes; exiting");
                 break;
             }
@@ -272,41 +269,40 @@ impl Handler {
     }
 
     /// Show ccstatus iff the focused pane is a registered Claude pane.
+    /// Computes the inputs to the pure `decide`, then performs the IO its
+    /// verdict implies.
     fn reconcile(&mut self) {
-        let focus_is_claude = self
+        let focused_claude = self
             .focused_pane
             .as_deref()
-            .map(|p| self.panes.contains(p))
-            .unwrap_or(false);
+            .filter(|p| self.panes.contains(*p))
+            .map(str::to_string);
         let force = std::mem::take(&mut self.force_rerender);
+        let warmth = focused_claude.as_deref().and_then(|p| self.pane_warmth(p));
+        let warmth_changed = warmth != self.last_warmth;
 
-        match (self.active, focus_is_claude) {
-            (false, true) => {
-                let pane = self.focused_pane.clone().unwrap();
+        match decide(self.active, focused_claude.as_deref(), force, warmth_changed) {
+            Action::Activate(pane) => {
                 self.log.write(&format!("activate via focused {pane}"));
-                self.write_rows(&pane);
+                self.render_and_apply(&pane);
                 self.active = true;
-                self.last_warmth = self.pane_warmth(&pane);
+                self.last_warmth = warmth;
                 self.last_activity = Instant::now();
                 self.refresh();
             }
-            (true, false) => {
+            Action::Rerender(pane) => {
+                self.render_and_apply(&pane);
+                self.last_warmth = warmth;
+                self.refresh();
+            }
+            Action::Deactivate => {
                 self.log.write("deactivate (focus left Claude)");
                 tmux::restore_session(self.tmux.as_ref(), &self.session);
                 self.active = false;
                 self.last_warmth = None;
                 self.refresh();
             }
-            (true, true) => {
-                let pane = self.focused_pane.clone().unwrap();
-                let warmth = self.pane_warmth(&pane);
-                if force || warmth != self.last_warmth {
-                    self.write_rows(&pane);
-                    self.last_warmth = warmth;
-                    self.refresh();
-                }
-            }
-            (false, false) => {}
+            Action::Noop => {}
         }
     }
 
@@ -315,12 +311,12 @@ impl Handler {
         let session = state::read_session(&pane.session_id)?;
         let last_turn = session.last_turn_ts?;
         let idle = crate::util::now_unix().saturating_sub(last_turn);
-        Some(if idle < WARM_THRESHOLD_SECS { "warm" } else { "cold" })
+        Some(if idle < render_tmux::WARM_THRESHOLD_SECS { "warm" } else { "cold" })
     }
 
-    /// Write the session-local rows + powerline sides from the routing
-    /// config, driven by the given (focused, Claude) pane's content.
-    fn write_rows(&self, pane_id: &str) {
+    /// Read the (focused, Claude) pane's content, build the bar plan from the
+    /// routing config, and apply it through the tmux seam.
+    fn render_and_apply(&self, pane_id: &str) {
         let Some(pane) = state::read_pane(&self.server_id, pane_id) else {
             return;
         };
@@ -333,66 +329,141 @@ impl Handler {
                 pane.elements.get(e.key()).cloned()
             }
         };
+        let plan = plan_bar(
+            &self.routing,
+            &content,
+            &tmux::powerline_row(self.tmux.as_ref()),
+            &self.tmux.global("status-left"),
+            &self.tmux.global("status-right"),
+        );
+        apply(self.tmux.as_ref(), &self.session, &plan);
+    }
+}
 
-        let mut idx = 0usize;
-        for row in self.routing.rows_used() {
-            let parts: Vec<String> = self
-                .routing
+/// The controller verdict: drive the observed bar to the desired bar, where
+/// desired = "show ccstatus iff the focused pane is a registered Claude pane".
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    Activate(String),
+    Deactivate,
+    Rerender(String),
+    Noop,
+}
+
+/// Pure transition. `focused_claude` is `Some(pane)` iff the focused pane is a
+/// registered Claude pane (the handler computes it once and passes it in).
+pub fn decide(
+    active: bool,
+    focused_claude: Option<&str>,
+    force: bool,
+    warmth_changed: bool,
+) -> Action {
+    match (active, focused_claude) {
+        (false, Some(p)) => Action::Activate(p.to_string()),
+        (true, None) => Action::Deactivate,
+        (true, Some(p)) if force || warmth_changed => Action::Rerender(p.to_string()),
+        _ => Action::Noop,
+    }
+}
+
+/// A fully-resolved set of bar mutations for one session: the status-format
+/// rows (dedicated rows first, powerline row last), the `status` choice value,
+/// and the two powerline sides.
+pub struct BarPlan {
+    pub formats: Vec<String>,
+    pub status: String,
+    pub left: Side,
+    pub right: Side,
+}
+
+/// A powerline side: an explicit value to set, or revert to inheriting the
+/// global (`unset_session`).
+pub enum Side {
+    Set(String),
+    Inherit,
+}
+
+/// Pure: turn routing + already-read element content into a concrete bar plan.
+/// `powerline_row` is the resolved global powerline template; `user_left` /
+/// `user_right` are the user's global `status-left` / `status-right`, composed
+/// onto the correct edge.
+pub fn plan_bar(
+    routing: &config::Routing,
+    content: &dyn Fn(Element) -> Option<String>,
+    powerline_row: &str,
+    user_left: &str,
+    user_right: &str,
+) -> BarPlan {
+    let mut formats: Vec<String> = routing
+        .rows_used()
+        .into_iter()
+        .map(|row| {
+            let parts: Vec<String> = routing
                 .elements_for(Dest::Row(row))
                 .into_iter()
                 .filter_map(content)
                 .filter(|s| !s.is_empty())
                 .collect();
-            let joined = render_tmux::join_segments(parts.iter().map(String::as_str));
-            let row = render_tmux::ansi_to_tmux(&joined);
-            self.tmux.set_session(&self.session, &format!("status-format[{idx}]"), &row);
-            idx += 1;
-        }
-        self.tmux.set_session(
-            &self.session,
-            &format!("status-format[{idx}]"),
-            &tmux::powerline_row(self.tmux.as_ref()),
-        );
-        self.tmux.set_session(&self.session, "status", &tmux::status_value(idx + 1));
+            render_tmux::ansi_to_tmux(&render_tmux::join_segments(parts.iter().map(String::as_str)))
+        })
+        .collect();
+    formats.push(powerline_row.to_string());
+    let status = tmux::status_value(formats.len());
 
-        self.write_powerline_side(Dest::Left, "status-left", &content);
-        self.write_powerline_side(Dest::Right, "status-right", &content);
+    BarPlan {
+        formats,
+        status,
+        left: plan_side(routing, content, Dest::Left, user_left),
+        right: plan_side(routing, content, Dest::Right, user_right),
     }
+}
 
-    fn write_powerline_side(
-        &self,
-        dest: Dest,
-        option: &str,
-        content: &dyn Fn(Element) -> Option<String>,
-    ) {
-        let parts: Vec<String> = self
-            .routing
-            .elements_for(dest)
-            .into_iter()
-            .filter_map(content)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if parts.is_empty() {
-            // Revert to inheriting the global (handles a hot-reload that
-            // removed the elements; no-op on a fresh activate).
-            self.tmux.unset_session(&self.session, option);
-            return;
-        }
-        let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(
-            parts.iter().map(String::as_str),
-        ));
-        let user = self.tmux.global(option);
-        let combined = match (user.is_empty(), dest) {
-            (true, _) => mine,
-            (false, Dest::Left) => format!("{mine} {user}"),
-            (false, _) => format!("{user} {mine}"),
-        };
-        self.tmux.set_session(&self.session, option, &combined);
+fn plan_side(
+    routing: &config::Routing,
+    content: &dyn Fn(Element) -> Option<String>,
+    dest: Dest,
+    user: &str,
+) -> Side {
+    let parts: Vec<String> = routing
+        .elements_for(dest)
+        .into_iter()
+        .filter_map(content)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        // Revert to inheriting the global (handles a hot-reload that removed
+        // the elements; no-op on a fresh activate).
+        return Side::Inherit;
     }
+    let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(parts.iter().map(String::as_str)));
+    let combined = match (user.is_empty(), dest) {
+        (true, _) => mine,
+        (false, Dest::Left) => format!("{mine} {user}"),
+        (false, _) => format!("{user} {mine}"),
+    };
+    Side::Set(combined)
+}
 
-    fn should_exit(&self) -> bool {
-        self.panes.is_empty() && !self.active && self.last_activity.elapsed() > IDLE_EXIT_AFTER
+/// Effect: apply a bar plan to a session through the tmux seam.
+fn apply(t: &dyn Tmux, session: &str, plan: &BarPlan) {
+    for (i, f) in plan.formats.iter().enumerate() {
+        t.set_session(session, &format!("status-format[{i}]"), f);
     }
+    t.set_session(session, "status", &plan.status);
+    match &plan.left {
+        Side::Set(v) => t.set_session(session, "status-left", v),
+        Side::Inherit => t.unset_session(session, "status-left"),
+    }
+    match &plan.right {
+        Side::Set(v) => t.set_session(session, "status-right", v),
+        Side::Inherit => t.unset_session(session, "status-right"),
+    }
+}
+
+/// Pure: the handler exits once no Claude panes remain, it isn't active, and
+/// the idle grace has elapsed.
+fn should_exit(panes_empty: bool, active: bool, idle: Duration) -> bool {
+    panes_empty && !active && idle > IDLE_EXIT_AFTER
 }
 
 /// Whether a process is still alive (`kill(pid, 0)`: 0 = exists, EPERM =
@@ -477,4 +548,115 @@ fn sanitize_session(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Routing;
+    use crate::tmux::{FakeTmux, Write};
+
+    #[test]
+    fn decide_covers_the_transition_table() {
+        // inactive + Claude focused -> activate
+        assert_eq!(decide(false, Some("%1"), false, false), Action::Activate("%1".into()));
+        // active + focus left Claude -> deactivate
+        assert_eq!(decide(true, None, false, false), Action::Deactivate);
+        // active + Claude focused, nothing changed -> noop
+        assert_eq!(decide(true, Some("%1"), false, false), Action::Noop);
+        // active + Claude focused, forced -> rerender
+        assert_eq!(decide(true, Some("%1"), true, false), Action::Rerender("%1".into()));
+        // active + Claude focused, warmth flipped -> rerender
+        assert_eq!(decide(true, Some("%1"), false, true), Action::Rerender("%1".into()));
+        // inactive + nothing focused -> noop
+        assert_eq!(decide(false, None, true, true), Action::Noop);
+    }
+
+    #[test]
+    fn plan_bar_default_has_three_rows_plus_powerline() {
+        let routing = Routing::default();
+        let content = |e: Element| (e == Element::Model).then(|| "M".to_string());
+        let plan = plan_bar(&routing, &content, "PL", "", "");
+        assert_eq!(plan.formats.len(), 4); // rows 0/1/2 + powerline
+        assert_eq!(plan.formats[3], "PL");
+        assert_eq!(plan.status, "4");
+        assert!(matches!(plan.left, Side::Inherit));
+        assert!(matches!(plan.right, Side::Inherit));
+    }
+
+    #[test]
+    fn plan_bar_joins_row_segments_with_separator() {
+        let routing = Routing::from_pairs(&[
+            (Element::Model, Dest::Row(0)),
+            (Element::Cwd, Dest::Row(0)),
+        ]);
+        let content = |e: Element| match e {
+            Element::Model => Some("M".to_string()),
+            Element::Cwd => Some("C".to_string()),
+            _ => None,
+        };
+        let plan = plan_bar(&routing, &content, "PL", "", "");
+        let expected = render_tmux::ansi_to_tmux(&render_tmux::join_segments(["M", "C"]));
+        assert_eq!(plan.formats[0], expected);
+        assert!(expected.contains('|')); // the ` | ` separator survived
+    }
+
+    #[test]
+    fn plan_bar_composes_user_side_on_correct_edge() {
+        let routing = Routing::from_pairs(&[(Element::Tokens, Dest::Right)]);
+        let content = |e: Element| (e == Element::Tokens).then(|| "T".to_string());
+        let plan = plan_bar(&routing, &content, "PL", "UL", "UR");
+        let mine = render_tmux::ansi_to_tmux("T");
+        match plan.right {
+            Side::Set(s) => assert_eq!(s, format!("UR {mine}")), // user value on the left edge
+            Side::Inherit => panic!("expected Set"),
+        }
+        // Nothing routed left -> inherit the global.
+        assert!(matches!(plan.left, Side::Inherit));
+    }
+
+    #[test]
+    fn apply_emits_ordered_writes() {
+        let t = FakeTmux::new();
+        let plan = BarPlan {
+            formats: vec!["row0".into(), "powerline".into()],
+            status: "2".into(),
+            left: Side::Set("L".into()),
+            right: Side::Inherit,
+        };
+        apply(&t, "$1", &plan);
+        assert_eq!(
+            *t.writes.borrow(),
+            vec![
+                Write::SetSession("$1".into(), "status-format[0]".into(), "row0".into()),
+                Write::SetSession("$1".into(), "status-format[1]".into(), "powerline".into()),
+                Write::SetSession("$1".into(), "status".into(), "2".into()),
+                Write::SetSession("$1".into(), "status-left".into(), "L".into()),
+                Write::UnsetSession("$1".into(), "status-right".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn deactivate_restore_emits_four_unsets() {
+        let t = FakeTmux::new();
+        tmux::restore_session(&t, "$1");
+        assert_eq!(
+            *t.writes.borrow(),
+            vec![
+                Write::UnsetSession("$1".into(), "status-format".into()),
+                Write::UnsetSession("$1".into(), "status".into()),
+                Write::UnsetSession("$1".into(), "status-left".into()),
+                Write::UnsetSession("$1".into(), "status-right".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_exit_requires_no_panes_inactive_and_grace_elapsed() {
+        assert!(should_exit(true, false, IDLE_EXIT_AFTER + Duration::from_secs(1)));
+        assert!(!should_exit(false, false, IDLE_EXIT_AFTER + Duration::from_secs(1))); // panes remain
+        assert!(!should_exit(true, true, IDLE_EXIT_AFTER + Duration::from_secs(1))); // active
+        assert!(!should_exit(true, false, Duration::from_secs(0))); // within grace
+    }
 }
