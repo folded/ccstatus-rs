@@ -87,35 +87,40 @@ Each rendered piece is independently routable to one of:
   (updates only on Claude activity — *not* live; unsuitable for warmth);
 - **`off`**.
 
-Config is a single file read by both registrar and daemon, hot-reloaded on
-mtime change:
+Config is a single JSON file (matching the codebase's `serde_json`-only
+dependency set — no `toml` crate) read by both registrar and daemon:
 
-```toml
-# ~/.config/ccstatus/config.toml
-[route]
-model        = "powerline-left"
-tokens       = "tmux-row-1"
-warmth       = "powerline-right"
-heatmap_main = "tmux-row-2"
-heatmap_sub  = "off"
-effort       = "claude"
+```json
+// ~/.config/ccstatus/config.json
+{
+  "route": {
+    "rich": "tmux",
+    "heatmap_main": "tmux",
+    "heatmap_sub": "off"
+  }
+}
 ```
 
+Phase 1 destinations are `"tmux"` (a dedicated row), `"claude"` (stdout), and
+`"off"`; Phase 2 adds `"powerline-left"` / `"powerline-right"`. Outside tmux
+the registrar forces every line to `"claude"` (no tmux surface exists).
+
 **Constraint:** the live cache-expiry indicator only ticks on a
-daemon-controlled surface (`tmux-row-*` or `powerline-*`). Routed to `claude`
-it updates only when Claude re-renders.
+daemon-controlled surface (a tmux row, or — Phase 2 — a powerline segment).
+Routed to `claude` it updates only when Claude re-renders.
 
 ## Phases
 
-### Phase 1 — structural
+### Phase 1 — structural (done)
 
-- Polling daemon (drop control mode; remove `control.rs` once unused).
-- Per-session session-local overrides; capture/restore `status`,
-  `status-position`, `status-format[*]` per session.
+- Polling daemon (control mode dropped; `control.rs` removed).
+- Per-session session-local overrides; restore by whole-array unset, reverting
+  to the inherited global. No global write, no captured snapshot needed.
 - Fixed height keyed to Claude presence per session.
-- Delete pollution detection; crash recovery = unset our own session overrides
-  on startup.
-- Routing at line granularity (the 3 existing lines).
+- Pollution detection deleted; crash recovery = unset our own session
+  overrides on startup, tracked via an `active-sessions` marker file.
+- Routing at line granularity (the 3 existing lines) via `config.json`, read
+  once at daemon startup. Outside tmux everything routes to Claude.
 
 ### Phase 2 — element granularity
 

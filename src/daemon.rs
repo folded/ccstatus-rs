@@ -41,6 +41,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::{self, Dest, Line};
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
 use crate::state;
@@ -61,10 +62,6 @@ const POLL: Duration = Duration::from_secs(2);
 /// Mirrors the constant in `render_tmux.rs`; sits under Claude's ~5-minute
 /// prompt-cache TTL.
 const WARM_THRESHOLD_SECS: i64 = 270;
-
-/// Status rows while a session hosts a Claude pane: the powerline row plus
-/// the three ccstatus rows.
-const ROWS_ACTIVE: u32 = 4;
 
 pub fn run() -> ExitCode {
     let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
@@ -112,8 +109,13 @@ pub fn run() -> ExitCode {
     let (tx, rx) = mpsc::channel::<String>();
     spawn_socket_reader(socket, tx);
 
+    // Routing is read once at startup (Phase 1). Config edits take effect
+    // when the daemon next restarts; live hot-reload is Phase 2.
+    let routing = config::Routing::load();
+
     let mut daemon = Daemon {
         server_id,
+        routing,
         panes: HashMap::new(),
         active: HashSet::new(),
         last_warmth: HashMap::new(),
@@ -127,6 +129,8 @@ pub fn run() -> ExitCode {
 
 struct Daemon {
     server_id: String,
+    /// Where each rendered line is routed (read once at startup).
+    routing: config::Routing,
     /// Registered Claude panes: tmux pane_id -> claude session id (uuid).
     panes: HashMap<String, String>,
     /// tmux session ids we currently hold a bar override on.
@@ -242,7 +246,7 @@ impl Daemon {
             let warmth = self.pane_warmth(&pane_id);
             if !self.active.contains(session) {
                 self.log.write(&format!("activate session {session} via {pane_id}"));
-                self.apply_session(session, &pane_id);
+                self.write_rows(session, &pane_id);
                 self.active.insert(session.clone());
                 self.last_activity = Instant::now();
                 changed = true;
@@ -294,32 +298,28 @@ impl Daemon {
         Some(if idle < WARM_THRESHOLD_SECS { "warm" } else { "cold" })
     }
 
-    /// Apply the full bar override for a session: the ccstatus rows plus
-    /// the powerline row, then bump the row count.
-    fn apply_session(&mut self, session: &str, pane_id: &str) {
-        self.write_rows(session, pane_id);
-        set_session(session, "status", &ROWS_ACTIVE.to_string());
-    }
-
-    /// Write the four status-format rows for a session. Setting any index
-    /// replaces the whole session-local array, so we must write every row
-    /// we want, including the powerline row at `[3]`.
-    ///
-    /// Layout (status-position bottom; `[0]` is closest to the panes):
-    ///   [0] sub heatmap, [1] main heatmap, [2] rich line + warmth,
-    ///   [3] powerline window list (effective global `[0]`).
+    /// Write the session-local status-format rows and row count from the
+    /// routing config. Only lines routed to a tmux row are drawn; they
+    /// stack top-to-bottom (sub, main, rich) above the powerline row.
+    /// Setting any index replaces the whole session-local array, so we
+    /// write each row explicitly. Higher indices left over from a previous
+    /// layout are harmless: the `status` row count gates what renders.
     fn write_rows(&self, session: &str, pane_id: &str) {
         let Some(pane) = state::read_pane(&self.server_id, pane_id) else {
             return;
         };
         let sess = state::read_session(&pane.session_id).unwrap_or_default();
-        let line0 = render_tmux::format_stashed_line(&pane, &sess, 0);
-        let line1 = render_tmux::format_stashed_line(&pane, &sess, 1);
-        let line2 = render_tmux::format_stashed_line(&pane, &sess, 2);
-        set_session(session, "status-format[0]", &line2);
-        set_session(session, "status-format[1]", &line1);
-        set_session(session, "status-format[2]", &line0);
-        set_session(session, "status-format[3]", &global_powerline_row());
+        let mut idx = 0usize;
+        for line in Line::TMUX_ORDER {
+            if self.routing.dest(line) == Dest::Tmux {
+                let content = render_tmux::format_stashed_line(&pane, &sess, line.index());
+                set_session(session, &format!("status-format[{idx}]"), &content);
+                idx += 1;
+            }
+        }
+        // Powerline window list sits below the ccstatus rows.
+        set_session(session, &format!("status-format[{idx}]"), &global_powerline_row());
+        set_session(session, "status", &status_value(idx + 1));
     }
 
     fn restore_all(&mut self) {
@@ -340,6 +340,16 @@ impl Daemon {
 enum Reconcile {
     Ok,
     ServerGone,
+}
+
+/// tmux's `status` is a choice option (`off`/`on`/`2`..`5`); `"1"` is
+/// rejected, so a single row must be spelled `on`.
+fn status_value(rows: usize) -> String {
+    match rows {
+        0 => "off".to_string(),
+        1 => "on".to_string(),
+        n => n.to_string(),
+    }
 }
 
 /// `set-option -t <session> <name> <value>` (session-local override).

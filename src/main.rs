@@ -2,6 +2,7 @@ mod api;
 mod cache;
 mod cli;
 mod color;
+mod config;
 mod daemon;
 mod format;
 mod git;
@@ -82,22 +83,37 @@ fn main() -> ExitCode {
     let _ = cache::ensure_cache_dir();
 
     let out = render(&input, &cfg);
+    let lines: Vec<String> = out.split('\n').map(str::to_string).collect();
 
-    if let Some(pane_id) = active_tmux_pane() {
-        let lines: Vec<String> = out.split('\n').map(str::to_string).collect();
-        if let Some(session_id) = register_pane(&input, &pane_id, lines) {
-            let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
-            ipc::notify_register(&server_id, &pane_id, &session_id);
-        }
-        // tmux owns the visible display via the daemon's control-channel
-        // injection; emit nothing here so the Claude statusline row
-        // stays clear.
-        return ExitCode::SUCCESS;
+    // Inside tmux, routing decides where each line goes; outside tmux there
+    // is no tmux surface, so everything falls back to Claude's statusline.
+    let (routing, pane_id) = match active_tmux_pane() {
+        Some(pane_id) => (config::Routing::load(), Some(pane_id)),
+        None => (config::Routing::all_claude(), None),
+    };
+
+    // Hand the daemon the lines it's responsible for (any line routed to a
+    // tmux row). It still receives the full set so its row layout can pull
+    // each line by index.
+    if let Some(pane_id) = &pane_id
+        && routing.any_tmux()
+        && let Some(session_id) = register_pane(&input, pane_id, lines.clone())
+    {
+        let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
+        ipc::notify_register(&server_id, pane_id, &session_id);
     }
 
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    let _ = handle.write_all(out.as_bytes());
+    // Print the lines routed to Claude's own statusline, in rendered order.
+    let claude_lines: Vec<&str> = config::Line::ALL
+        .iter()
+        .filter(|&&l| routing.dest(l) == config::Dest::Claude)
+        .filter_map(|&l| lines.get(l.index()).map(String::as_str))
+        .collect();
+    if !claude_lines.is_empty() {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        let _ = handle.write_all(claude_lines.join("\n").as_bytes());
+    }
     ExitCode::SUCCESS
 }
 
