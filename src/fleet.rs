@@ -234,6 +234,8 @@ mod tests {
             turn_count: 0,
             context_pct_used: ctx,
             cache_read_pct: None,
+            cwd: None,
+            claude_pid: None,
         }
     }
 

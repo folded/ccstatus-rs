@@ -44,13 +44,25 @@ pub struct PaneState {
     pub elements: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Per-Claude-session record. The hook owns the turn fields
+/// (`last_turn_ts`, `turn_count`); the registrar owns the **presence** fields
+/// (`model`, `cwd`, `context_pct_used`, `cache_read_pct`, `claude_pid`),
+/// written on every render — *including outside tmux*, so a non-tmux session
+/// still appears in the fleet (as a non-jumpable row). Both writers
+/// read-modify-write the whole record, so each preserves the other's fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     pub last_turn_ts: Option<i64>,
     pub model: Option<String>,
     pub turn_count: u64,
     pub context_pct_used: Option<u32>,
     pub cache_read_pct: Option<u32>,
+    /// Working directory (presence). Plain text, unlike the pane's rendered
+    /// `cwd` element.
+    pub cwd: Option<String>,
+    /// The Claude process pid (presence) — the fleet's liveness anchor for
+    /// sessions with no pane file (i.e. outside tmux).
+    pub claude_pid: Option<u32>,
 }
 
 pub fn pane_path(server_id: &str, pane_id: &str) -> PathBuf {
@@ -129,6 +141,11 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
             .get("cache_read_pct")
             .and_then(|x| x.as_u64())
             .and_then(|n| u32::try_from(n).ok()),
+        cwd: v.get("cwd").and_then(|x| x.as_str()).map(str::to_string),
+        claude_pid: v
+            .get("claude_pid")
+            .and_then(|x| x.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
     })
 }
 
@@ -139,6 +156,8 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
         "turn_count": s.turn_count,
         "context_pct_used": s.context_pct_used,
         "cache_read_pct": s.cache_read_pct,
+        "cwd": s.cwd,
+        "claude_pid": s.claude_pid,
     });
     cache::write_atomic(&session_path(session_id), &v.to_string())
 }

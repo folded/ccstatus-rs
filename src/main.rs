@@ -90,6 +90,10 @@ fn main() -> ExitCode {
 
     let _ = cache::ensure_cache_dir();
 
+    // Presence: record this session's model/cwd/context/pid every render, so
+    // the fleet sees it even outside tmux (where no pane state is written).
+    write_session_presence(&input);
+
     let elements = render_elements(&input, &cfg);
 
     // Inside tmux, routing decides where each element goes; outside tmux
@@ -220,6 +224,68 @@ fn ps_field(pid: u32, field: &str) -> Option<String> {
 
 fn pane_recent(server_id: &str, pane_id: &str, window: Duration) -> bool {
     let meta = match fs::metadata(state::pane_path(server_id, pane_id)) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    SystemTime::now()
+        .duration_since(mtime)
+        .map(|age| age < window)
+        .unwrap_or(false)
+}
+
+/// Record this session's presence (model, cwd, context, pid) so the fleet can
+/// show it — crucially, this runs on *every* render, including outside tmux
+/// where no pane state exists. Merges into the session record without
+/// touching the hook-owned turn fields. Coalesced: skips when nothing changed,
+/// and (to spare a streaming statusline) when an unchanged-but-for-context
+/// write would land within 1s of the last one.
+fn write_session_presence(input: &Value) {
+    let Some(session_id) = resolve_session_id(input) else {
+        return;
+    };
+    let mut s = state::read_session(&session_id).unwrap_or_default();
+    let before = s.clone();
+
+    s.model = input
+        .pointer("/model/display_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or(s.model);
+    let cwd = input.pointer("/cwd").and_then(|v| v.as_str()).unwrap_or("");
+    if !cwd.is_empty() {
+        s.cwd = Some(cwd.to_string());
+    }
+    s.claude_pid = Some(resolve_claude_pid());
+
+    let usage = input.pointer("/context_window/current_usage");
+    let size = input
+        .pointer("/context_window/context_window_size")
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .unwrap_or(200_000);
+    let input_tokens = u64_at(usage, "input_tokens");
+    let cache_create = u64_at(usage, "cache_creation_input_tokens");
+    let cache_read = u64_at(usage, "cache_read_input_tokens");
+    let current = input_tokens + cache_create + cache_read;
+    s.context_pct_used = Some((current * 100 / size).min(100) as u32);
+    let denom = input_tokens + cache_create + cache_read;
+    s.cache_read_pct = Some(if denom > 0 { (cache_read * 100 / denom) as u32 } else { 0 });
+
+    if s == before {
+        return;
+    }
+    if session_recent(&session_id, Duration::from_secs(1)) {
+        return;
+    }
+    let _ = state::write_session(&session_id, &s);
+}
+
+fn session_recent(session_id: &str, window: Duration) -> bool {
+    let meta = match fs::metadata(state::session_path(session_id)) {
         Ok(m) => m,
         Err(_) => return false,
     };
