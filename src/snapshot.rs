@@ -30,14 +30,26 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn capture(conn: &mut Connection) -> Result<Self, String> {
-        // Detect pollution from a crashed predecessor daemon. When the
-        // daemon enters Active state it sets @ccstatus-active=1; on
-        // graceful Deactivate / shutdown it unsets the option. A
-        // surviving value means a previous daemon was killed without
-        // restoring the user's bar — every status/status-format value
-        // we'd read right now might be our own leftover rather than
-        // the user's true config.
-        let polluted = read_option(conn, "@ccstatus-active")?.is_some();
+        // Detect pollution from a crashed predecessor daemon. Two
+        // signals:
+        //   (a) the @ccstatus-active sentinel set during activate.
+        //   (b) any of status-format[1..5] being set. tmux's defaults
+        //       for those higher indices are unset; we set them during
+        //       activate. A non-empty value there is a strong hint
+        //       that the previous daemon didn't clean up. This catches
+        //       the case of (a) being absent — e.g. predecessor was
+        //       an older binary, or @ccstatus-active was manually
+        //       unset.
+        // Tradeoff: a user who runs with status=2 and a custom
+        // status-format[1] gets misidentified and reset to defaults.
+        let sentinel = read_option(conn, "@ccstatus-active")?.is_some();
+        let any_extra_format = (1..STATUS_FORMAT_SLOTS).any(|i| {
+            read_indexed(conn, "status-format", i)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        let polluted = sentinel || any_extra_format;
         let status = if polluted {
             "on".to_string()
         } else {

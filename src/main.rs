@@ -44,6 +44,7 @@ fn main() -> ExitCode {
         ParseOutcome::Render(flavor, pane_id) => return render_tmux::run(flavor, &pane_id),
         ParseOutcome::TmuxOnFocus(hint) => return tmux::on_focus(hint.as_deref()),
         ParseOutcome::Daemon => return daemon::run(),
+        ParseOutcome::TmuxReset => return tmux_reset(),
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -106,6 +107,34 @@ fn main() -> ExitCode {
 /// Returns `Some(pane_id)` if Claude Code was launched inside tmux. Both
 /// `$TMUX` and `$TMUX_PANE` must be set; either one missing means we render
 /// for stdout as usual.
+/// Manual cleanup for when a daemon left ccstatus content in the tmux
+/// status options and there's no live daemon to restore it. Unsets
+/// every status-format slot, clears the @ccstatus-active sentinel, and
+/// puts status back to `on`. Use after a daemon crash or when ccstatus
+/// is being uninstalled.
+fn tmux_reset() -> ExitCode {
+    let unsets = [
+        "@ccstatus-active",
+        "status-format[0]",
+        "status-format[1]",
+        "status-format[2]",
+        "status-format[3]",
+        "status-format[4]",
+        "status-format[5]",
+    ];
+    for name in unsets {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-gu", name])
+            .status();
+    }
+    let _ = Command::new("tmux")
+        .args(["set-option", "-g", "status", "on"])
+        .status();
+    let _ = Command::new("tmux").arg("refresh-client").status();
+    println!("ccstatus: bar reset to defaults");
+    ExitCode::SUCCESS
+}
+
 fn active_tmux_pane() -> Option<String> {
     env::var("TMUX").ok().filter(|s| !s.is_empty())?;
     env::var("TMUX_PANE").ok().filter(|s| !s.is_empty())

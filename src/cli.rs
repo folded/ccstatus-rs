@@ -48,6 +48,11 @@ pub enum ParseOutcome {
     TmuxOnFocus(Option<String>),
     /// Run the long-lived tmux control-mode daemon.
     Daemon,
+    /// Manually reset the tmux bar to defaults (unset every
+    /// `status-format[N]`, clear the `@ccstatus-active` sentinel, set
+    /// `status` to `on`). For cleaning up a polluted bar when no
+    /// daemon is running.
+    TmuxReset,
     Install,
     Help,
     Version,
@@ -74,6 +79,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--no-updates" => cfg.updates = false,
             "--install" => return ParseOutcome::Install,
             "--daemon" => return ParseOutcome::Daemon,
+            "--tmux-reset" => return ParseOutcome::TmuxReset,
             "--tmux-on-focus" => {
                 let hint = iter.next().filter(|s| !s.is_empty());
                 return ParseOutcome::TmuxOnFocus(hint);
@@ -163,6 +169,9 @@ Options:
   --hook <kind>     Run as a Claude Code hook (kinds: stop)
   --daemon          Run the long-lived tmux control-mode daemon that
                     drives the status bar while Claude sessions are active
+  --tmux-reset      Unset all status-format[*] slots, clear the
+                    @ccstatus-active sentinel, and set status=on. Cleans
+                    up a polluted bar when no daemon is running.
   --render-tmux <flavor> <pane_id>
                     Emit a tmux status line for the given pane.
                     Flavors: row | line <N>
