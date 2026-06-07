@@ -2,7 +2,6 @@ mod api;
 mod cache;
 mod cli;
 mod color;
-mod control;
 mod daemon;
 mod format;
 mod git;
@@ -13,7 +12,6 @@ mod oauth;
 mod ipc;
 mod render_tmux;
 mod server_dir;
-mod snapshot;
 mod state;
 mod term;
 mod tmux;
@@ -122,7 +120,7 @@ fn tmux_reset() -> ExitCode {
             "set-option",
             "-g",
             "status-format[0]",
-            snapshot::DEFAULT_STATUS_FORMAT_0,
+            tmux::DEFAULT_STATUS_FORMAT_0,
         ])
         .status();
     // Higher slots have no built-in default and only render as extra

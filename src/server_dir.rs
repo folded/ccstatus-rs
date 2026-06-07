@@ -6,7 +6,7 @@
 //! /tmp/ccstatus-<uid>/server/<server-hash>/
 //!   daemon.lock      flock-held by the live daemon; contains its pid
 //!   daemon.sock      Unix socket the registrar pings
-//!   snapshot.json    captured user state (see snapshot.rs)
+//!   active-sessions  tmux sessions we hold a bar override on (crash marker)
 //! ```
 
 use std::fs::{self, File, OpenOptions};

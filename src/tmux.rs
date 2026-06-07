@@ -7,6 +7,17 @@ use sha2::{Digest, Sha256};
 
 use crate::state;
 
+/// tmux's built-in default value for `status-format[0]` — the powerline
+/// window list (status-left + `#{W:…}` window loop + status-right).
+///
+/// We read the *effective* global `status-format[0]` at activate time and
+/// reuse it as the session's powerline row, but fall back to this when the
+/// global is empty/unset. Copied verbatim from a fresh tmux server's
+/// `show-options -g status-format[0]`. (tmux does not expose the default
+/// via `show-options` once the slot has been touched, and `set -gu` does
+/// not restore it — on macOS tmux it leaves the slot empty.)
+pub const DEFAULT_STATUS_FORMAT_0: &str = "#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{W:#[range=window|#{window_index} #{E:window-status-style}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-format}#[pop-default]#[norange default]#{?loop_last_flag,,#{window-status-separator}},#[range=window|#{window_index} list=focus #{?#{!=:#{E:window-status-current-style},default},#{E:window-status-current-style},#{E:window-status-style}}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-current-format}#[pop-default]#[norange list=on default]#{?loop_last_flag,,#{window-status-separator}}}#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]";
+
 /// Number of status rows when the focused pane is hosting a Claude
 /// session: 1 row for the existing powerline window list, plus 3 rows of
 /// ccstatus rich output.
