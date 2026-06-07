@@ -40,16 +40,24 @@ impl Snapshot {
         })
     }
 
-    pub fn restore(&self, conn: &mut Connection) -> Result<(), String> {
-        set_option(conn, "status", &self.status)?;
-        set_option(conn, "status-position", &self.status_position)?;
+    /// Fire-and-forget restore via the split Writer half (the
+    /// event-driven daemon path). Errors are swallowed individually —
+    /// if a single set-option fails, the rest still get attempted.
+    pub fn apply_via_writer(&self, w: &mut crate::control::Writer) {
+        let _ = w.send(&format!("set-option -g status {}", quoted(&self.status)));
+        let _ = w.send(&format!(
+            "set-option -g status-position {}",
+            quoted(&self.status_position)
+        ));
         for (i, slot) in self.status_format.iter().enumerate() {
-            match slot {
-                Some(v) => set_indexed(conn, "status-format", i, v)?,
-                None => unset_indexed(conn, "status-format", i)?,
-            }
+            let _ = match slot {
+                Some(v) => w.send(&format!(
+                    "set-option -g 'status-format[{i}]' \"{}\"",
+                    escape_for_tmux(v)
+                )),
+                None => w.send(&format!("set-option -gu 'status-format[{i}]'")),
+            };
         }
-        Ok(())
     }
 
     pub fn to_json(&self) -> Value {
@@ -142,38 +150,19 @@ fn read_indexed(
     read_option(conn, &format!("'{name}[{index}]'"))
 }
 
-fn set_option(conn: &mut Connection, name: &str, value: &str) -> Result<(), String> {
-    let escaped = escape_for_tmux(value);
-    let r = conn.cmd(&format!("set-option -g {name} \"{escaped}\""))?;
-    if !r.ok {
-        return Err(format!("set-option -g {name} failed: {}", r.output));
-    }
-    Ok(())
-}
-
-fn set_indexed(
-    conn: &mut Connection,
-    name: &str,
-    index: usize,
-    value: &str,
-) -> Result<(), String> {
-    set_option(conn, &format!("'{name}[{index}]'"), value)
-}
-
-fn unset_indexed(conn: &mut Connection, name: &str, index: usize) -> Result<(), String> {
-    let r = conn.cmd(&format!("set-option -gu '{name}[{index}]'"))?;
-    if !r.ok {
-        return Err(format!("set-option -gu {name}[{index}] failed: {}", r.output));
-    }
-    Ok(())
-}
-
 /// Escape a string value for inclusion in a tmux command argument
 /// surrounded by double quotes. tmux's quoting follows shell-ish rules:
 /// inside `"..."`, a `\"` is a literal quote and `\\` is a literal
 /// backslash. The format-string `#{…}` and `#(…)` survive unescaped.
-fn escape_for_tmux(s: &str) -> String {
+pub fn escape_for_tmux(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Quote a short scalar (option value with no whitespace / special
+/// characters) for use after `set-option`. Bare values are accepted by
+/// tmux's parser; wrapping in single quotes is safer for diagnostics.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

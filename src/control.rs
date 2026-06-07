@@ -37,8 +37,19 @@ pub enum Event {
 }
 
 pub struct Connection {
-    child: Child,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    reader: Option<BufReader<ChildStdout>>,
+}
+
+/// Write half of a split connection. Sends fire-and-forget commands.
+/// Responses come back through the matching `EventStream`.
+pub struct Writer {
     stdin: ChildStdin,
+}
+
+/// Read half of a split connection. Yields `Event`s sequentially.
+pub struct EventStream {
     reader: BufReader<ChildStdout>,
 }
 
@@ -70,9 +81,9 @@ impl Connection {
             .take()
             .ok_or_else(|| "no stdout on tmux child".to_string())?;
         let mut conn = Self {
-            child,
-            stdin,
-            reader: BufReader::new(stdout),
+            child: Some(child),
+            stdin: Some(stdin),
+            reader: Some(BufReader::new(stdout)),
         };
         conn.drain_initial_frame()?;
         Ok(conn)
@@ -92,21 +103,39 @@ impl Connection {
         }
     }
 
-    /// Send a command and consume events until its `%end`/`%error`.
-    /// Notifications received between commands are dropped here —
-    /// milestone 1 callers only do request/response. Subsequent
-    /// milestones will need a queued or callback-based event sink.
-    ///
-    /// Identifies the response by ORDER (next `%begin` after we send),
-    /// not by cmd-num, because tmux assigns its own monotonic ids
-    /// (e.g. `4388032`) rather than echoing client-supplied ones.
-    pub fn cmd(&mut self, command: &str) -> Result<Response, String> {
-        writeln!(self.stdin, "{command}").map_err(|e| format!("write: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("flush: {e}"))?;
+    /// Consume the connection and return separate write and read halves.
+    /// After splitting:
+    /// - Sending commands is the writer's job; responses are not
+    ///   automatically correlated. Treat commands as fire-and-forget.
+    /// - The event stream yields every line as a tagged event (begin,
+    ///   end, output, notification, exit).
+    /// - The tmux child handle is intentionally leaked here — the OS
+    ///   reaps it when the daemon process exits. Closing our stdin or
+    ///   stdout pipes signals tmux to detach its control client; the
+    ///   tmux server itself stays alive for other clients.
+    pub fn split(mut self) -> (Writer, EventStream) {
+        let stdin = self.stdin.take().expect("stdin already taken");
+        let reader = self.reader.take().expect("reader already taken");
+        let _child = self.child.take().expect("child already taken");
+        // `_child` falls out of scope here. std::process::Child's Drop on
+        // Unix is a no-op (no wait, no kill), so the tmux process keeps
+        // running. The daemon's lifetime then bounds the tmux child via
+        // file-descriptor lifetimes.
+        (Writer { stdin }, EventStream { reader })
+    }
 
-        // Wait for response frame to start.
+    /// Send a command and consume events until its `%end`/`%error`.
+    /// Identifies the response by ORDER (next `%begin` after we send),
+    /// not by cmd-num, because tmux assigns its own monotonic ids.
+    ///
+    /// Notifications received between commands are dropped here. Callers
+    /// that need to interleave commands with notification handling
+    /// should `split()` and run an event loop.
+    pub fn cmd(&mut self, command: &str) -> Result<Response, String> {
+        let stdin = self.stdin.as_mut().ok_or("stdin gone")?;
+        writeln!(stdin, "{command}").map_err(|e| format!("write: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush: {e}"))?;
+
         loop {
             match self.next_event()? {
                 Event::Begin { .. } => break,
@@ -117,7 +146,6 @@ impl Connection {
             }
         }
 
-        // Collect body lines until %end/%error.
         let mut output = String::new();
         loop {
             match self.next_event()? {
@@ -138,37 +166,55 @@ impl Connection {
 
     /// Read one event from tmux. Blocks until a full line is available
     /// or stdout closes.
-    ///
-    /// tmux's `%output` notifications can include raw pane bytes that
-    /// aren't valid UTF-8, so we read bytes and lossy-convert. We don't
-    /// inspect output bodies here anyway — we just frame on `\n`.
     pub fn next_event(&mut self) -> Result<Event, String> {
-        let mut buf = Vec::new();
-        let n = self
-            .reader
-            .read_until(b'\n', &mut buf)
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Ok(Event::Exit);
-        }
-        while matches!(buf.last(), Some(b'\n' | b'\r')) {
-            buf.pop();
-        }
-        let line = String::from_utf8_lossy(&buf);
-        Ok(parse_line(&line))
+        let reader = self.reader.as_mut().ok_or("reader gone")?;
+        read_event(reader)
+    }
+}
+
+impl Writer {
+    /// Send a command line. Does not wait for or correlate a response.
+    pub fn send(&mut self, command: &str) -> std::io::Result<()> {
+        writeln!(self.stdin, "{command}")?;
+        self.stdin.flush()
+    }
+}
+
+impl EventStream {
+    pub fn next_event(&mut self) -> Result<Event, String> {
+        read_event(&mut self.reader)
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Best-effort tidy: detach (so the server keeps running) and reap
-        // the child. Killing rather than detaching would also tear down
-        // the user's tmux session if this is the only client; we never
-        // want that.
-        let _ = writeln!(self.stdin, "detach-client");
-        let _ = self.stdin.flush();
-        let _ = self.child.wait();
+        // Only runs on a non-split Connection (split() takes the fields).
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = writeln!(stdin, "detach-client");
+            let _ = stdin.flush();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
     }
+}
+
+/// Shared line-reader. tmux's `%output` notifications can carry raw pane
+/// bytes that aren't valid UTF-8, so we read bytes and lossy-convert.
+/// The body-line vs `%begin`/etc. distinction is purely textual.
+fn read_event(reader: &mut BufReader<ChildStdout>) -> Result<Event, String> {
+    let mut buf = Vec::new();
+    let n = reader
+        .read_until(b'\n', &mut buf)
+        .map_err(|e| format!("read: {e}"))?;
+    if n == 0 {
+        return Ok(Event::Exit);
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    let line = String::from_utf8_lossy(&buf);
+    Ok(parse_line(&line))
 }
 
 fn parse_line(line: &str) -> Event {

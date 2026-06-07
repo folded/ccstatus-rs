@@ -58,7 +58,7 @@ fn build_line(flavor: RenderFlavor, pane_id: &str) -> String {
 /// pane-state lines are raw ANSI (produced by the standard render); we
 /// translate to tmux format strings here so tmux interprets them as
 /// colours instead of printing them as escape-sequence soup.
-fn format_stashed_line(pane: &PaneState, session: &SessionState, n: usize) -> String {
+pub fn format_stashed_line(pane: &PaneState, session: &SessionState, n: usize) -> String {
     let Some(base) = pane.lines.get(n) else {
         return String::new();
     };
