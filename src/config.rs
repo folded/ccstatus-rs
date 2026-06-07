@@ -236,6 +236,12 @@ fn read_config() -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+/// Last-modified time of the config file, for change detection (hot
+/// reload). `None` if the file is absent.
+pub fn mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(config_path()).ok()?.modified().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

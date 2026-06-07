@@ -158,4 +158,6 @@ Sub-phases:
   session-effective one, to avoid double-injection), puts the ccstatus
   segment at the screen edge with the user's value beside the window list,
   and reverts by unsetting on teardown. Zero added height.
-- **2c**: config-file hot reload (daemon re-reads on mtime change).
+- **2c** (done): config-file hot reload — the daemon re-reads on mtime
+  change each loop and re-renders active sessions, so editing `config.json`
+  re-lays-out the bar with no restart.

@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{self, Dest, Element};
 use crate::render_tmux;
@@ -113,13 +113,13 @@ pub fn run() -> ExitCode {
     let (tx, rx) = mpsc::channel::<String>();
     spawn_socket_reader(socket, tx);
 
-    // Routing is read once at startup (Phase 1). Config edits take effect
-    // when the daemon next restarts; live hot-reload is Phase 2.
     let routing = config::Routing::load();
 
     let mut daemon = Daemon {
         server_id,
         routing,
+        config_mtime: config::mtime(),
+        force_rerender: false,
         panes: HashMap::new(),
         active: HashSet::new(),
         last_warmth: HashMap::new(),
@@ -133,8 +133,13 @@ pub fn run() -> ExitCode {
 
 struct Daemon {
     server_id: String,
-    /// Where each rendered line is routed (read once at startup).
+    /// Where each element is routed. Reloaded when the config file changes.
     routing: config::Routing,
+    /// Last-seen config mtime, for hot-reload detection.
+    config_mtime: Option<SystemTime>,
+    /// Set when the config reloaded; forces a re-render of active sessions
+    /// on the next reconcile even if nothing else changed.
+    force_rerender: bool,
     /// Registered Claude panes: tmux pane_id -> claude session id (uuid).
     panes: HashMap<String, String>,
     /// tmux session ids we currently hold a bar override on.
@@ -159,6 +164,8 @@ impl Daemon {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
+            self.maybe_reload_config();
+
             match self.reconcile() {
                 Reconcile::ServerGone => {
                     // The tmux server is gone; its options went with it.
@@ -180,6 +187,18 @@ impl Daemon {
         // restore_all; on a Disconnected break it reflects the live state
         // so the next daemon can clean up).
         write_active(&self.server_id, &self.active);
+    }
+
+    /// Reload routing if the config file's mtime changed since last seen,
+    /// and flag active sessions for re-render.
+    fn maybe_reload_config(&mut self) {
+        let m = config::mtime();
+        if m != self.config_mtime {
+            self.config_mtime = m;
+            self.routing = config::Routing::load();
+            self.force_rerender = true;
+            self.log.write("config reloaded");
+        }
     }
 
     fn handle_register(&mut self, line: String) {
@@ -260,6 +279,9 @@ impl Daemon {
             changed = true;
         }
 
+        // A config reload re-renders every active session this pass.
+        let force = std::mem::take(&mut self.force_rerender);
+
         // Activate / refresh sessions that have a Claude pane.
         for (session, panes) in &session_panes {
             let Some(pane_id) = self.pick_pane(panes) else {
@@ -272,12 +294,7 @@ impl Daemon {
                 self.active.insert(session.clone());
                 self.last_activity = Instant::now();
                 changed = true;
-            } else if self.last_warmth.get(session).copied() != warmth {
-                self.log.write(&format!(
-                    "warmth flip on {session}: {:?} -> {:?}",
-                    self.last_warmth.get(session),
-                    warmth
-                ));
+            } else if force || self.last_warmth.get(session).copied() != warmth {
                 self.write_rows(session, &pane_id);
                 changed = true;
             }
@@ -386,6 +403,12 @@ impl Daemon {
             .filter(|s| !s.is_empty())
             .collect();
         if parts.is_empty() {
+            // Nothing routed here now — revert to inheriting the global so a
+            // hot-reload that removed the elements doesn't leave our value
+            // stuck. Harmless on first activate (already inheriting).
+            let _ = Command::new("tmux")
+                .args(["set-option", "-u", "-t", session, option])
+                .status();
             return;
         }
         let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(
