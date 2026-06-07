@@ -18,6 +18,7 @@ mod term;
 mod tmux;
 mod util;
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -30,7 +31,7 @@ use serde_json::Value;
 
 use cli::{Config, ParseOutcome};
 use color::*;
-use format::{format_tokens, push, push_fmt, shorten_model_name};
+use format::{format_tokens, push_fmt, shorten_model_name};
 use state::PaneState;
 use util::{now_unix, resolve_session_id};
 
@@ -40,7 +41,6 @@ fn main() -> ExitCode {
     let cfg = match cli::parse_args(env::args().skip(1)) {
         ParseOutcome::Run(c) => c,
         ParseOutcome::Hook(kind) => return hooks::run(kind),
-        ParseOutcome::Render(flavor, pane_id) => return render_tmux::run(flavor, &pane_id),
         ParseOutcome::Daemon => return daemon::run(),
         ParseOutcome::TmuxReset => return tmux_reset(),
         ParseOutcome::Install => {
@@ -82,37 +82,32 @@ fn main() -> ExitCode {
 
     let _ = cache::ensure_cache_dir();
 
-    let out = render(&input, &cfg);
-    let lines: Vec<String> = out.split('\n').map(str::to_string).collect();
+    let elements = render_elements(&input, &cfg);
 
-    // Inside tmux, routing decides where each line goes; outside tmux there
-    // is no tmux surface, so everything falls back to Claude's statusline.
+    // Inside tmux, routing decides where each element goes; outside tmux
+    // there is no tmux surface, so everything falls back to Claude's
+    // statusline.
     let (routing, pane_id) = match active_tmux_pane() {
         Some(pane_id) => (config::Routing::load(), Some(pane_id)),
         None => (config::Routing::all_claude(), None),
     };
 
-    // Hand the daemon the lines it's responsible for (any line routed to a
-    // tmux row). It still receives the full set so its row layout can pull
-    // each line by index.
+    // Store the rendered elements for the daemon and ping it, but only when
+    // at least one element is routed to a tmux surface.
     if let Some(pane_id) = &pane_id
         && routing.any_tmux()
-        && let Some(session_id) = register_pane(&input, pane_id, lines.clone())
+        && let Some(session_id) = register_pane(&input, pane_id, &elements)
     {
         let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
         ipc::notify_register(&server_id, pane_id, &session_id);
     }
 
-    // Print the lines routed to Claude's own statusline, in rendered order.
-    let claude_lines: Vec<&str> = config::Line::ALL
-        .iter()
-        .filter(|&&l| routing.dest(l) == config::Dest::Claude)
-        .filter_map(|&l| lines.get(l.index()).map(String::as_str))
-        .collect();
-    if !claude_lines.is_empty() {
+    // Print the elements routed to Claude's own statusline.
+    let claude = compose_claude(&elements, &routing);
+    if !claude.is_empty() {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        let _ = handle.write_all(claude_lines.join("\n").as_bytes());
+        let _ = handle.write_all(claude.as_bytes());
     }
     ExitCode::SUCCESS
 }
@@ -166,13 +161,16 @@ fn active_tmux_pane() -> Option<String> {
     env::var("TMUX_PANE").ok().filter(|s| !s.is_empty())
 }
 
-/// Write per-pane state so the tmux-side renderer (running on
-/// `status-interval`) can show a live indicator. Coalesces writes that
-/// arrive within 500 ms of an identical prior write so a streaming
-/// statusline call doesn't hammer the filesystem.
-/// Returns the session id that was registered (so the caller can ping the
-/// daemon with it), or None if the input lacked one.
-fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) -> Option<String> {
+/// Write per-pane state so the daemon can compose the tmux surfaces from
+/// the rendered elements. Coalesces writes that arrive within 500 ms of an
+/// identical prior write so a streaming statusline call doesn't hammer the
+/// filesystem. Returns the session id that was registered (so the caller
+/// can ping the daemon with it), or None if the input lacked one.
+fn register_pane(
+    input: &Value,
+    pane_id: &str,
+    elements: &[(config::Element, String)],
+) -> Option<String> {
     let session_id = resolve_session_id(input)?;
     let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
     let claude_pid = resolve_claude_pid();
@@ -182,10 +180,16 @@ fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) -> Option<Str
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    let element_map: HashMap<String, String> = elements
+        .iter()
+        .filter(|(_, c)| !c.is_empty())
+        .map(|(e, c)| (e.key().to_string(), c.clone()))
+        .collect();
+
     if let Some(existing) = state::read_pane(&server_id, pane_id) {
         if existing.session_id == session_id
             && existing.claude_pid == claude_pid
-            && existing.lines == lines
+            && existing.elements == element_map
             && pane_recent(&server_id, pane_id, Duration::from_millis(500))
         {
             return Some(session_id);
@@ -199,7 +203,7 @@ fn register_pane(input: &Value, pane_id: &str, lines: Vec<String>) -> Option<Str
         transcript_path,
         registered_at: now_unix(),
         last_warmth: None,
-        lines,
+        elements: element_map,
     };
     let _ = state::write_pane(&server_id, pane_id, &pane_state);
     Some(session_id)
@@ -273,7 +277,12 @@ fn pane_recent(server_id: &str, pane_id: &str, window: Duration) -> bool {
         .unwrap_or(false)
 }
 
-fn render(input: &Value, cfg: &Config) -> String {
+/// Render the statusline as a list of named elements, each holding its own
+/// raw-ANSI content with **no** leading separator. Surfaces join the
+/// segments they're routed (` | ` between them); rows stand alone. The live
+/// `warmth` element is not produced here — the daemon computes it.
+fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)> {
+    use config::Element as E;
     let config_dir = oauth::config_dir();
 
     let model_name_raw = input
@@ -300,28 +309,25 @@ fn render(input: &Value, cfg: &Config) -> String {
 
     let cwd = input.pointer("/cwd").and_then(|v| v.as_str()).unwrap_or("");
 
-    let mut out = String::with_capacity(512);
+    let mut out: Vec<(E, String)> = Vec::new();
 
-    push_fmt(&mut out, format_args!("{BLUE}{model_name}{RESET}"));
+    out.push((E::Model, format!("{BLUE}{model_name}{RESET}")));
 
     if cfg.cwd && !cwd.is_empty() {
         let display_dir = cwd.rsplit('/').next().unwrap_or(cwd);
-        push_fmt(&mut out, format_args!(" {DIM}|{RESET} {CYAN}{display_dir}{RESET}"));
+        let mut s = format!("{CYAN}{display_dir}{RESET}");
         if cfg.git {
             if let Some(g) = git::collect(cwd) {
-                push_fmt(&mut out, format_args!("{DIM}@{RESET}{GREEN}{branch}{RESET}", branch = g.branch));
+                s.push_str(&format!("{DIM}@{RESET}{GREEN}{}{RESET}", g.branch));
                 if g.added + g.deleted > 0 {
-                    push_fmt(
-                        &mut out,
-                        format_args!(
-                            " {DIM}({RESET}{GREEN}+{a}{RESET} {RED}-{d}{RESET}{DIM}){RESET}",
-                            a = g.added,
-                            d = g.deleted
-                        ),
-                    );
+                    s.push_str(&format!(
+                        " {DIM}({RESET}{GREEN}+{}{RESET} {RED}-{}{RESET}{DIM}){RESET}",
+                        g.added, g.deleted
+                    ));
                 }
             }
         }
+        out.push((E::Cwd, s));
     }
 
     let cols = term::columns(120);
@@ -346,60 +352,97 @@ fn render(input: &Value, cfg: &Config) -> String {
             let total = r.today_main_raw + r.today_sub_raw;
             if total == 0 { None } else { Some((r.today_sub_raw * 100 / total) as i64) }
         });
-
-        push_fmt(
-            &mut out,
-            format_args!(
-                " {DIM}|{RESET} {ORANGE}{used_str}/{total_str}{RESET} {DIM}({RESET}{GREEN}{pct_used}%{RESET} {DIM}·{RESET} {WHITE}cache{RESET} {cache_color}{cache_pct}%{RESET}",
-            ),
+        let mut s = format!(
+            "{ORANGE}{used_str}/{total_str}{RESET} {DIM}({RESET}{GREEN}{pct_used}%{RESET} {DIM}·{RESET} {WHITE}cache{RESET} {cache_color}{cache_pct}%{RESET}"
         );
         if let Some(p) = sub_pct {
-            push_fmt(&mut out, format_args!(" {DIM}·{RESET} {WHITE}sub{RESET} {WHITE}{p}%{RESET}"));
+            s.push_str(&format!(" {DIM}·{RESET} {WHITE}sub{RESET} {WHITE}{p}%{RESET}"));
         }
-        push_fmt(&mut out, format_args!("{DIM}){RESET}"));
+        s.push_str(&format!("{DIM}){RESET}"));
+        out.push((E::Tokens, s));
     }
 
     if cfg.effort {
         let effort = resolve_effort(input, &config_dir);
-        push(&mut out, " ");
-        push(&mut out, DIM);
-        push(&mut out, "|");
-        push(&mut out, RESET);
-        push(&mut out, " effort: ");
-        match effort.as_str() {
-            "low" => push_fmt(&mut out, format_args!("{DIM}low{RESET}")),
-            "medium" => push_fmt(&mut out, format_args!("{ORANGE}med{RESET}")),
-            "high" => push_fmt(&mut out, format_args!("{GREEN}high{RESET}")),
-            "xhigh" => push_fmt(&mut out, format_args!("{PURPLE}xhigh{RESET}")),
-            "max" => push_fmt(&mut out, format_args!("{RED}max{RESET}")),
-            other => push_fmt(&mut out, format_args!("{GREEN}{other}{RESET}")),
-        }
+        let level = match effort.as_str() {
+            "low" => format!("{DIM}low{RESET}"),
+            "medium" => format!("{ORANGE}med{RESET}"),
+            "high" => format!("{GREEN}high{RESET}"),
+            "xhigh" => format!("{PURPLE}xhigh{RESET}"),
+            "max" => format!("{RED}max{RESET}"),
+            other => format!("{GREEN}{other}{RESET}"),
+        };
+        out.push((E::Effort, format!("effort: {level}")));
     }
 
     if cfg.limits {
-        render_rate_limits(input, &config_dir, &mut out);
+        let mut s = String::new();
+        render_rate_limits(input, &config_dir, &mut s);
+        let s = strip_leading_sep(s);
+        if !s.is_empty() {
+            out.push((E::Limits, s));
+        }
     }
 
     if cfg.cli_version {
         if let Some(v) = cli_version_cached() {
-            push_fmt(&mut out, format_args!(" {DIM}|{RESET} {ORANGE}v{v}{RESET}"));
+            out.push((E::Version, format!("{ORANGE}v{v}{RESET}")));
         }
     }
 
     if cfg.updates {
-        if let Some(update_line) = update_check_line() {
-            out.push_str(&update_line);
+        if let Some(line) = update_check_line() {
+            let line = line.strip_prefix('\n').unwrap_or(&line).to_string();
+            out.push((E::Updates, line));
         }
     }
 
     if let Some(rows) = heatmap_result {
-        out.push('\n');
-        out.push_str(&rows.main_row);
-        out.push('\n');
-        out.push_str(&rows.sub_row);
+        out.push((E::HeatmapMain, rows.main_row));
+        out.push((E::HeatmapSub, rows.sub_row));
     }
 
     out
+}
+
+/// Strip a single leading inline separator (` | `) — `render_rate_limits`
+/// prepends one before its first item, but as a standalone element the
+/// limits block must not start with it (composition adds separators).
+fn strip_leading_sep(s: String) -> String {
+    let sp = render_tmux::sep();
+    s.strip_prefix(sp.as_str()).map(str::to_string).unwrap_or(s)
+}
+
+/// Compose the lines printed to Claude's own statusline: the claude-routed
+/// segment elements joined on one line, followed by any claude-routed row
+/// element (heatmaps) on their own lines.
+fn compose_claude(elements: &[(config::Element, String)], routing: &config::Routing) -> String {
+    use config::{Dest, Element, Kind};
+    let find = |e: Element| {
+        elements
+            .iter()
+            .find(|(el, _)| *el == e)
+            .map(|(_, c)| c.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let segs = Element::ALL
+        .iter()
+        .copied()
+        .filter(|&e| e.kind() == Kind::Segment && routing.dest(e) == Dest::Claude)
+        .filter_map(find);
+    let mut lines: Vec<String> = Vec::new();
+    let seg_line = render_tmux::join_segments(segs);
+    if !seg_line.is_empty() {
+        lines.push(seg_line);
+    }
+    for e in [Element::HeatmapMain, Element::HeatmapSub] {
+        if routing.dest(e) == Dest::Claude {
+            if let Some(c) = find(e) {
+                lines.push(c.to_string());
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 fn u64_at(v: Option<&Value>, key: &str) -> u64 {

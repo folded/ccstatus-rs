@@ -19,6 +19,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
@@ -36,11 +37,11 @@ pub struct PaneState {
     pub transcript_path: Option<String>,
     pub registered_at: i64,
     pub last_warmth: Option<String>,
-    /// Pre-rendered output lines from the registrar, one per logical row
-    /// of the original statusline (rich line + any heatmap rows). The
-    /// tmux renderer can pull each line independently to populate a
-    /// separate status row.
-    pub lines: Vec<String>,
+    /// Pre-rendered status elements from the registrar, keyed by element
+    /// name (see [`crate::config::Element`]). Raw ANSI content; the daemon
+    /// pulls the elements routed to each tmux surface and composes them.
+    /// The live `warmth` element is not stored — the daemon computes it.
+    pub elements: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,12 +69,12 @@ pub fn session_path(session_id: &str) -> PathBuf {
 pub fn read_pane(server_id: &str, pane_id: &str) -> Option<PaneState> {
     let text = std::fs::read_to_string(pane_path(server_id, pane_id)).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    let lines = v
-        .get("lines")
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+    let elements = v
+        .get("elements")
+        .and_then(|x| x.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
         .unwrap_or_default();
@@ -90,7 +91,7 @@ pub fn read_pane(server_id: &str, pane_id: &str) -> Option<PaneState> {
             .get("last_warmth")
             .and_then(|x| x.as_str())
             .map(str::to_string),
-        lines,
+        elements,
     })
 }
 
@@ -102,7 +103,7 @@ pub fn write_pane(server_id: &str, pane_id: &str, s: &PaneState) -> std::io::Res
         "transcript_path": s.transcript_path,
         "registered_at": s.registered_at,
         "last_warmth": s.last_warmth,
-        "lines": s.lines,
+        "elements": s.elements,
     });
     cache::write_atomic(&pane_path(server_id, pane_id), &v.to_string())
 }

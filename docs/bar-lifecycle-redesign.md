@@ -129,9 +129,30 @@ Routed to `claude` it updates only when Claude re-renders.
 
 ### Phase 2 — element granularity
 
-- Decompose `render()` into addressable named segments (`model`, `cwd`,
-  `tokens`, `effort`, `limits`, `version`, `warmth`, `heatmap_main`,
-  `heatmap_sub`).
-- Element-level routing including `powerline-left/right` injection via
-  per-session `status-left`/`status-right` composition.
-- Config-file routing table + hot reload.
+Routing granularity moves from 3 lines to named **elements**:
+
+| element | kind | source |
+|---------|------|--------|
+| `model`, `cwd`, `tokens`, `effort`, `limits`, `version`, `updates` | segment (inline, join with ` | `) | registrar render |
+| `warmth` | segment | daemon (live; computed each tick) |
+| `heatmap_main`, `heatmap_sub` | row (standalone) | registrar render |
+
+Destinations: `off`, `claude` (stdout), `row0`/`row1`/`row2` (dedicated tmux
+rows, `row0` nearest the panes), and — Phase 2b — `left`/`right` (the
+powerline row's `status-left`/`status-right`, zero added height).
+
+Composition: a surface's segment elements join with ` | ` in `Element::ALL`
+order; row elements stand alone. Registrar elements are stored by name in
+pane state; the daemon pulls them and computes `warmth` itself. tmux row
+height = (distinct rows used) + 1 powerline row.
+
+Sub-phases:
+
+- **2a** (done): element decomposition; `config.json`
+  element→`{off,claude,rowN}` routing; `warmth` as a live daemon element;
+  pane state stores named elements. Default routing reproduces the Phase 1
+  look (segments→row2, heatmap_main→row1, heatmap_sub→row0, warmth→row2).
+  Removed the now-dead `--render-tmux` subprocess path.
+- **2b**: `left`/`right` via per-session `status-left`/`status-right`
+  composition (capture the user's value, compose, restore by unset).
+- **2c**: config-file hot reload (daemon re-reads on mtime change).

@@ -1,123 +1,199 @@
-//! Shared routing configuration: where each rendered status line is sent.
+//! Shared routing configuration: where each status **element** is sent.
 //!
-//! Read by both the registrar (which decides what to print to Claude's own
-//! statusline) and the daemon (which decides which tmux rows to drive), so
-//! the two processes must agree. A single JSON file keeps them in sync:
+//! Read by both the registrar (which composes Claude's own statusline and
+//! stores element content in pane state) and the daemon (which composes the
+//! tmux surfaces), so the two must agree. A single JSON file keeps them in
+//! sync:
 //!
 //! ```json
-//! { "route": { "rich": "tmux", "heatmap_main": "tmux", "heatmap_sub": "off" } }
+//! {
+//!   "route": {
+//!     "model": "row2", "cwd": "row2", "tokens": "row2",
+//!     "warmth": "row2", "heatmap_main": "row1", "heatmap_sub": "row0"
+//!   }
+//! }
 //! ```
 //!
 //! Destinations:
 //!
-//! - `"tmux"` — a dedicated tmux status row (driven by the daemon; the only
-//!   surface where the warmth/cache-expiry indicator ticks live);
+//! - `"off"` — not shown;
 //! - `"claude"` — Claude's own statusline via stdout (updates only when
-//!   Claude re-renders);
-//! - `"off"` — not shown.
+//!   Claude re-renders — unsuitable for the live `warmth` element);
+//! - `"row0"`, `"row1"`, … — a dedicated tmux status row (`row0` nearest the
+//!   panes), driven live by the daemon. Multiple elements on one row join
+//!   inline.
+//! - `"left"` / `"right"` — Phase 2b: the powerline row's `status-left` /
+//!   `status-right` (zero added height).
 //!
-//! Missing keys default to `"tmux"`. Outside tmux the caller forces every
-//! line to Claude's statusline regardless of this file (there is no tmux
-//! surface to route to).
+//! Missing keys fall back to per-element defaults that reproduce the Phase 1
+//! look. Outside tmux the caller forces every element to `"claude"`.
 //!
-//! The daemon reads this once at startup (Phase 1); live hot-reload is
-//! Phase 2.
+//! The daemon reads this once at startup (Phase 2a); live hot-reload is 2c.
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 
+/// A routable status element. The discriminant order is the canonical order
+/// elements are composed in (left to right within a surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Element {
+    Model,
+    Cwd,
+    Tokens,
+    Effort,
+    Limits,
+    Version,
+    Updates,
+    /// Cache-warmth / expiry indicator. Computed live by the daemon, not the
+    /// registrar — it only ticks on a daemon-driven surface.
+    Warmth,
+    HeatmapMain,
+    HeatmapSub,
+}
+
+/// How an element occupies a surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Inline; joins with ` | ` alongside other segments on the surface.
+    Segment,
+    /// A standalone full-width row.
+    Row,
+}
+
+impl Element {
+    pub const ALL: [Element; 10] = [
+        Element::Model,
+        Element::Cwd,
+        Element::Tokens,
+        Element::Effort,
+        Element::Limits,
+        Element::Version,
+        Element::Updates,
+        Element::Warmth,
+        Element::HeatmapMain,
+        Element::HeatmapSub,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Element::Model => "model",
+            Element::Cwd => "cwd",
+            Element::Tokens => "tokens",
+            Element::Effort => "effort",
+            Element::Limits => "limits",
+            Element::Version => "version",
+            Element::Updates => "updates",
+            Element::Warmth => "warmth",
+            Element::HeatmapMain => "heatmap_main",
+            Element::HeatmapSub => "heatmap_sub",
+        }
+    }
+
+    pub fn kind(self) -> Kind {
+        match self {
+            Element::HeatmapMain | Element::HeatmapSub => Kind::Row,
+            _ => Kind::Segment,
+        }
+    }
+
+    /// Computed live by the daemon rather than rendered by the registrar.
+    pub fn is_live(self) -> bool {
+        matches!(self, Element::Warmth)
+    }
+
+    fn default_dest(self) -> Dest {
+        // Reproduce the Phase 1 layout: rich segments + warmth on row2,
+        // heatmaps on rows 1 and 0, powerline below.
+        match self {
+            Element::HeatmapMain => Dest::Row(1),
+            Element::HeatmapSub => Dest::Row(0),
+            Element::Updates => Dest::Off,
+            _ => Dest::Row(2),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dest {
-    Tmux,
-    Claude,
     Off,
+    Claude,
+    Row(u8),
 }
 
 impl Dest {
     fn parse(s: &str) -> Option<Dest> {
         match s {
-            "tmux" => Some(Dest::Tmux),
-            "claude" => Some(Dest::Claude),
             "off" => Some(Dest::Off),
-            _ => None,
-        }
-    }
-}
-
-/// The routable lines (Phase 1 granularity). The discriminant is the line's
-/// index in the registrar's rendered output and in pane-state `lines`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Line {
-    Rich = 0,
-    HeatmapMain = 1,
-    HeatmapSub = 2,
-}
-
-impl Line {
-    /// All lines in their natural top-to-bottom rendered order.
-    pub const ALL: [Line; 3] = [Line::Rich, Line::HeatmapMain, Line::HeatmapSub];
-
-    /// Lines in the top-to-bottom order they occupy the tmux status area,
-    /// above the powerline row (sub-heatmap closest to the panes).
-    pub const TMUX_ORDER: [Line; 3] = [Line::HeatmapSub, Line::HeatmapMain, Line::Rich];
-
-    pub fn index(self) -> usize {
-        self as usize
-    }
-
-    fn key(self) -> &'static str {
-        match self {
-            Line::Rich => "rich",
-            Line::HeatmapMain => "heatmap_main",
-            Line::HeatmapSub => "heatmap_sub",
+            "claude" => Some(Dest::Claude),
+            _ => s
+                .strip_prefix("row")
+                .and_then(|n| n.parse::<u8>().ok())
+                .map(Dest::Row),
         }
     }
 }
 
 pub struct Routing {
-    rich: Dest,
-    main: Dest,
-    sub: Dest,
+    dests: [Dest; 10],
 }
 
 impl Default for Routing {
-    /// All lines to tmux rows — the original in-tmux behaviour.
     fn default() -> Self {
-        Self {
-            rich: Dest::Tmux,
-            main: Dest::Tmux,
-            sub: Dest::Tmux,
+        let mut dests = [Dest::Off; 10];
+        for e in Element::ALL {
+            dests[e as usize] = e.default_dest();
         }
+        Self { dests }
     }
 }
 
 impl Routing {
-    /// Every line to Claude's statusline. Used outside tmux, where there is
-    /// no tmux surface to route to.
+    /// Every element to Claude's statusline. Used outside tmux, where there
+    /// is no tmux surface to route to. The live `warmth` element is dropped
+    /// (it can't tick on Claude's statusline).
     pub fn all_claude() -> Self {
-        Self {
-            rich: Dest::Claude,
-            main: Dest::Claude,
-            sub: Dest::Claude,
-        }
+        let mut dests = [Dest::Claude; 10];
+        dests[Element::Warmth as usize] = Dest::Off;
+        Self { dests }
     }
 
-    pub fn dest(&self, line: Line) -> Dest {
-        match line {
-            Line::Rich => self.rich,
-            Line::HeatmapMain => self.main,
-            Line::HeatmapSub => self.sub,
-        }
+    pub fn dest(&self, e: Element) -> Dest {
+        self.dests[e as usize]
     }
 
+    /// Any element routed to a daemon-driven tmux surface (a row; in 2b also
+    /// left/right). Determines whether the registrar registers/spawns the
+    /// daemon at all.
     pub fn any_tmux(&self) -> bool {
-        Line::ALL.iter().any(|&l| self.dest(l) == Dest::Tmux)
+        Element::ALL
+            .iter()
+            .any(|&e| matches!(self.dest(e), Dest::Row(_)))
     }
 
-    /// Load from the config file, falling back to per-key defaults for
-    /// anything missing or unparseable. A missing/corrupt file yields the
-    /// default routing (all tmux).
+    /// Distinct row numbers used, ascending (row0 nearest the panes).
+    pub fn rows_used(&self) -> Vec<u8> {
+        let mut rows: Vec<u8> = Element::ALL
+            .iter()
+            .filter_map(|&e| match self.dest(e) {
+                Dest::Row(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// Elements routed to a given destination, in canonical order.
+    pub fn elements_for(&self, dest: Dest) -> Vec<Element> {
+        Element::ALL
+            .iter()
+            .copied()
+            .filter(|&e| self.dest(e) == dest)
+            .collect()
+    }
+
     pub fn load() -> Self {
         Self::from_value(read_config())
     }
@@ -127,14 +203,11 @@ impl Routing {
         let Some(route) = v.as_ref().and_then(|v| v.get("route")) else {
             return r;
         };
-        let apply = |line: Line, slot: &mut Dest| {
-            if let Some(d) = route.get(line.key()).and_then(|x| x.as_str()).and_then(Dest::parse) {
-                *slot = d;
+        for e in Element::ALL {
+            if let Some(d) = route.get(e.key()).and_then(|x| x.as_str()).and_then(Dest::parse) {
+                r.dests[e as usize] = d;
             }
-        };
-        apply(Line::Rich, &mut r.rich);
-        apply(Line::HeatmapMain, &mut r.main);
-        apply(Line::HeatmapSub, &mut r.sub);
+        }
         r
     }
 }
@@ -159,34 +232,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_all_tmux() {
+    fn default_reproduces_phase1_layout() {
         let r = Routing::default();
-        assert_eq!(r.dest(Line::Rich), Dest::Tmux);
-        assert_eq!(r.dest(Line::HeatmapSub), Dest::Tmux);
+        assert_eq!(r.dest(Element::Model), Dest::Row(2));
+        assert_eq!(r.dest(Element::Warmth), Dest::Row(2));
+        assert_eq!(r.dest(Element::HeatmapMain), Dest::Row(1));
+        assert_eq!(r.dest(Element::HeatmapSub), Dest::Row(0));
+        assert_eq!(r.dest(Element::Updates), Dest::Off);
+        assert_eq!(r.rows_used(), vec![0, 1, 2]);
         assert!(r.any_tmux());
     }
 
     #[test]
-    fn parses_route_table_with_defaults_for_missing() {
+    fn parses_dests_including_rows() {
+        assert_eq!(Dest::parse("off"), Some(Dest::Off));
+        assert_eq!(Dest::parse("claude"), Some(Dest::Claude));
+        assert_eq!(Dest::parse("row0"), Some(Dest::Row(0)));
+        assert_eq!(Dest::parse("row12"), Some(Dest::Row(12)));
+        assert_eq!(Dest::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn from_value_overrides_only_named_keys() {
         let v: Value = serde_json::from_str(
-            r#"{ "route": { "rich": "claude", "heatmap_sub": "off" } }"#,
+            r#"{ "route": { "tokens": "claude", "heatmap_sub": "off" } }"#,
         )
         .unwrap();
         let r = Routing::from_value(Some(v));
-        assert_eq!(r.dest(Line::Rich), Dest::Claude);
-        assert_eq!(r.dest(Line::HeatmapMain), Dest::Tmux); // missing -> default
-        assert_eq!(r.dest(Line::HeatmapSub), Dest::Off);
+        assert_eq!(r.dest(Element::Tokens), Dest::Claude);
+        assert_eq!(r.dest(Element::HeatmapSub), Dest::Off);
+        assert_eq!(r.dest(Element::Model), Dest::Row(2)); // untouched default
     }
 
     #[test]
-    fn line_index_matches_rendered_order() {
-        assert_eq!(Line::Rich.index(), 0);
-        assert_eq!(Line::HeatmapMain.index(), 1);
-        assert_eq!(Line::HeatmapSub.index(), 2);
+    fn all_claude_drops_warmth_and_uses_no_rows() {
+        let r = Routing::all_claude();
+        assert_eq!(r.dest(Element::Model), Dest::Claude);
+        assert_eq!(r.dest(Element::Warmth), Dest::Off);
+        assert!(!r.any_tmux());
     }
 
     #[test]
-    fn any_tmux_false_when_all_claude() {
-        assert!(!Routing::all_claude().any_tmux());
+    fn elements_for_row_is_ordered() {
+        let r = Routing::default();
+        assert_eq!(
+            r.elements_for(Dest::Row(2)),
+            vec![
+                Element::Model,
+                Element::Cwd,
+                Element::Tokens,
+                Element::Effort,
+                Element::Limits,
+                Element::Version,
+                Element::Warmth,
+            ]
+        );
     }
 }

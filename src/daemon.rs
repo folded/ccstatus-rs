@@ -41,7 +41,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{self, Dest, Line};
+use crate::config::{self, Dest, Element};
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
 use crate::state;
@@ -321,25 +321,42 @@ impl Daemon {
     }
 
     /// Write the session-local status-format rows and row count from the
-    /// routing config. Only lines routed to a tmux row are drawn; they
-    /// stack top-to-bottom (sub, main, rich) above the powerline row.
-    /// Setting any index replaces the whole session-local array, so we
-    /// write each row explicitly. Higher indices left over from a previous
-    /// layout are harmless: the `status` row count gates what renders.
+    /// routing config. Each used row (ascending; `row0` nearest the panes)
+    /// gets the elements routed to it, joined inline and translated to tmux
+    /// format; the powerline window list sits below them. Setting any index
+    /// replaces the whole session-local array, so we write each row
+    /// explicitly. Higher indices left over from a previous layout are
+    /// harmless: the `status` row count gates what renders.
     fn write_rows(&self, session: &str, pane_id: &str) {
         let Some(pane) = state::read_pane(&self.server_id, pane_id) else {
             return;
         };
         let sess = state::read_session(&pane.session_id).unwrap_or_default();
-        let mut idx = 0usize;
-        for line in Line::TMUX_ORDER {
-            if self.routing.dest(line) == Dest::Tmux {
-                let content = render_tmux::format_stashed_line(&pane, &sess, line.index());
-                set_session(session, &format!("status-format[{idx}]"), &content);
-                idx += 1;
+        // `warmth` is computed live here; all other elements come from the
+        // registrar's pane state.
+        let warmth = render_tmux::warmth_segment(&sess);
+        let content = |e: Element| -> Option<String> {
+            if e.is_live() {
+                warmth.clone()
+            } else {
+                pane.elements.get(e.key()).cloned()
             }
+        };
+
+        let mut idx = 0usize;
+        for row in self.routing.rows_used() {
+            let parts: Vec<String> = self
+                .routing
+                .elements_for(Dest::Row(row))
+                .into_iter()
+                .filter_map(content)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let joined = render_tmux::join_segments(parts.iter().map(String::as_str));
+            let tmux = render_tmux::ansi_to_tmux(&joined);
+            set_session(session, &format!("status-format[{idx}]"), &tmux);
+            idx += 1;
         }
-        // Powerline window list sits below the ccstatus rows.
         set_session(session, &format!("status-format[{idx}]"), &global_powerline_row());
         set_session(session, "status", &status_value(idx + 1));
     }

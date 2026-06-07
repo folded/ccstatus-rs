@@ -38,11 +38,6 @@ pub fn shorten_model_name(name: &str) -> String {
     name.to_string()
 }
 
-/// Append to `out` with no allocation churn. Convenience for building the status line.
-pub fn push(out: &mut String, s: &str) {
-    out.push_str(s);
-}
-
 pub fn push_fmt(out: &mut String, args: std::fmt::Arguments<'_>) {
     let _ = out.write_fmt(args);
 }
