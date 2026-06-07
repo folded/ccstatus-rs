@@ -1,0 +1,52 @@
+# ccstatus domain glossary
+
+Shared vocabulary for the codebase. Architecture terms (module, interface,
+seam, adapter, depth, leverage, locality) follow their usual meaning; the
+nouns below are specific to ccstatus.
+
+## Roles (the binary wears one per invocation)
+
+- **registrar** — the default render mode (`main.rs`). Invoked by Claude
+  Code's `statusLine.command` on every render. Renders the **elements**,
+  writes per-pane **state**, and pings the **handler**. Outside tmux it just
+  prints to stdout.
+- **handler** — `ccstatus --session <id>` (`daemon.rs`). One per tmux
+  **session** that hosts Claude. Holds a control-mode connection to that
+  session and drives the bar. Spawned on demand by the registrar; exits on
+  `%exit` (session killed) or after an idle grace with no Claude panes.
+- **hook** — `ccstatus --hook stop` (`hooks.rs`). Updates per-session
+  **state** (last turn timestamp, model) on Claude's Stop event.
+
+## Concepts
+
+- **element** — a named, independently routable piece of the statusline
+  (`model`, `cwd`, `tokens`, `effort`, `limits`, `version`, `updates`,
+  `warmth`, `heatmap_main`, `heatmap_sub`). See `config::Element`.
+- **surface** — where an element can land: a dedicated tmux **row**, a
+  **powerline side** (`status-left`/`status-right`), Claude's own statusline
+  (stdout), or `off`. See `config::Dest`.
+- **routing** — the element→surface map, a single JSON file read by both
+  registrar and handler so they agree. See `config::Routing`.
+- **reconcile** — the handler's controller step: drive the *observed* bar to
+  the *desired* bar, where desired = "show ccstatus iff the focused pane is a
+  registered Claude pane". See `daemon::Handler::reconcile`.
+- **warmth** — the live cache-warm/cold indicator. Flips warm→cold once the
+  session has been idle past the prompt-cache TTL (~270s). Computed live by
+  the handler so it ticks while idle.
+- **state** — the on-disk data contract under `/tmp/ccstatus-<uid>/`:
+  `pane/<server>/<pane>.json` (registrar) and `session/<id>.json` (hook).
+
+## Modules being deepened (see docs/deepening-design.md)
+
+- **tmux seam** (`Tmux` trait) — the single owner of one-shot tmux commands
+  (option get/set/unset, focused-pane / session / tty queries, refresh,
+  reset). CLI adapter in prod, recording fake in tests. Distinct from the
+  persistent **control connection** (`control.rs`), which carries focus
+  events and `refresh-client -S` and must never fork.
+- **bar plan** (`BarPlan`) — a fully-resolved set of bar mutations for one
+  session, computed purely from routing + element content, then applied
+  through the tmux seam.
+- **usage module** (`usage::render`) — the deep home for the `limits`
+  element: OAuth fetch, usage cache, builtin-vs-API branching, extra-usage
+  credits, reset-time formatting. Internal pure `format_segment` is its test
+  surface.
