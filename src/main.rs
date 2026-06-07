@@ -2,6 +2,8 @@ mod api;
 mod cache;
 mod cli;
 mod color;
+mod control;
+mod daemon;
 mod format;
 mod git;
 mod heatmap;
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
         ParseOutcome::Hook(kind) => return hooks::run(kind),
         ParseOutcome::Render(flavor, pane_id) => return render_tmux::run(flavor, &pane_id),
         ParseOutcome::TmuxOnFocus(hint) => return tmux::on_focus(hint.as_deref()),
+        ParseOutcome::Daemon => return daemon::run(),
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,

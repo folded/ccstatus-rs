@@ -46,6 +46,8 @@ pub enum ParseOutcome {
     /// only — the handler queries tmux for the actually-focused pane
     /// because not every hook event reports the new focus correctly.
     TmuxOnFocus(Option<String>),
+    /// Run the long-lived tmux control-mode daemon.
+    Daemon,
     Install,
     Help,
     Version,
@@ -71,6 +73,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--updates" => cfg.updates = true,
             "--no-updates" => cfg.updates = false,
             "--install" => return ParseOutcome::Install,
+            "--daemon" => return ParseOutcome::Daemon,
             "--tmux-on-focus" => {
                 let hint = iter.next().filter(|s| !s.is_empty());
                 return ParseOutcome::TmuxOnFocus(hint);
@@ -158,6 +161,8 @@ Options:
   --no-updates      Disable update check (default)
   --install         Wire this binary into ~/.claude/settings.json and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop)
+  --daemon          Run the long-lived tmux control-mode daemon that
+                    drives the status bar while Claude sessions are active
   --render-tmux <flavor> <pane_id>
                     Emit a tmux status line for the given pane.
                     Flavors: row | line <N>
