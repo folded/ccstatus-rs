@@ -123,7 +123,8 @@ Options:
   --no-updates      Disable update check (default)
   top               Interactive table of every live Claude session, with
                     jump-to-session (Enter). Quit with q.
-  --install         Wire this binary into ~/.claude/settings.json and exit
+  --install         Wire this binary into ~/.claude/settings.json
+                    (statusLine + Stop/UserPromptSubmit hooks) and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop,
                     user-prompt-submit)
   --session <id>    Run the per-session control-mode handler for tmux
