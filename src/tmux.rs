@@ -126,9 +126,10 @@ pub fn status_value(rows: usize) -> String {
     }
 }
 
-/// The effective global `status-format[0]` (the powerline window list),
-/// falling back to tmux's built-in default template when empty.
-pub fn powerline_row(t: &dyn Tmux) -> String {
+/// The effective global `status-format[0]` (the user's base status row — the
+/// window list with its `status-left`/`status-right` edges), falling back to
+/// tmux's built-in default template when empty.
+pub fn base_row(t: &dyn Tmux) -> String {
     let value = t.global("status-format[0]");
     if value.is_empty() {
         DEFAULT_STATUS_FORMAT_0.to_string()
@@ -162,11 +163,11 @@ pub fn reset(t: &dyn Tmux) {
     t.refresh();
 }
 
-/// tmux's built-in default value for `status-format[0]` — the powerline
-/// window list (status-left + `#{W:…}` window loop + status-right).
+/// tmux's built-in default value for `status-format[0]` — the (plain, not
+/// powerline) window list (status-left + `#{W:…}` window loop + status-right).
 ///
 /// We read the *effective* global `status-format[0]` at activate time and
-/// reuse it as the session's powerline row, but fall back to this when the
+/// reuse it as the session's base status row, but fall back to this when the
 /// global is empty/unset. Copied verbatim from a fresh tmux server's
 /// `show-options -g status-format[0]`. (tmux does not expose the default
 /// via `show-options` once the slot has been touched, and `set -gu` does
@@ -302,13 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn powerline_row_falls_back_to_default() {
+    fn base_row_falls_back_to_default() {
         let t = FakeTmux::new();
-        assert_eq!(powerline_row(&t), DEFAULT_STATUS_FORMAT_0);
+        assert_eq!(base_row(&t), DEFAULT_STATUS_FORMAT_0);
         t.globals
             .borrow_mut()
             .insert("status-format[0]".into(), "custom".into());
-        assert_eq!(powerline_row(&t), "custom");
+        assert_eq!(base_row(&t), "custom");
     }
 
     #[test]

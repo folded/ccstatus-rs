@@ -23,8 +23,9 @@ nouns below are specific to ccstatus.
   (`model`, `cwd`, `tokens`, `effort`, `limits`, `version`, `updates`,
   `warmth`, `heatmap_main`, `heatmap_sub`). See `config::Element`.
 - **surface** — where an element can land: a dedicated tmux **row**, a
-  **powerline side** (`status-left`/`status-right`), Claude's own statusline
-  (stdout), or `off`. See `config::Dest`.
+  **base-row edge** (the user's existing status row's `status-left` /
+  `status-right`), Claude's own statusline (stdout), or `off`. See
+  `config::Dest`.
 - **routing** — the element→surface map, a single JSON file read by both
   registrar and handler so they agree. See `config::Routing`.
 - **reconcile** — the handler's controller step: drive the *observed* bar to

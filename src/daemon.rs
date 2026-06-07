@@ -332,7 +332,7 @@ impl Handler {
         let plan = plan_bar(
             &self.routing,
             &content,
-            &tmux::powerline_row(self.tmux.as_ref()),
+            &tmux::base_row(self.tmux.as_ref()),
             &self.tmux.global("status-left"),
             &self.tmux.global("status-right"),
         );
@@ -367,8 +367,8 @@ pub fn decide(
 }
 
 /// A fully-resolved set of bar mutations for one session: the status-format
-/// rows (dedicated rows first, powerline row last), the `status` choice value,
-/// and the two powerline sides.
+/// rows (dedicated rows first, the user's base row last), the `status` choice
+/// value, and the two base-row edges (`status-left` / `status-right`).
 pub struct BarPlan {
     pub formats: Vec<String>,
     pub status: String,
@@ -376,21 +376,21 @@ pub struct BarPlan {
     pub right: Side,
 }
 
-/// A powerline side: an explicit value to set, or revert to inheriting the
-/// global (`unset_session`).
+/// A base-row edge (`status-left` / `status-right`): an explicit value to set,
+/// or revert to inheriting the global (`unset_session`).
 pub enum Side {
     Set(String),
     Inherit,
 }
 
 /// Pure: turn routing + already-read element content into a concrete bar plan.
-/// `powerline_row` is the resolved global powerline template; `user_left` /
-/// `user_right` are the user's global `status-left` / `status-right`, composed
-/// onto the correct edge.
+/// `base_row` is the resolved user base status row (`status-format[0]`);
+/// `user_left` / `user_right` are the user's global `status-left` /
+/// `status-right`, composed onto the correct edge.
 pub fn plan_bar(
     routing: &config::Routing,
     content: &dyn Fn(Element) -> Option<String>,
-    powerline_row: &str,
+    base_row: &str,
     user_left: &str,
     user_right: &str,
 ) -> BarPlan {
@@ -407,7 +407,7 @@ pub fn plan_bar(
             render_tmux::ansi_to_tmux(&render_tmux::join_segments(parts.iter().map(String::as_str)))
         })
         .collect();
-    formats.push(powerline_row.to_string());
+    formats.push(base_row.to_string());
     let status = tmux::status_value(formats.len());
 
     BarPlan {
@@ -573,12 +573,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_bar_default_has_three_rows_plus_powerline() {
+    fn plan_bar_default_has_three_rows_plus_base_row() {
         let routing = Routing::default();
         let content = |e: Element| (e == Element::Model).then(|| "M".to_string());
-        let plan = plan_bar(&routing, &content, "PL", "", "");
-        assert_eq!(plan.formats.len(), 4); // rows 0/1/2 + powerline
-        assert_eq!(plan.formats[3], "PL");
+        let plan = plan_bar(&routing, &content, "BASE", "", "");
+        assert_eq!(plan.formats.len(), 4); // rows 0/1/2 + base row
+        assert_eq!(plan.formats[3], "BASE");
         assert_eq!(plan.status, "4");
         assert!(matches!(plan.left, Side::Inherit));
         assert!(matches!(plan.right, Side::Inherit));
@@ -595,7 +595,7 @@ mod tests {
             Element::Cwd => Some("C".to_string()),
             _ => None,
         };
-        let plan = plan_bar(&routing, &content, "PL", "", "");
+        let plan = plan_bar(&routing, &content, "BASE", "", "");
         let expected = render_tmux::ansi_to_tmux(&render_tmux::join_segments(["M", "C"]));
         assert_eq!(plan.formats[0], expected);
         assert!(expected.contains('|')); // the ` | ` separator survived
@@ -605,7 +605,7 @@ mod tests {
     fn plan_bar_composes_user_side_on_correct_edge() {
         let routing = Routing::from_pairs(&[(Element::Tokens, Dest::Right)]);
         let content = |e: Element| (e == Element::Tokens).then(|| "T".to_string());
-        let plan = plan_bar(&routing, &content, "PL", "UL", "UR");
+        let plan = plan_bar(&routing, &content, "BASE", "UL", "UR");
         let mine = render_tmux::ansi_to_tmux("T");
         match plan.right {
             Side::Set(s) => assert_eq!(s, format!("UR {mine}")), // user value on the left edge
@@ -619,7 +619,7 @@ mod tests {
     fn apply_emits_ordered_writes() {
         let t = FakeTmux::new();
         let plan = BarPlan {
-            formats: vec!["row0".into(), "powerline".into()],
+            formats: vec!["row0".into(), "base".into()],
             status: "2".into(),
             left: Side::Set("L".into()),
             right: Side::Inherit,
@@ -629,7 +629,7 @@ mod tests {
             *t.writes.borrow(),
             vec![
                 Write::SetSession("$1".into(), "status-format[0]".into(), "row0".into()),
-                Write::SetSession("$1".into(), "status-format[1]".into(), "powerline".into()),
+                Write::SetSession("$1".into(), "status-format[1]".into(), "base".into()),
                 Write::SetSession("$1".into(), "status".into(), "2".into()),
                 Write::SetSession("$1".into(), "status-left".into(), "L".into()),
                 Write::UnsetSession("$1".into(), "status-right".into()),

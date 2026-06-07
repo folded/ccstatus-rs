@@ -22,8 +22,8 @@
 //! - `"row0"`, `"row1"`, … — a dedicated tmux status row (`row0` nearest the
 //!   panes), driven live by the daemon. Multiple elements on one row join
 //!   inline.
-//! - `"left"` / `"right"` — Phase 2b: the powerline row's `status-left` /
-//!   `status-right` (zero added height).
+//! - `"left"` / `"right"` — the user's base status row's `status-left` /
+//!   `status-right` edge (zero added height).
 //!
 //! Missing keys fall back to per-element defaults that reproduce the Phase 1
 //! look. Outside tmux the caller forces every element to `"claude"`.
@@ -104,7 +104,7 @@ impl Element {
 
     fn default_dest(self) -> Dest {
         // Reproduce the Phase 1 layout: rich segments + warmth on row2,
-        // heatmaps on rows 1 and 0, powerline below.
+        // heatmaps on rows 1 and 0, the user's base row below.
         match self {
             Element::HeatmapMain => Dest::Row(1),
             Element::HeatmapSub => Dest::Row(0),
@@ -119,9 +119,9 @@ pub enum Dest {
     Off,
     Claude,
     Row(u8),
-    /// The powerline row's `status-left` (zero added height).
+    /// The base status row's `status-left` edge (zero added height).
     Left,
-    /// The powerline row's `status-right` (zero added height).
+    /// The base status row's `status-right` edge (zero added height).
     Right,
 }
 
@@ -139,7 +139,7 @@ impl Dest {
         }
     }
 
-    /// A daemon-driven tmux surface (row or powerline side).
+    /// A daemon-driven tmux surface (a dedicated row or a base-row edge).
     pub fn is_tmux(self) -> bool {
         matches!(self, Dest::Row(_) | Dest::Left | Dest::Right)
     }
@@ -174,7 +174,7 @@ impl Routing {
     }
 
     /// Any element routed to a daemon-driven tmux surface (a row or a
-    /// powerline side). Determines whether the registrar registers/spawns
+    /// base-row edge). Determines whether the registrar registers/spawns
     /// the daemon at all.
     pub fn any_tmux(&self) -> bool {
         Element::ALL.iter().any(|&e| self.dest(e).is_tmux())
