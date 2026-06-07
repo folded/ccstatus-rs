@@ -1,0 +1,14 @@
+{
+  "route": {
+    "model": "left",
+    "warmth": "right",
+    "heatmap_main": "row0",
+    "tokens": "row1",
+    "limits": "row1",
+    "cwd": "claude",
+    "effort": "claude",
+    "version": "claude",
+    "heatmap_sub": "off",
+    "updates": "off"
+  }
+}
