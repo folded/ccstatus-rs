@@ -1,12 +1,17 @@
 //! Long-lived ccstatus process driving tmux via control mode.
 //!
-//! Milestone 1 scope: prove out the control connection with a single
-//! request/response round-trip and exit. Subsequent milestones add the
-//! snapshot/restore, focus tracking, and notification multiplexing.
+//! Milestone 2 scope: snapshot the user's status-bar options on start,
+//! demonstrate a visible mutation, then restore on exit. Subsequent
+//! milestones add lockfile/socket, registrar integration, focus tracking,
+//! and reload detection.
 
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use crate::control;
+use crate::snapshot::{self, Snapshot};
+use crate::tmux;
 
 pub fn run() -> ExitCode {
     let mut conn = match control::Connection::attach() {
@@ -17,22 +22,59 @@ pub fn run() -> ExitCode {
         }
     };
 
-    // Sanity round-trip: a literal display-message that just echoes a
-    // string. Proves the framing logic end-to-end and that we can send a
-    // command and parse its response. Later milestones add the snapshot,
-    // event loop, and registrar IPC.
-    match conn.cmd("display-message -p 'ccstatus-control-mode-ok'") {
-        Ok(r) if r.ok => {
-            println!("ccstatus daemon: {}", r.output);
-            ExitCode::SUCCESS
-        }
-        Ok(r) => {
-            eprintln!("ccstatus daemon: tmux refused command: {}", r.output);
-            ExitCode::FAILURE
-        }
+    let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
+
+    let snap = match Snapshot::capture(&mut conn) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("ccstatus daemon: {e}");
-            ExitCode::FAILURE
+            eprintln!("ccstatus daemon: snapshot failed: {e}");
+            return ExitCode::FAILURE;
         }
+    };
+    if let Err(e) = snapshot::save(&server_id, &snap) {
+        eprintln!("ccstatus daemon: persisting snapshot: {e}");
+        // Non-fatal: the daemon can still restore in-process on graceful
+        // exit even if persistence fails. The disk copy is only there
+        // for crash recovery.
     }
+    eprintln!(
+        "ccstatus daemon: snapshot captured (status={}, position={})",
+        snap.status, snap.status_position
+    );
+
+    // Visible mutation so the operator can verify the daemon is driving
+    // tmux. Replaced with the real focus-driven row injection in a
+    // later milestone.
+    if let Err(e) = mutate_for_demo(&mut conn) {
+        eprintln!("ccstatus daemon: mutate failed: {e}");
+        let _ = snap.restore(&mut conn);
+        return ExitCode::FAILURE;
+    }
+
+    thread::sleep(Duration::from_secs(5));
+
+    if let Err(e) = snap.restore(&mut conn) {
+        eprintln!("ccstatus daemon: restore failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("ccstatus daemon: restored, exiting");
+    ExitCode::SUCCESS
+}
+
+fn mutate_for_demo(conn: &mut control::Connection) -> Result<(), String> {
+    let r = conn.cmd("set-option -g status 2")?;
+    if !r.ok {
+        return Err(r.output);
+    }
+    let r = conn.cmd(
+        "set-option -g 'status-format[1]' '#[fg=red,bold]ccstatus daemon demo row#[default]'",
+    )?;
+    if !r.ok {
+        return Err(r.output);
+    }
+    let r = conn.cmd("refresh-client -S")?;
+    if !r.ok {
+        return Err(r.output);
+    }
+    Ok(())
 }

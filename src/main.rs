@@ -11,6 +11,7 @@ mod hooks;
 mod install;
 mod oauth;
 mod render_tmux;
+mod snapshot;
 mod state;
 mod term;
 mod tmux;
