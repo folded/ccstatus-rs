@@ -22,16 +22,41 @@ use std::fs;
 use std::os::unix::net::UnixStream;
 
 use crate::cache;
-use crate::render_tmux::WARM_THRESHOLD_SECS;
 use crate::state::{self, SessionState};
 use crate::util::{now_unix, pid_alive};
 
+/// How long after a turn completes a session is still "waiting for you"
+/// before it's considered idle (you've moved on).
+const ACTIVITY_IDLE_AFTER: i64 = 600;
+
+/// What a session is doing — the "which one needs me?" axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Warmth {
-    Warm,
-    Cold,
-    /// No recorded turn yet — warmth is unknown.
+pub enum Activity {
+    /// A turn is in progress (last prompt is newer than the last completion).
+    Working,
+    /// Finished a turn recently and waiting for input.
+    Waiting,
+    /// Finished a while ago — you've likely moved on.
+    Idle,
+    /// Nothing recorded yet.
     Unknown,
+}
+
+/// Pure: derive activity from the prompt/turn timestamps. `idle_secs` is
+/// seconds since the last completed turn.
+fn activity(last_prompt: Option<i64>, last_turn: Option<i64>, idle_secs: Option<i64>) -> Activity {
+    match (last_prompt, last_turn) {
+        // A prompt newer than the last completion (or with no completion yet)
+        // means a turn is running.
+        (Some(p), Some(t)) if p > t => Activity::Working,
+        (Some(_), None) => Activity::Working,
+        // Otherwise the last turn has completed: waiting, or idle once stale.
+        (_, Some(_)) => match idle_secs {
+            Some(i) if i > ACTIVITY_IDLE_AFTER => Activity::Idle,
+            _ => Activity::Waiting,
+        },
+        (None, None) => Activity::Unknown,
+    }
 }
 
 /// A tmux jump address: which server, which pane.
@@ -49,7 +74,7 @@ pub struct SessionView {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub context_pct: Option<u32>,
-    pub warmth: Warmth,
+    pub activity: Activity,
     /// Seconds since the last recorded turn, or `None` if no turn yet.
     pub idle_secs: Option<i64>,
     /// The tmux pane backing this session, or `None` for a non-tmux Claude.
@@ -71,11 +96,6 @@ pub fn build_views(
         .iter()
         .map(|(id, s)| {
             let idle_secs = s.last_turn_ts.map(|t| (now - t).max(0));
-            let warmth = match idle_secs {
-                Some(i) if i < WARM_THRESHOLD_SECS => Warmth::Warm,
-                Some(_) => Warmth::Cold,
-                None => Warmth::Unknown,
-            };
             let address = pane_index.get(id).cloned();
             let jumpable = address
                 .as_ref()
@@ -86,7 +106,7 @@ pub fn build_views(
                 model: s.model.clone(),
                 cwd: s.cwd.clone(),
                 context_pct: s.context_pct_used,
-                warmth,
+                activity: activity(s.last_prompt_ts, s.last_turn_ts, idle_secs),
                 idle_secs,
                 address,
                 jumpable,
@@ -198,6 +218,7 @@ mod tests {
     fn session(last_turn: Option<i64>, model: Option<&str>, ctx: Option<u32>) -> SessionState {
         SessionState {
             last_turn_ts: last_turn,
+            last_prompt_ts: None,
             model: model.map(str::to_string),
             turn_count: 0,
             context_pct_used: ctx,
@@ -209,21 +230,6 @@ mod tests {
 
     fn addr(server: &str, pane: &str) -> PaneAddr {
         PaneAddr { server_id: server.into(), pane_id: pane.into() }
-    }
-
-    #[test]
-    fn warmth_flips_at_threshold() {
-        let now = 10_000;
-        let mut sessions = HashMap::new();
-        sessions.insert("warm".to_string(), session(Some(now - 10), None, None));
-        sessions.insert("cold".to_string(), session(Some(now - WARM_THRESHOLD_SECS - 1), None, None));
-        sessions.insert("new".to_string(), session(None, None, None));
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
-
-        let by = |s: &str| views.iter().find(|v| v.claude_session == s).unwrap().clone();
-        assert_eq!(by("warm").warmth, Warmth::Warm);
-        assert_eq!(by("cold").warmth, Warmth::Cold);
-        assert_eq!(by("new").warmth, Warmth::Unknown);
     }
 
     #[test]
@@ -249,6 +255,37 @@ mod tests {
         assert_eq!(views[0].model.as_deref(), Some("Opus"));
         assert_eq!(views[0].cwd.as_deref(), Some("~/demo"));
         assert_eq!(views[0].context_pct, Some(42));
+    }
+
+    #[test]
+    fn activity_derivation() {
+        let now = 10_000;
+        // Prompt newer than last turn -> working.
+        assert_eq!(activity(Some(now), Some(now - 50), Some(50)), Activity::Working);
+        // Prompt, never completed -> working.
+        assert_eq!(activity(Some(now), None, None), Activity::Working);
+        // Completed after the prompt, recently -> waiting.
+        assert_eq!(activity(Some(now - 100), Some(now - 10), Some(10)), Activity::Waiting);
+        // Completed long ago -> idle.
+        assert_eq!(
+            activity(Some(now - 5000), Some(now - 4000), Some(4000)),
+            Activity::Idle
+        );
+        // Turn but no recorded prompt, recent -> waiting.
+        assert_eq!(activity(None, Some(now - 5), Some(5)), Activity::Waiting);
+        // Nothing -> unknown.
+        assert_eq!(activity(None, None, None), Activity::Unknown);
+    }
+
+    #[test]
+    fn build_views_sets_activity_working_when_prompt_is_newer() {
+        let now = 10_000;
+        let mut sessions = HashMap::new();
+        let mut s = session(Some(now - 100), None, None); // completed at now-100
+        s.last_prompt_ts = Some(now - 5); // new prompt since -> working
+        sessions.insert("s".to_string(), s);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        assert_eq!(views[0].activity, Activity::Working);
     }
 
     #[test]

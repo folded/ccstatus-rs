@@ -14,7 +14,10 @@ use crate::util::{now_unix, resolve_session_id};
 
 #[derive(Debug, Clone, Copy)]
 pub enum HookKind {
+    /// Claude finished a turn — now waiting for input.
     Stop,
+    /// The user submitted a prompt — a turn is starting (Claude is working).
+    UserPromptSubmit,
 }
 
 pub fn run(kind: HookKind) -> std::process::ExitCode {
@@ -24,6 +27,7 @@ pub fn run(kind: HookKind) -> std::process::ExitCode {
     };
     match kind {
         HookKind::Stop => handle_stop(&input),
+        HookKind::UserPromptSubmit => handle_prompt(&input),
     }
     std::process::ExitCode::SUCCESS
 }
@@ -42,6 +46,15 @@ fn handle_stop(input: &Value) {
     {
         s.model = Some(m.to_string());
     }
+    let _ = state::write_session(&session_id, &s);
+}
+
+fn handle_prompt(input: &Value) {
+    let Some(session_id) = resolve_session_id(input) else {
+        return;
+    };
+    let mut s = state::read_session(&session_id).unwrap_or_default();
+    s.last_prompt_ts = Some(now_unix());
     let _ = state::write_session(&session_id, &s);
 }
 

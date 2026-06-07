@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use crate::color::*;
-use crate::fleet::{self, SessionView, Warmth};
+use crate::fleet::{self, Activity, SessionView};
 use crate::ipc;
 use crate::tmux::{self, Tmux};
 
@@ -99,9 +99,10 @@ fn render(views: &[SessionView], selected: usize, my_server: Option<&str>) -> St
     let cols = crate::term::columns(100) as usize;
     let mut out = String::new();
 
-    let warm = views.iter().filter(|v| v.warmth == Warmth::Warm).count();
+    let working = views.iter().filter(|v| v.activity == Activity::Working).count();
+    let waiting = views.iter().filter(|v| v.activity == Activity::Waiting).count();
     out.push_str(&format!(
-        "{BLUE}ccstatus{RESET} {DIM}·{RESET} {} session(s), {GREEN}{warm} warm{RESET}\r\n",
+        "{BLUE}ccstatus{RESET} {DIM}·{RESET} {} session(s) {DIM}·{RESET} {GREEN}{working} working{RESET} {DIM}·{RESET} {ORANGE}{waiting} waiting{RESET}\r\n",
         views.len()
     ));
     out.push_str(&format!(
@@ -126,10 +127,12 @@ fn render(views: &[SessionView], selected: usize, my_server: Option<&str>) -> St
 
 fn row(v: &SessionView, selected: bool, my_server: Option<&str>, cols: usize) -> String {
     let marker = if selected { format!("{BLUE}▶{RESET} ") } else { "  ".to_string() };
-    let (glyph, gcolor) = match v.warmth {
-        Warmth::Warm => ("●", GREEN),
-        Warmth::Cold => ("●", RED),
-        Warmth::Unknown => ("○", DIM),
+    // Lead status: what the session is doing (the "needs me?" axis).
+    let (label, lcolor) = match v.activity {
+        Activity::Working => ("working", GREEN),
+        Activity::Waiting => ("waiting", ORANGE),
+        Activity::Idle => ("idle", DIM),
+        Activity::Unknown => ("-", DIM),
     };
     let model = v.model.as_deref().unwrap_or("Claude");
     let ctx = v
@@ -154,10 +157,10 @@ fn row(v: &SessionView, selected: bool, my_server: Option<&str>, cols: usize) ->
 
     // Fixed-ish left columns, then cwd fills the rest.
     let left = format!(
-        "{marker}{gcolor}{glyph}{RESET} {WHITE}{model:<14}{RESET} {DIM}ctx{RESET} {ctx:<4} {DIM}idle{RESET} {age:<5}{here} "
+        "{marker}{lcolor}{label:<8}{RESET}{WHITE}{model:<14}{RESET} {DIM}ctx{RESET} {ctx:<4} {DIM}idle{RESET} {age:<5}{here} "
     );
     // Budget the cwd column by terminal width, ignoring ANSI in the estimate.
-    let used = 2 + 2 + 15 + 5 + 5 + 6 + 5 + here.len() + 1;
+    let used = 2 + 8 + 15 + 5 + 5 + 6 + 5 + here.len() + 1;
     let budget = cols.saturating_sub(used).max(8);
     let cwd = v.cwd.as_deref().unwrap_or("");
     let cwd = truncate(cwd, budget);

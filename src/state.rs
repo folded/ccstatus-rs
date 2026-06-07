@@ -53,6 +53,10 @@ pub struct PaneState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     pub last_turn_ts: Option<i64>,
+    /// When the user last submitted a prompt (the UserPromptSubmit hook). A
+    /// turn is in progress — Claude is *working* — when this is newer than
+    /// `last_turn_ts`.
+    pub last_prompt_ts: Option<i64>,
     pub model: Option<String>,
     pub turn_count: u64,
     pub context_pct_used: Option<u32>,
@@ -125,6 +129,7 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
     let v: Value = serde_json::from_str(&text).ok()?;
     Some(SessionState {
         last_turn_ts: v.get("last_turn_ts").and_then(|x| x.as_i64()),
+        last_prompt_ts: v.get("last_prompt_ts").and_then(|x| x.as_i64()),
         model: v
             .get("model")
             .and_then(|x| x.as_str())
@@ -152,6 +157,7 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
 pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> {
     let v = json!({
         "last_turn_ts": s.last_turn_ts,
+        "last_prompt_ts": s.last_prompt_ts,
         "model": s.model,
         "turn_count": s.turn_count,
         "context_pct_used": s.context_pct_used,
