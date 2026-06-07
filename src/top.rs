@@ -54,7 +54,9 @@ pub fn run() -> ExitCode {
             Some(Key::Up) => selected = selected.saturating_sub(1),
             Some(Key::Down) => selected += 1,
             Some(Key::Jump) => {
-                if let Some(v) = views.get(selected) {
+                if let Some(v) = views.get(selected)
+                    && v.jumpable
+                {
                     jump(v, my_server.as_deref());
                     break; // jumping switches the client away; nothing to show
                 }
@@ -72,12 +74,14 @@ pub fn run() -> ExitCode {
 
 /// Perform the jump. Same server as us → straight through the tmux seam (fast).
 /// Different server (or we're not in tmux) → route through that server's
-/// handler, which runs in the correct tmux environment.
+/// handler, which runs in the correct tmux environment. No-op for a session
+/// with no pane (a non-tmux Claude — caller gates on `jumpable`).
 fn jump(v: &SessionView, my_server: Option<&str>) {
-    if my_server == Some(v.server_id.as_str()) {
-        tmux::CliTmux.focus_pane(&v.pane_id);
+    let Some(addr) = &v.address else { return };
+    if my_server == Some(addr.server_id.as_str()) {
+        tmux::CliTmux.focus_pane(&addr.pane_id);
     } else {
-        ipc::notify_focus(&v.server_id, &v.pane_id);
+        ipc::notify_focus(&addr.server_id, &addr.pane_id);
     }
 }
 
@@ -136,11 +140,16 @@ fn row(v: &SessionView, selected: bool, my_server: Option<&str>, cols: usize) ->
         .idle_secs
         .map(human_age)
         .unwrap_or_else(|| "-".to_string());
-    let here = if my_server == Some(v.server_id.as_str()) { "" } else { "*" };
-    let jump = if v.jumpable {
-        String::new()
-    } else {
-        format!(" {DIM}(no handler){RESET}")
+    // `*` = on a different tmux server than us (still jumpable via its handler).
+    let here = match &v.address {
+        Some(a) if my_server == Some(a.server_id.as_str()) => "",
+        Some(_) => "*",
+        None => "",
+    };
+    let note = match &v.address {
+        None => format!(" {DIM}(not in tmux){RESET}"),
+        Some(_) if !v.jumpable => format!(" {DIM}(no handler){RESET}"),
+        Some(_) => String::new(),
     };
 
     // Fixed-ish left columns, then cwd fills the rest.
@@ -152,7 +161,7 @@ fn row(v: &SessionView, selected: bool, my_server: Option<&str>, cols: usize) ->
     let budget = cols.saturating_sub(used).max(8);
     let cwd = v.cwd.as_deref().unwrap_or("");
     let cwd = truncate(cwd, budget);
-    format!("{left}{CYAN}{cwd}{RESET}{jump}")
+    format!("{left}{CYAN}{cwd}{RESET}{note}")
 }
 
 fn human_age(secs: i64) -> String {

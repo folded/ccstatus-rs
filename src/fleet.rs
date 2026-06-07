@@ -1,14 +1,18 @@
 //! Aggregate read model over the on-disk state directory.
 //!
-//! The registrar and hooks persist per-pane and per-session state under
+//! The registrar and hooks persist per-session state under
 //! `/tmp/ccstatus-<uid>/` (see [`crate::state`]). This module enumerates all
 //! of it and folds it into one cross-session view — the substrate for
 //! `ccstatus top` and any future aggregate surface (menubar, notifications).
 //!
+//! **Session-driven.** The row identity is the Claude session (its presence
+//! record); a *pane* file, when present, supplies the tmux jump address. A
+//! session with no pane file is a non-tmux Claude: shown, but not jumpable.
+//!
 //! Disk state is *last-known render — may be stale, display-only*. Liveness
-//! and addressing are not read from disk: a session is "live" iff its Claude
-//! process is alive, and "jumpable" iff a handler is listening on its server
-//! (see [`crate::server_dir`]). Both are probed, not trusted from a file.
+//! and addressing are not trusted from a file: a session is "live" iff its
+//! recorded `claude_pid` is alive, and "jumpable" iff a handler is listening
+//! on its server (see [`crate::server_dir`]). Both are probed.
 //!
 //! The fold ([`build_views`]) is pure and takes already-read data; the IO
 //! shell ([`collect`]) does the directory walk and the liveness probes.
@@ -19,7 +23,7 @@ use std::os::unix::net::UnixStream;
 
 use crate::cache;
 use crate::render_tmux::WARM_THRESHOLD_SECS;
-use crate::state::{self, PaneState, SessionState};
+use crate::state::{self, SessionState};
 use crate::util::{now_unix, pid_alive};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,63 +34,62 @@ pub enum Warmth {
     Unknown,
 }
 
+/// A tmux jump address: which server, which pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneAddr {
+    pub server_id: String,
+    pub pane_id: String,
+}
+
 /// One Claude session as seen across the whole machine.
 #[derive(Debug, Clone)]
 pub struct SessionView {
     /// Claude conversation id (the session UUID), the jump key.
     pub claude_session: String,
-    /// tmux server hash + pane id — the address the jump resolves through.
-    pub server_id: String,
-    pub pane_id: String,
     pub model: Option<String>,
-    /// Plain-text working dir / git summary (ANSI stripped from the rendered
-    /// `cwd` element).
     pub cwd: Option<String>,
     pub context_pct: Option<u32>,
     pub warmth: Warmth,
     /// Seconds since the last recorded turn, or `None` if no turn yet.
     pub idle_secs: Option<i64>,
-    /// A handler is listening on this session's server, so a jump can be
-    /// routed to it.
+    /// The tmux pane backing this session, or `None` for a non-tmux Claude.
+    pub address: Option<PaneAddr>,
+    /// Addressable *and* a handler is live on its server, so a jump can land.
     pub jumpable: bool,
 }
 
-/// A parsed pane record: `(server_id, pane_id, state)`.
-pub type PaneRecord = (String, String, PaneState);
-
-/// Pure: fold parsed pane + session state into sorted session views.
-/// `live_servers` is the set of server ids with a listening handler; `now` is
-/// the current unix time (injected for testability).
+/// Pure: fold session presence + pane addressing into sorted views.
+/// `pane_index` maps a session id to its tmux address; `live_servers` is the
+/// set of server ids with a listening handler; `now` is injected for tests.
 pub fn build_views(
-    panes: &[PaneRecord],
     sessions: &HashMap<String, SessionState>,
+    pane_index: &HashMap<String, PaneAddr>,
     live_servers: &HashSet<String>,
     now: i64,
 ) -> Vec<SessionView> {
-    let mut views: Vec<SessionView> = panes
+    let mut views: Vec<SessionView> = sessions
         .iter()
-        .map(|(server_id, pane_id, pane)| {
-            let sess = sessions.get(&pane.session_id);
-            let idle_secs = sess
-                .and_then(|s| s.last_turn_ts)
-                .map(|t| (now - t).max(0));
+        .map(|(id, s)| {
+            let idle_secs = s.last_turn_ts.map(|t| (now - t).max(0));
             let warmth = match idle_secs {
                 Some(i) if i < WARM_THRESHOLD_SECS => Warmth::Warm,
                 Some(_) => Warmth::Cold,
                 None => Warmth::Unknown,
             };
+            let address = pane_index.get(id).cloned();
+            let jumpable = address
+                .as_ref()
+                .map(|a| live_servers.contains(&a.server_id))
+                .unwrap_or(false);
             SessionView {
-                claude_session: pane.session_id.clone(),
-                server_id: server_id.clone(),
-                pane_id: pane_id.clone(),
-                model: sess
-                    .and_then(|s| s.model.clone())
-                    .or_else(|| pane.elements.get("model").map(|s| strip_ansi(s))),
-                cwd: pane.elements.get("cwd").map(|s| strip_ansi(s)),
-                context_pct: sess.and_then(|s| s.context_pct_used),
+                claude_session: id.clone(),
+                model: s.model.clone(),
+                cwd: s.cwd.clone(),
+                context_pct: s.context_pct_used,
                 warmth,
                 idle_secs,
-                jumpable: live_servers.contains(server_id),
+                address,
+                jumpable,
             }
         })
         .collect();
@@ -100,19 +103,24 @@ pub fn build_views(
     views
 }
 
-/// IO shell: walk the state dir, drop panes whose Claude process has exited,
-/// probe handler liveness, and fold into [`SessionView`]s.
+/// IO shell: read every session presence record, drop those whose Claude
+/// process has exited, attach pane addressing, probe handler liveness, and
+/// fold into [`SessionView`]s.
 pub fn collect() -> Vec<SessionView> {
-    let panes: Vec<PaneRecord> = read_live_panes();
-    let sessions = read_sessions();
+    let sessions: HashMap<String, SessionState> = read_sessions()
+        .into_iter()
+        .filter(|(_, s)| s.claude_pid.map(pid_alive).unwrap_or(false))
+        .collect();
+    let pane_index = read_pane_index();
     let live_servers = live_servers();
-    build_views(&panes, &sessions, &live_servers, now_unix())
+    build_views(&sessions, &pane_index, &live_servers, now_unix())
 }
 
-/// Every live pane across every server: `pane/<server_id>/<pane>.json` whose
-/// `claude_pid` is still alive.
-fn read_live_panes() -> Vec<PaneRecord> {
-    let mut out = Vec::new();
+/// Map each session id to its tmux pane address, from `pane/<server>/<pane>`
+/// files. (A session may have at most one pane; last write wins on the rare
+/// duplicate.)
+fn read_pane_index() -> HashMap<String, PaneAddr> {
+    let mut out = HashMap::new();
     let pane_root = cache::cache_dir().join("pane");
     let Ok(servers) = fs::read_dir(&pane_root) else {
         return out;
@@ -127,10 +135,14 @@ fn read_live_panes() -> Vec<PaneRecord> {
             let Some(pane_id) = name.strip_suffix(".json") else {
                 continue;
             };
-            if let Some(pane) = state::read_pane(&server_id, pane_id)
-                && pid_alive(pane.claude_pid)
-            {
-                out.push((server_id.clone(), pane_id.to_string(), pane));
+            if let Some(pane) = state::read_pane(&server_id, pane_id) {
+                out.insert(
+                    pane.session_id,
+                    PaneAddr {
+                        server_id: server_id.clone(),
+                        pane_id: pane_id.to_string(),
+                    },
+                );
             }
         }
     }
@@ -179,53 +191,9 @@ fn live_servers() -> HashSet<String> {
     out
 }
 
-/// Strip ANSI SGR sequences (`\x1b[…m`) so rendered element content can be
-/// shown as plain text.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
-            let mut j = i + 2;
-            while j < bytes.len() && bytes[j] != b'm' {
-                j += 1;
-            }
-            i = if j < bytes.len() { j + 1 } else { bytes.len() };
-            continue;
-        }
-        let start = i;
-        i += 1;
-        while i < bytes.len() && bytes[i] != 0x1b {
-            i += 1;
-        }
-        out.push_str(&s[start..i]);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pane(session: &str, model_el: Option<&str>, cwd_el: Option<&str>) -> PaneState {
-        let mut elements = HashMap::new();
-        if let Some(m) = model_el {
-            elements.insert("model".to_string(), m.to_string());
-        }
-        if let Some(c) = cwd_el {
-            elements.insert("cwd".to_string(), c.to_string());
-        }
-        PaneState {
-            session_id: session.to_string(),
-            claude_pid: 1234,
-            pane_tty: "/dev/ttys001".to_string(),
-            transcript_path: None,
-            registered_at: 0,
-            last_warmth: None,
-            elements,
-        }
-    }
 
     fn session(last_turn: Option<i64>, model: Option<&str>, ctx: Option<u32>) -> SessionState {
         SessionState {
@@ -235,93 +203,85 @@ mod tests {
             context_pct_used: ctx,
             cache_read_pct: None,
             cwd: None,
-            claude_pid: None,
+            claude_pid: Some(1234),
         }
+    }
+
+    fn addr(server: &str, pane: &str) -> PaneAddr {
+        PaneAddr { server_id: server.into(), pane_id: pane.into() }
     }
 
     #[test]
     fn warmth_flips_at_threshold() {
         let now = 10_000;
-        let panes = vec![
-            ("srv".into(), "%1".into(), pane("warm-sess", None, None)),
-            ("srv".into(), "%2".into(), pane("cold-sess", None, None)),
-            ("srv".into(), "%3".into(), pane("new-sess", None, None)),
-        ];
         let mut sessions = HashMap::new();
-        sessions.insert("warm-sess".to_string(), session(Some(now - 10), None, None));
-        sessions.insert(
-            "cold-sess".to_string(),
-            session(Some(now - WARM_THRESHOLD_SECS - 1), None, None),
-        );
-        // new-sess has no session file / no turn.
-        let views = build_views(&panes, &sessions, &HashSet::new(), now);
+        sessions.insert("warm".to_string(), session(Some(now - 10), None, None));
+        sessions.insert("cold".to_string(), session(Some(now - WARM_THRESHOLD_SECS - 1), None, None));
+        sessions.insert("new".to_string(), session(None, None, None));
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
 
-        let by_sess = |s: &str| views.iter().find(|v| v.claude_session == s).unwrap().clone();
-        assert_eq!(by_sess("warm-sess").warmth, Warmth::Warm);
-        assert_eq!(by_sess("cold-sess").warmth, Warmth::Cold);
-        assert_eq!(by_sess("new-sess").warmth, Warmth::Unknown);
+        let by = |s: &str| views.iter().find(|v| v.claude_session == s).unwrap().clone();
+        assert_eq!(by("warm").warmth, Warmth::Warm);
+        assert_eq!(by("cold").warmth, Warmth::Cold);
+        assert_eq!(by("new").warmth, Warmth::Unknown);
     }
 
     #[test]
     fn sorts_most_recently_active_first_unknown_last() {
         let now = 10_000;
-        let panes = vec![
-            ("srv".into(), "%1".into(), pane("idle", None, None)),
-            ("srv".into(), "%2".into(), pane("active", None, None)),
-            ("srv".into(), "%3".into(), pane("never", None, None)),
-        ];
         let mut sessions = HashMap::new();
         sessions.insert("idle".to_string(), session(Some(now - 200), None, None));
         sessions.insert("active".to_string(), session(Some(now - 5), None, None));
-        let views = build_views(&panes, &sessions, &HashSet::new(), now);
+        sessions.insert("never".to_string(), session(None, None, None));
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
         let order: Vec<&str> = views.iter().map(|v| v.claude_session.as_str()).collect();
         assert_eq!(order, vec!["active", "idle", "never"]);
     }
 
     #[test]
-    fn model_falls_back_to_stripped_element() {
+    fn presence_fields_pass_through() {
         let now = 10_000;
-        let panes = vec![(
-            "srv".into(),
-            "%1".into(),
-            pane("s", Some("\x1b[38;2;0;0;0mOpus\x1b[0m"), Some("\x1b[2mdemo\x1b[0m@main")),
-        )];
-        let sessions = HashMap::new(); // no session file -> model from element
-        let views = build_views(&panes, &sessions, &HashSet::new(), now);
-        assert_eq!(views[0].model.as_deref(), Some("Opus"));
-        assert_eq!(views[0].cwd.as_deref(), Some("demo@main"));
-    }
-
-    #[test]
-    fn session_model_wins_over_element() {
-        let now = 10_000;
-        let panes = vec![("srv".into(), "%1".into(), pane("s", Some("FromElement"), None))];
         let mut sessions = HashMap::new();
-        sessions.insert("s".to_string(), session(Some(now), Some("FromSession"), Some(42)));
-        let views = build_views(&panes, &sessions, &HashSet::new(), now);
-        assert_eq!(views[0].model.as_deref(), Some("FromSession"));
+        let mut s = session(Some(now), Some("Opus"), Some(42));
+        s.cwd = Some("~/demo".into());
+        sessions.insert("s".to_string(), s);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        assert_eq!(views[0].model.as_deref(), Some("Opus"));
+        assert_eq!(views[0].cwd.as_deref(), Some("~/demo"));
         assert_eq!(views[0].context_pct, Some(42));
     }
 
     #[test]
-    fn jumpable_tracks_live_servers() {
+    fn non_tmux_session_has_no_address_and_is_not_jumpable() {
         let now = 10_000;
-        let panes = vec![
-            ("live".into(), "%1".into(), pane("a", None, None)),
-            ("dead".into(), "%2".into(), pane("b", None, None)),
-        ];
-        let mut live = HashSet::new();
-        live.insert("live".to_string());
-        let views = build_views(&panes, &HashMap::new(), &live, now);
-        let by_sess = |s: &str| views.iter().find(|v| v.claude_session == s).unwrap().clone();
-        assert!(by_sess("a").jumpable);
-        assert!(!by_sess("b").jumpable);
+        let mut sessions = HashMap::new();
+        sessions.insert("s".to_string(), session(Some(now), None, None));
+        // No pane file for it -> not in tmux.
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        assert!(views[0].address.is_none());
+        assert!(!views[0].jumpable);
     }
 
     #[test]
-    fn strip_ansi_removes_sgr_keeps_text() {
-        assert_eq!(strip_ansi("\x1b[38;2;0;153;255mClaude\x1b[0m"), "Claude");
-        assert_eq!(strip_ansi("plain"), "plain");
-        assert_eq!(strip_ansi("\x1b[2m·\x1b[0m mid \x1b[1mX\x1b[0m"), "· mid X");
+    fn jumpable_requires_a_pane_on_a_live_server() {
+        let now = 10_000;
+        let mut sessions = HashMap::new();
+        sessions.insert("live".to_string(), session(Some(now), None, None));
+        sessions.insert("deadsrv".to_string(), session(Some(now), None, None));
+        sessions.insert("notmux".to_string(), session(Some(now), None, None));
+        let mut panes = HashMap::new();
+        panes.insert("live".to_string(), addr("L", "%1"));
+        panes.insert("deadsrv".to_string(), addr("D", "%2"));
+        let mut live = HashSet::new();
+        live.insert("L".to_string());
+
+        let views = build_views(&sessions, &panes, &live, now);
+        let by = |s: &str| views.iter().find(|v| v.claude_session == s).unwrap().clone();
+        assert!(by("live").jumpable); // pane on a live server
+        assert_eq!(by("live").address, Some(addr("L", "%1")));
+        assert!(!by("deadsrv").jumpable); // pane, but no live handler
+        assert!(by("deadsrv").address.is_some());
+        assert!(!by("notmux").jumpable); // no pane at all
+        assert!(by("notmux").address.is_none());
     }
 }

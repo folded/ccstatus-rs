@@ -39,13 +39,19 @@ nouns below are specific to ccstatus.
   session has been idle past the prompt-cache TTL (~270s). Computed live by
   the handler so it ticks while idle.
 - **state** — the on-disk data contract under `/tmp/ccstatus-<uid>/`:
-  `pane/<server>/<pane>.json` (registrar) and `session/<id>.json` (hook).
+  `pane/<server>/<pane>.json` (registrar, tmux-only) and `session/<id>.json`.
+  The session file carries **presence** (model, cwd, context %, `claude_pid`)
+  written by the registrar on *every* render — including outside tmux — plus
+  the turn fields (`last_turn_ts`, `turn_count`) written by the hook. Two
+  writers, disjoint fields, each read-modify-writing the whole record.
 - **fleet** — the aggregate read model over **all** sessions' **state**
-  (`fleet.rs`). Enumerates the state dir, drops dead panes, probes handler
-  liveness, and folds into sorted `SessionView`s. Pure core (`build_views`) +
-  IO shell (`collect`). Disk state is display-only; liveness/addressing are
-  probed, never trusted from a file. Substrate for **top** and future
-  aggregate surfaces.
+  (`fleet.rs`). **Session-driven**: the row is a Claude session (its presence
+  record); a pane file, when present, supplies the tmux jump address, so a
+  non-tmux Claude still shows (as a non-jumpable row). Drops dead-pid sessions,
+  probes handler liveness, folds into sorted `SessionView`s. Pure core
+  (`build_views`) + IO shell (`collect`). Disk state is display-only;
+  liveness/addressing are probed, never trusted from a file. Substrate for
+  **top** and future aggregate surfaces.
 - **jump** — "take me to this Claude": focus a session's tmux window + pane
   from an aggregate surface. Actuated via `Tmux::focus_pane`; same-server jumps
   go direct, cross-server jumps route through that server's **handler** (a
