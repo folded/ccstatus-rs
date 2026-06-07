@@ -158,7 +158,17 @@ pub fn run() -> ExitCode {
         .map(|r| r.output.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let (writer, events) = conn.split();
+    let (mut writer, events) = conn.split();
+
+    // If a previous daemon crashed mid-Active, the live bar still has
+    // its ccstatus content even though the snapshot is now defaulted.
+    // Apply the (clean) snapshot now to put the user's bar back in
+    // shape before this daemon starts changing anything itself.
+    if snap.was_polluted {
+        log.write("pollution detected: applying defaults to live bar");
+        snap.apply_via_writer(&mut writer);
+        let _ = writer.send("refresh-client -S");
+    }
 
     // Merge tmux events and registrar messages onto one channel.
     let (tx, rx) = mpsc::channel::<Incoming>();
@@ -480,20 +490,36 @@ impl Daemon {
     }
 }
 
-/// Shell out to a fresh `tmux display-message` client to ask which pane
-/// is currently active. Bypasses our control-mode connection entirely —
-/// each invocation is its own short-lived tmux client. Used as the
-/// fallback for missed subscription notifications.
+/// Ask tmux which pane the user's interactive client is currently
+/// looking at. `display-message -p '#{window_active_pane}'` from a
+/// subprocess context isn't reliable (no implicit target), so we walk
+/// the client list, find one with a real tty (excludes our own
+/// control-mode client and any other automation), and return its
+/// active pane.
 fn query_focused_pane() -> Option<String> {
     let out = std::process::Command::new("tmux")
-        .args(["display-message", "-p", "#{window_active_pane}"])
+        .args([
+            "list-clients",
+            "-F",
+            "#{client_tty}\t#{client_active_pane}",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let tty = parts.next().unwrap_or("");
+        let pane = parts.next().unwrap_or("");
+        // Skip clients with no tty (control mode — including us).
+        if tty.is_empty() || pane.is_empty() {
+            continue;
+        }
+        return Some(pane.to_string());
+    }
+    None
 }
 
 /// Truncate a (possibly multi-line, possibly unicode) format value to

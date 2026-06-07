@@ -21,6 +21,11 @@ pub struct Snapshot {
     pub status_position: String,
     /// `None` for slots that were unset; restore via `set -gu status-format[N]`.
     pub status_format: [Option<String>; STATUS_FORMAT_SLOTS],
+    /// True if the `@ccstatus-active` sentinel was set when we
+    /// captured. Means a previous daemon left without restoring; the
+    /// caller should apply this (already-defaulted) snapshot
+    /// immediately to clean up the live tmux state.
+    pub was_polluted: bool,
 }
 
 impl Snapshot {
@@ -51,6 +56,7 @@ impl Snapshot {
             status,
             status_position,
             status_format,
+            was_polluted: polluted,
         })
     }
 
@@ -100,6 +106,7 @@ impl Snapshot {
             status: v.get("status")?.as_str()?.to_string(),
             status_position: v.get("status_position")?.as_str()?.to_string(),
             status_format: Default::default(),
+            was_polluted: v.get("was_polluted").and_then(|x| x.as_bool()).unwrap_or(false),
         };
         let arr = v.get("status_format")?.as_array()?;
         for (i, slot) in s.status_format.iter_mut().enumerate() {
@@ -197,6 +204,7 @@ mod tests {
             status: "on".into(),
             status_position: "bottom".into(),
             status_format: Default::default(),
+            was_polluted: false,
         };
         s.status_format[0] = Some("first".into());
         s.status_format[2] = Some("third".into());
