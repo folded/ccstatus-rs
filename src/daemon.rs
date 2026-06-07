@@ -61,14 +61,6 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 /// Mirrors the constant in `render_tmux.rs`.
 const WARM_THRESHOLD_SECS: i64 = 270;
 
-/// tmux's built-in default value for `status-format[0]`. The default
-/// isn't stored as an option (so `show-options -gv` returns empty), it's
-/// implicit in tmux's renderer. When the user's snapshot captures `None`
-/// at `[0]`, we use this when injecting at `[3]` so the row that should
-/// be the powerline window list isn't blank. Copied verbatim from a
-/// fresh tmux server's `show-options -g status-format[0]`.
-const DEFAULT_STATUS_FORMAT_0: &str = "#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{W:#[range=window|#{window_index} #{E:window-status-style}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-format}#[pop-default]#[norange default]#{?loop_last_flag,,#{window-status-separator}},#[range=window|#{window_index} list=focus #{?#{!=:#{E:window-status-current-style},default},#{E:window-status-current-style},#{E:window-status-style}}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-current-format}#[pop-default]#[norange list=on default]#{?loop_last_flag,,#{window-status-separator}}}#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]";
-
 #[derive(Debug)]
 enum Incoming {
     Tmux(control::Event),
@@ -462,7 +454,7 @@ impl Daemon {
         // to tmux's built-in default so the row isn't blank.
         let user_fmt0 = self.snapshot.status_format[0]
             .clone()
-            .unwrap_or_else(|| DEFAULT_STATUS_FORMAT_0.to_string());
+            .unwrap_or_else(|| snapshot::DEFAULT_STATUS_FORMAT_0.to_string());
         self.set_format(3, &user_fmt0);
     }
 

@@ -15,6 +15,18 @@ use crate::control::Connection;
 /// Number of status-format slots tmux supports.
 pub const STATUS_FORMAT_SLOTS: usize = 6;
 
+/// tmux's built-in default value for `status-format[0]` — the powerline
+/// window list (status-left + `#{W:…}` window loop + status-right).
+///
+/// The default isn't stored as an option (`show-options -gv` returns it
+/// on a *fresh* server, but once any index has been touched, `set -gu`
+/// does **not** restore it: on macOS tmux it leaves the slot empty,
+/// which renders as a blank bar). So whenever we need to put the user's
+/// bar back and the captured slot was unset/empty, we must write this
+/// template explicitly rather than unsetting. Copied verbatim from a
+/// fresh tmux server's `show-options -g status-format[0]`.
+pub const DEFAULT_STATUS_FORMAT_0: &str = "#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{W:#[range=window|#{window_index} #{E:window-status-style}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-format}#[pop-default]#[norange default]#{?loop_last_flag,,#{window-status-separator}},#[range=window|#{window_index} list=focus #{?#{!=:#{E:window-status-current-style},default},#{E:window-status-current-style},#{E:window-status-style}}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-current-format}#[pop-default]#[norange list=on default]#{?loop_last_flag,,#{window-status-separator}}}#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]";
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub status: String,
@@ -76,12 +88,16 @@ impl Snapshot {
     /// event-driven daemon path). Errors are swallowed individually —
     /// if a single set-option fails, the rest still get attempted.
     ///
-    /// Always unsets status-format[0..N] regardless of captured value:
-    /// the captured values can't be trusted to be the user's true
-    /// intent (a crashed predecessor daemon may have left its own
-    /// content in those slots). Unsetting them returns tmux to its
-    /// built-in default rendering, which is what the user got from
-    /// their config in the first place.
+    /// Restores each captured `status-format[N]`:
+    ///   - captured `Some(v)` → write `v` back verbatim;
+    ///   - captured `None` at slot 0 → write the built-in default
+    ///     template (`DEFAULT_STATUS_FORMAT_0`). We must NOT `set -gu`
+    ///     here: on macOS tmux unsetting leaves the slot empty rather
+    ///     than restoring the default, which renders as a blank (black)
+    ///     bar — the user's powerline window list vanishes;
+    ///   - captured `None` at slots 1..N → unset (those higher slots
+    ///     have no built-in default and only render as extra rows when
+    ///     `status >= 2`, which the restored `status` value governs).
     ///
     /// Also clears the @ccstatus-active sentinel so the next daemon
     /// start sees a clean shutdown and trusts its captured values.
@@ -91,8 +107,20 @@ impl Snapshot {
             "set-option -g status-position {}",
             quoted(&self.status_position)
         ));
-        for i in 0..STATUS_FORMAT_SLOTS {
-            let _ = w.send(&format!("set-option -gu 'status-format[{i}]'"));
+        for (i, slot) in self.status_format.iter().enumerate() {
+            match slot {
+                Some(v) => {
+                    let escaped = escape_for_tmux(v);
+                    let _ = w.send(&format!("set-option -g 'status-format[{i}]' \"{escaped}\""));
+                }
+                None if i == 0 => {
+                    let escaped = escape_for_tmux(DEFAULT_STATUS_FORMAT_0);
+                    let _ = w.send(&format!("set-option -g 'status-format[0]' \"{escaped}\""));
+                }
+                None => {
+                    let _ = w.send(&format!("set-option -gu 'status-format[{i}]'"));
+                }
+            }
         }
         let _ = w.send("set-option -gu @ccstatus-active");
     }

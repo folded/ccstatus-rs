@@ -113,9 +113,22 @@ fn main() -> ExitCode {
 /// puts status back to `on`. Use after a daemon crash or when ccstatus
 /// is being uninstalled.
 fn tmux_reset() -> ExitCode {
+    // status-format[0] must be written back to tmux's built-in default
+    // template explicitly. `set -gu` does NOT restore it once the slot
+    // has been touched (macOS tmux leaves it empty -> black bar), so
+    // unsetting here is exactly what left the bar broken.
+    let _ = Command::new("tmux")
+        .args([
+            "set-option",
+            "-g",
+            "status-format[0]",
+            snapshot::DEFAULT_STATUS_FORMAT_0,
+        ])
+        .status();
+    // Higher slots have no built-in default and only render as extra
+    // rows when status >= 2; unsetting them is correct.
     let unsets = [
         "@ccstatus-active",
-        "status-format[0]",
         "status-format[1]",
         "status-format[2]",
         "status-format[3]",
