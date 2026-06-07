@@ -19,74 +19,89 @@ keeps updating while idle.
 
 ## Goals
 
-- Single binary, no new daemon (for now).
+- **Zero modifications to the user's tmux config.** Adding ccstatus must
+  not require any `set-option`, `set-hook`, or `status-format` lines in
+  `tmux.conf`. Removing ccstatus must leave the user's bar exactly as it
+  was. The status bar should behave entirely normally when Claude isn't
+  active.
 - Outside tmux: behaviour unchanged from today (one-line render on stdout,
   all current blocks preserved).
-- Inside tmux: ccstatus becomes a two-role tool sharing one binary:
+- Inside tmux: ccstatus runs a long-lived daemon that holds a tmux control
+  channel and drives the status bar over it. The binary has three roles:
   - **registrar**: invoked by Claude Code via `statusLine.command`, writes
-    per-pane state *and* still renders the rich line to stdout (model, cwd,
-    tokens, rate limits, heatmap). Claude's statusline holds the
-    mostly-static fields that don't benefit from idle ticking.
-  - **renderer**: invoked by tmux via `status-format` / `pane-border-format`
-    shell substitutions, reads state, formats a tick-driven line (cache
-    warmth, idle time).
+    per-pane state, ensures a daemon is running for the local tmux server,
+    notifies the daemon over a local socket.
+  - **daemon** (`ccstatus --daemon`): long-lived process. Connects to tmux
+    via `tmux -C attach -t <session>`; snapshots the user's `status`,
+    `status-format[*]`, and `status-position` on start; subscribes to
+    focus events; mutates the bar to inject ccstatus rows when the
+    focused pane has a registered Claude session and restores the
+    snapshot otherwise. Exits and restores when no Claude sessions
+    remain.
+  - **hook handlers** (`ccstatus --hook stop` etc.): unchanged from
+    before, write per-session state.
 - Cache-warmth indicator that keeps ticking when the session is idle and
-  when Claude has been suspended (`Ctrl-Z`), and that disappears once Claude
-  has exited.
+  when Claude has been suspended (`Ctrl-Z`), and that disappears once
+  Claude has exited.
+- Daemon adapts to user reloads (`prefix + r`) — when the user changes
+  their bar config, the daemon re-snapshots and the new config becomes
+  the new baseline.
 
 ## Non-goals (for the first cut)
 
-- A long-running daemon.
 - Surfaces that lack a natural tick (notification on warm→cold edge,
   free-floating status windows). Will revisit only if we add such a surface.
 - Reworking the existing single-line render or its options — tmux mode adds
   alternative emission paths, it does not replace them.
+- Cross-server coordination. One daemon per tmux server.
 
 ## What already exists in this crate
 
-(For agents/humans reading this cold.)
-
-- `main.rs` — entry point. Reads stdin, parses JSON, calls `render()`,
-  prints to stdout. ~510 lines.
-- `cli.rs` — argument parser, `Config` struct of feature toggles.
-- `cache.rs` — `/tmp/ccstatus-&lt;uid&gt;` cache dir, `write_atomic`, `read_if_fresh`,
-  `read_stale`, `touch`, `remove_if_empty`. Reusable for the new state
-  files.
-- `install.rs` — writes `statusLine.command` into `~/.claude/settings.json`
-  (or `$CLAUDE_CONFIG_DIR`) preserving other keys.
-- `heatmap.rs`, `git.rs`, `api.rs`, `oauth.rs`, `format.rs`, `color.rs`,
-  `term.rs`, `cache.rs` — existing rendering blocks and helpers.
-
-The Claude JSON schema the binary already consumes (see `render()` in
-`main.rs`): `model.display_name`, `context_window.context_window_size`,
-`context_window.current_usage.{input_tokens, cache_creation_input_tokens,
-cache_read_input_tokens}`, `cwd`, `effort.level`, `rate_limits.{five_hour,
-seven_day}.{used_percentage, resets_at}`.
-
-Notably **not present in the per-render JSON**: a `session_id` field, a
-`transcript_path`, the Claude Code pid. The first cut will need to verify
-what `session_id` looks like in the stdin payload (Claude has added new keys
-over time — there is a `session_id` at the top level in recent versions,
-worth confirming on real input rather than guessing).
+- `main.rs` — entry point and `render()` (the rich ANSI statusline).
+  Dispatches modes from `cli::parse_args`.
+- `cli.rs` — argument parser. Current modes: default render, `--install`,
+  `--hook stop`, `--render-tmux <flavor> <pane>`, `--tmux-on-focus`
+  (legacy, to be retired with the daemon).
+- `state.rs` — `PaneState`, `SessionState`, JSON IO under
+  `/tmp/ccstatus-<uid>/pane/<server>/<pane>.json` and
+  `/tmp/ccstatus-<uid>/session/<session_id>.json`. Pane state currently
+  stores pre-rendered ANSI lines from the registrar.
+- `hooks.rs` — `--hook stop` handler: bumps `last_turn_ts` and
+  `turn_count` in session state.
+- `render_tmux.rs` — current `--render-tmux line N` and `row` flavors:
+  reads state, formats with tmux format strings (`#[fg=…]`), includes an
+  ANSI→tmux converter for stashed lines. **Will mostly go away once the
+  daemon pushes content directly via control mode.**
+- `tmux.rs` — small env helpers (`server_id` from `$TMUX` socket hash)
+  and the legacy `on_focus` handler (also to be retired).
+- `cache.rs` — atomic write helpers, per-user cache dir.
+- `install.rs`, `heatmap.rs`, `git.rs`, `api.rs`, `oauth.rs`,
+  `format.rs`, `color.rs`, `term.rs` — unchanged, reused.
 
 ## Architecture
 
 ```
-                                                       ┌─► tmux status row
-Claude render → ccstatus (registrar mode)              │
-                  writes pane state, prints "" ┐       │
-                                               │       │
-Claude Stop  → ccstatus (hook mode)            ▼       │
-                  writes session state ────► state ────►─► pane border / pane title
-                                               ▲       │
-PostToolUse  → ccstatus (hook mode)            │       │
-                  writes session deltas ───────┘       │
-                                                       │
-                                                       └─► future surfaces
+                                                                ┌── tmux server ──┐
+Claude render → ccstatus (registrar)                            │                 │
+                  writes pane state ───┐                        │   status bar    │
+                  notifies daemon ─────┼────────► UNIX SOCKET ─► daemon process   │
+                                       │           (notify)    │     │            │
+Claude Stop hook → ccstatus            │                       │     │ control    │
+                  writes session state │                       │     │ channel    │
+                                       │                       │     │            │
+                                       ▼                       │     ▼            │
+                                STATE FILES                    │   set-option,    │
+                          /tmp/ccstatus-<uid>/                 │   refresh-client │
+                          (pane/, session/)                    │                  │
+                                       │                       │                  │
+                                       └───── daemon reads ────┘                  │
+                                                                └─────────────────┘
 ```
 
-Three writers, one reader (the renderer), arbitrarily many display surfaces.
-Filesystem is the contract.
+The state files are still the data contract. The change is *display*: the
+daemon owns the status bar via control mode rather than tmux-config
+substitutions calling ccstatus back. One long-lived daemon per tmux server.
+The registrar's job shrinks to "write state and ping the daemon."
 
 ## State layout
 
@@ -132,124 +147,86 @@ without re-reading history; useful when we add edge-triggered surfaces.
 
 ## CLI surface
 
-Extend `cli.rs`. New flags route to new code paths:
-
 ```
-ccstatus                       # current behaviour: render statusline from stdin
-                               # NEW: if $TMUX set, additionally register pane
-                               # state and emit nothing on stdout
+ccstatus                       Default render mode. If $TMUX is set,
+                               ALSO writes pane state and pokes the
+                               daemon (spawning it if absent). Either
+                               way prints the rich line to stdout.
 
-ccstatus --render-tmux <flavor> <pane_id>
-  flavors: row | border | title
-  Reads pane state for <pane_id>, prints formatted line on stdout.
-  For `title`, also emits `tmux select-pane -T` so window-title chain works.
+ccstatus --hook <kind>         kinds: stop. Reads hook JSON on stdin,
+                               updates session/<session_id>.json.
 
-ccstatus --hook <kind>
-  kinds: stop | post-tool-use
-  Reads hook JSON on stdin, updates session/<session_id>.json.
+ccstatus --daemon              The long-lived process. Connects to the
+                               local tmux server via control mode,
+                               snapshots and restores user state, owns
+                               the bar while Claude sessions are
+                               registered. Exits when none remain.
 
-ccstatus --install
-  As today, plus optional `--with-hooks` to also write the Stop /
-  PostToolUse hook entries into settings.json.
+ccstatus --install             Wires statusLine.command (and Stop hook
+                               with --with-hooks) into settings.json.
 ```
 
-A single binary keeps install/distribution simple. Mode dispatch in
-`main.rs` happens after `cli::parse_args` but before `render()`.
+Removed (or made internal/deprecated by the daemon):
 
-## Mode 1 — registrar (default mode, augmented)
+- `--render-tmux <flavor> <pane_id>` — daemon pushes directly via
+  control mode; no shell-substitution renderer needed.
+- `--tmux-on-focus [<pane_id>]` — daemon subscribes to focus events
+  directly; no hook glue required.
 
-Today: read stdin JSON → `render()` → stdout.
+## Daemon (`--daemon`)
 
-New behaviour, only when `$TMUX` is set:
+Single process per tmux server. Lifecycle and responsibilities:
 
-1. Resolve Claude pid. `$PPID` is the script's parent; if that doesn't have
-   `comm == claude`, walk up `ps -o ppid= -p <pid>` until it does. Cache the
-   walk in `pane_state` so we don't redo it every render. Fall back to
-   `$PPID` if the walk fails.
-2. Capture `$TMUX_PANE` (e.g. `%5`) and the pane's tty via
-   `tmux display -t $TMUX_PANE -p '#{pane_tty}'`.
-3. Pull `session_id` from the stdin JSON (verify the key path on a real
-   payload — likely `/session_id` at the top level).
-4. Atomically write `pane/<TMUX_PANE>.json`. Rate-limit: skip the write if
-   the existing file is <500 ms old and the session_id/pid match (statusline
-   can fire on every streamed chunk; we don't want a write storm).
-5. Fall through and render the rich line to stdout. The Claude
-   statusline and the tmux row are complementary: rich, mostly-static
-   fields (model, cwd, tokens, rates, heatmap) belong in Claude's row;
-   time-sensitive fields (cache warmth, idle time) belong in the tmux
-   row which ticks on `status-interval`.
+**Startup.**
+1. Discover the server socket from `$TMUX`. Acquire a per-server lock
+   (`/tmp/ccstatus-<uid>/server-<hash>/daemon.lock`). If another daemon
+   holds it, exit silently (the registrar's poke already woke them).
+2. Spawn `tmux -C attach -t <session>` as a child with piped stdin/stdout.
+3. Snapshot user state: `status`, `status-position`, `status-interval`,
+   and every set `status-format[N]`. Persist to disk so a crashed daemon
+   can still restore on restart.
+4. Open a local Unix socket
+   (`/tmp/ccstatus-<uid>/server-<hash>/daemon.sock`) for the registrar
+   to send notifications.
 
-When `$TMUX` is unset, fall through to the existing `render()` path
-unchanged.
+**Main loop.** Multiplex three sources with non-blocking IO:
+- Control-mode notifications from tmux (focus events, exit, output).
+- Registrar messages on the socket ("session X registered for pane Y",
+  "session X exited").
+- Self timer for periodic refreshes (cache-warmth ticks).
 
-Open question: should the registrar *also* paint iTerm surfaces (title,
-badge) when running outside tmux but inside iTerm directly? Probably yes,
-but defer to Phase 3 — outside-tmux behaviour stays identical until then.
+**State machine.** Tracks the *visible* state of the bar:
+- `Idle` — no Claude pane focused, bar matches user snapshot.
+- `Active(pane_id)` — bar has injected rows for `pane_id`.
 
-## Mode 2 — renderer (`--render-tmux`)
+Transitions:
+- Focus into a pane that has registered state → `Active`. Send
+  `set-option status N` and `set-option status-format[N]` for each row.
+- Focus out of a Claude pane → `Idle`. Restore from snapshot.
+- Same Claude pane focus tick (timer) → re-render line content if
+  warmth changed.
 
-Invoked by tmux with a flavor and a pane id; reads state and prints. Must
-be fast (we will run it at 1–2 s interval × N panes). Target <5 ms wall.
+**Reload detection.** Subscribe via `refresh-client -B` to formats that
+mirror the user's bar config (e.g.
+`@ccstatus-baseline:#{status}|#{status-format[0]}|…`). When tmux emits a
+`%subscription-changed` notification *while we're in `Idle`*, treat the
+new values as the new baseline and update the snapshot. When we're
+`Active`, our own writes trigger subscriptions too; suppress those by
+comparing against pending-write tracking.
 
-1. Read `pane/<pane_id>.json`. Missing → exit 0 with empty output.
-2. **Liveness:** `kill -0 claude_pid`. Failure → empty output, optionally
-   `unlink` the stale pane file. Success → continue.
-3. **Pid-reuse guard:** `ps -p <pid> -o comm=`; if it doesn't match
-   `claude` (or `claude` is not the last path segment), treat as dead. Same
-   handling.
-4. **Suspended state:** `ps -o state=` returning `T`/`Tsl` means the process
-   is stopped. We still render — `idle = now - last_turn_ts` keeps ticking,
-   which is the honest answer to "what will happen if I resume and submit".
-5. Read `session/<session_id>.json`. Compute:
-   - `idle = now - last_turn_ts`
-   - `warmth` band: `warm` if `idle < 270 s`, else `cold` (single threshold
-     for now, single config knob later).
-6. Format for flavor:
-   - `row`: full one-liner, can reuse format helpers from `format.rs` and
-     `color.rs`. Coloured `warm`/`cold` plus `idle` (mm:ss).
-   - `border`: shorter, single-cell-friendly variant.
-   - `title`: plain text, no ANSI. After printing to stdout, also exec
-     `tmux select-pane -t <pane_id> -T "<title>"` so the user's `set-titles`
-     config can propagate it into the window title.
-7. Optionally update `pane.last_warmth` if it changed (atomic write). This
-   gives a future notifier something to diff against.
+**Shutdown.** Triggered by: no Claude sessions remaining for >N seconds,
+SIGTERM/SIGINT, or tmux server exit. Steps: restore snapshot, write a
+"clean shutdown" marker, exit.
+
+**Crash recovery.** On startup, if a stale lockfile/snapshot exists from
+a previous daemon that didn't clean shut down: still restore from the
+snapshot (the user's pre-ccstatus state), then continue.
 
 ## Hook mode (`--hook`)
 
-`Stop` is load-bearing; everything else is icing.
-
-`--hook stop`:
-1. Read stdin JSON. Pull `session_id` and `transcript_path` (verify keys on
-   real payload).
-2. Update `session/<session_id>.json`: set `last_turn_ts = now`, refresh
-   `model` and `turn_count` if present.
-3. Exit 0 immediately. Never block.
-
-`--hook post-tool-use` (Phase 2): bump `turn_count`, increment cost if
-hook provides it.
-
-Hooks should *never* fail loudly. If state directory is unwritable, log to
-stderr (Claude swallows it in the transcript) and exit 0.
-
-## tmux configuration (in dotfiles, separate commit)
-
-```tmux
-set -g status 2
-set -g status-interval 2
-set -g status-format[1] '#(ccstatus --render-tmux row #{pane_id})'
-
-# pane border surface (optional)
-set -g pane-border-status bottom
-set -g pane-border-format '#(ccstatus --render-tmux border #{pane_id})'
-
-# pane title → window title (optional)
-set -g set-titles on
-set -g set-titles-string '#{pane_title}'
-# pane title is set by the renderer via `tmux select-pane -T` on each tick.
-```
-
-Note: `#{pane_id}` is substituted before tmux's shell-substitution cache,
-so each pane gets its own cache entry. Focused-pane switching just works.
+Unchanged. `--hook stop` reads JSON on stdin, updates session state. Will
+also send a tiny notification to the daemon socket if present, so warmth
+flips visually within a tick rather than waiting for the next focus event.
 
 ## Liveness / lifecycle table
 
@@ -263,76 +240,56 @@ so each pane gets its own cache entry. Focused-pane switching just works.
 
 ## Implementation order
 
-Each step is a separate commit per global preferences.
+Each milestone is a separate commit (or small commit-set) per the
+global preference.
 
-1. **`state.rs` module:** define `PaneState`, `SessionState`, IO helpers
-   on top of `cache::write_atomic` + a `read_json`. No behaviour change yet.
-2. **Registrar branch in `main.rs`:** when `$TMUX` set, write pane state
-   and print nothing; otherwise existing `render()` path. Add rate-limit
-   on writes.
-3. **`--hook stop` mode:** new subcommand, updates session state. Wire it
-   into `--install --with-hooks`.
-4. **`--render-tmux row` mode:** basic ANSI output (`warm`/`cold` + idle).
-   First user-visible win.
-5. **Liveness check (`kill -0` + `ps -o comm=`):** robustness.
-6. **`--render-tmux border` and `--render-tmux title`:** add the other
-   surfaces. `title` flavor also calls `tmux select-pane -T`.
-7. **`--hook post-tool-use`:** richer fields (turn count, cost if
-   available).
-8. **Settings install ergonomics:** confirm install behaviour adds/removes
-   hooks idempotently; tests for the JSON merging.
-9. **Stretch / deferred:** iTerm badge / user var via OSC 1337 (needs
-   `allow-passthrough on`); macOS notification on warm→cold edge; daemon
-   for surfaces without a tick.
-
-## Decisions to make before coding
-
-- **`session_id` location in stdin JSON.** Check real payloads from
-  current Claude Code; the registrar relies on this and a fallback strategy
-  (e.g. derive from transcript_path) may be needed.
-- **Where to store pane/session state.** Reusing `/tmp/ccstatus-&lt;uid&gt;` (current
-  `cache_dir`) is the obvious answer; if there's any chance of multiple
-  Claude processes on multi-user machines, namespace by `$UID`. For a
-  single-user laptop, this doesn't matter.
-- **Threshold for warm/cold.** Default 270 s (under documented 5 min TTL
-  with margin). Plumb as `STATUSLINE_CACHE_WARMTH_SECS` env var and a CLI
-  flag.
-- **Cost source.** `cost_so_far_usd` is wishful unless a hook payload
-  provides it. Confirm what `Stop` and `PostToolUse` actually deliver
-  before committing to the field.
-- **Existing `cache::cache_dir()` returns `/tmp/ccstatus-&lt;uid&gt;`.** State files
-  share that root. Fine, but worth a docstring on each new file path.
+1. **Skeleton control-mode connection.** New `src/control.rs` with a
+   `Connection` type that spawns `tmux -C attach`, sends commands, and
+   parses `%begin/%end/%error` framing into responses. Plus
+   `%event-name` notifications into a stream. No business logic yet —
+   verify we can round-trip a `display-message -p '#{pane_id}'`.
+2. **`--daemon` subcommand.** Owns the connection. On start: snapshot
+   user state (read all relevant options), persist, log. On shutdown
+   signal: restore + exit. Run for a few seconds in a `sleep` body and
+   verify snapshot/restore by hand.
+3. **Lock + socket.** Per-server lockfile, refuse to run concurrently.
+   Unix socket for registrar pings.
+4. **Registrar integration.** The default mode now: writes pane state
+   (as today), then ensures the daemon is running (spawns if not),
+   sends a `register <pane_id> <session_id>` line over the socket.
+5. **Focus tracking + row injection.** Daemon subscribes to focus
+   events; on focus into a registered pane, computes the row content
+   from state files and pushes `set-option status N`,
+   `set-option status-format[i] "..."`. On focus out, restores
+   snapshot.
+6. **Periodic refresh + warmth ticks.** Internal timer in the daemon
+   re-renders the active line's warmth indicator. No more
+   `status-interval` dependency for our content.
+7. **Reload detection via subscription.** Subscribe to a format that
+   mirrors the user's bar config; when it changes while we're `Idle`,
+   update the snapshot. Distinguish user changes from our own writes.
+8. **Cleanup of old code.** Drop `--render-tmux`, `--tmux-on-focus`,
+   the on-disk `lines` cache. Tighten `pane_state` to what the daemon
+   actually needs.
+9. **Crash recovery + auto-shutdown.** Stale-lock detection; restore on
+   recovery. Auto-shutdown when no Claude sessions for N seconds.
 
 ## Open risks
 
-- **Statusline call frequency.** Claude Code may invoke the statusline on
-  every streamed chunk; the registrar must not write storm. Mitigation:
-  500 ms write coalescing.
-- **`ps` portability.** macOS and Linux both have `ps -p <pid> -o comm=`
-  but the output format differs slightly (trailing whitespace, full path).
-  Trim aggressively; match by suffix not exact string.
-- **Pane id stability across tmux server restart.** Pane ids reset; stale
-  state files in `pane/` survive and fail the liveness check on next
-  read. Acceptable.
-- **iTerm passthrough complexity (Phase 3).** Defer until needed; the
-  pane-title route gives us most of the title-surface value without it.
-
-## File-level plan summary
-
-New files:
-
-- `src/state.rs` — PaneState/SessionState structs + IO
-- `src/tmux.rs` — tmux helpers (`display -p`, `select-pane -T`, env reads)
-- `src/hooks.rs` — `--hook stop`, `--hook post-tool-use` handlers
-- `src/render_tmux.rs` — `--render-tmux row|border|title` handlers
-
-Touched:
-
-- `src/main.rs` — dispatch new modes before falling through to `render()`
-- `src/cli.rs` — new flags (`--render-tmux`, `--hook`, `--with-hooks`)
-- `src/install.rs` — optional hook-block insertion in settings.json
-
-Untouched (by design):
-
-- `src/heatmap.rs`, `src/git.rs`, `src/api.rs`, `src/oauth.rs`,
-  `src/format.rs`, `src/color.rs`, `src/term.rs`, `src/cache.rs`
+- **Control mode error handling.** Tmux errors come as `%error` with a
+  client-side timestamp/command-num. Need to correlate to in-flight
+  commands and surface them. Don't crash on parse failure of unknown
+  notifications — tmux adds new ones across versions.
+- **Restore correctness.** Restoring N options must be byte-identical,
+  including unsetting indices we set that the user hadn't set. Use
+  `set -gu` for indices that were unset in the snapshot.
+- **User reloads during `Active`.** If the user runs `source-file` while
+  we have rows injected, the daemon's writes and the user's writes
+  race. Defer: handle by snapshotting only in `Idle`; reloads while
+  `Active` are tolerated but may temporarily look wrong.
+- **Multiple clients on one server.** `status` is server-global. If
+  client A is focused on a Claude pane and client B on a shell, the bar
+  shows Claude rows for both. Accept the limitation; document it.
+- **Daemon process model.** Long-lived process started by a Claude
+  subprocess: needs to detach properly (fork + setsid) so its lifetime
+  isn't bound to the Claude session that spawned it.
