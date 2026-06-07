@@ -107,16 +107,27 @@ pub fn run() -> ExitCode {
         }
     };
 
+    // Create the log *before* anything that can fail with the daemon
+    // exiting silently (we redirect stderr to /dev/null when
+    // auto-spawning from the registrar). A "started" line guarantees we
+    // can always tell, after the fact, whether the process at least
+    // reached this point.
+    let log = DaemonLog::for_server(&server_id);
+    log.write("daemon process started");
+
     let mut conn = match Connection::attach() {
         Ok(c) => c,
         Err(e) => {
+            log.write(&format!("attach failed: {e}"));
             eprintln!("ccstatus daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
+    log.write("control-mode connection attached");
     let snap = match Snapshot::capture(&mut conn) {
         Ok(s) => s,
         Err(e) => {
+            log.write(&format!("snapshot failed: {e}"));
             eprintln!("ccstatus daemon: snapshot: {e}");
             return ExitCode::FAILURE;
         }
@@ -148,7 +159,6 @@ pub fn run() -> ExitCode {
     spawn_tmux_reader(events, tx.clone());
     spawn_socket_reader(socket, tx);
 
-    let log = DaemonLog::for_server(&server_id);
     log.write(&format!(
         "startup: snapshot status={} pos={} initial_focus={:?}",
         &snap.status, &snap.status_position, initial_focus

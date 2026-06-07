@@ -150,12 +150,15 @@ fn sanitize(s: &str) -> String {
 }
 
 fn read_option(conn: &mut Connection, name: &str) -> Result<Option<String>, String> {
-    // `show-options -gv` prints the value (empty if unset). We treat
-    // empty as "unset" for the options we care about — none of the bar
-    // settings are legitimately empty strings.
+    // `show-options -gv` prints the value (empty if unset for built-in
+    // options) but returns `%error invalid option: <name>` for user
+    // options that have never been set. Treat both empty *and* error
+    // as "unset" — the caller doesn't care about the distinction and
+    // crashing the daemon at snapshot time over a missing user-defined
+    // option is worse than the loss of fidelity.
     let r = conn.cmd(&format!("show-options -gv {name}"))?;
     if !r.ok {
-        return Err(format!("show-options -gv {name} failed: {}", r.output));
+        return Ok(None);
     }
     let v = r.output.trim().to_string();
     Ok(if v.is_empty() { None } else { Some(v) })
