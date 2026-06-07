@@ -34,6 +34,7 @@ use cli::{Config, ParseOutcome};
 use color::*;
 use format::{format_tokens, push_fmt, shorten_model_name};
 use state::PaneState;
+use tmux::Tmux;
 use util::{now_unix, resolve_session_id};
 
 const SELF_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,7 +44,11 @@ fn main() -> ExitCode {
         ParseOutcome::Run(c) => c,
         ParseOutcome::Hook(kind) => return hooks::run(kind),
         ParseOutcome::Handler(session) => return daemon::run(session),
-        ParseOutcome::TmuxReset => return tmux_reset(),
+        ParseOutcome::TmuxReset => {
+            tmux::reset(&tmux::CliTmux);
+            println!("ccstatus: bar reset to defaults");
+            return ExitCode::SUCCESS;
+        }
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -98,7 +103,7 @@ fn main() -> ExitCode {
     if let Some(pane_id) = &pane_id
         && routing.any_tmux()
         && register_pane(&input, pane_id, &elements).is_some()
-        && let Some(tmux_session) = tmux_session_of(pane_id)
+        && let Some(tmux_session) = tmux::CliTmux.session_of(pane_id)
     {
         let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
         ipc::notify_register(&server_id, &tmux_session, pane_id);
@@ -117,47 +122,6 @@ fn main() -> ExitCode {
 /// Returns `Some(pane_id)` if Claude Code was launched inside tmux. Both
 /// `$TMUX` and `$TMUX_PANE` must be set; either one missing means we render
 /// for stdout as usual.
-/// Manual cleanup for when a daemon left ccstatus content in the tmux
-/// status options and there's no live daemon to restore it. Unsets
-/// every status-format slot, clears the @ccstatus-active sentinel, and
-/// puts status back to `on`. Use after a daemon crash or when ccstatus
-/// is being uninstalled.
-fn tmux_reset() -> ExitCode {
-    // status-format[0] must be written back to tmux's built-in default
-    // template explicitly. `set -gu` does NOT restore it once the slot
-    // has been touched (macOS tmux leaves it empty -> black bar), so
-    // unsetting here is exactly what left the bar broken.
-    let _ = Command::new("tmux")
-        .args([
-            "set-option",
-            "-g",
-            "status-format[0]",
-            tmux::DEFAULT_STATUS_FORMAT_0,
-        ])
-        .status();
-    // Higher slots have no built-in default and only render as extra
-    // rows when status >= 2; unsetting them is correct.
-    let unsets = [
-        "@ccstatus-active",
-        "status-format[1]",
-        "status-format[2]",
-        "status-format[3]",
-        "status-format[4]",
-        "status-format[5]",
-    ];
-    for name in unsets {
-        let _ = Command::new("tmux")
-            .args(["set-option", "-gu", name])
-            .status();
-    }
-    let _ = Command::new("tmux")
-        .args(["set-option", "-g", "status", "on"])
-        .status();
-    let _ = Command::new("tmux").arg("refresh-client").status();
-    println!("ccstatus: bar reset to defaults");
-    ExitCode::SUCCESS
-}
-
 fn active_tmux_pane() -> Option<String> {
     env::var("TMUX").ok().filter(|s| !s.is_empty())?;
     env::var("TMUX_PANE").ok().filter(|s| !s.is_empty())
@@ -176,7 +140,7 @@ fn register_pane(
     let session_id = resolve_session_id(input)?;
     let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
     let claude_pid = resolve_claude_pid();
-    let pane_tty = query_pane_tty(pane_id);
+    let pane_tty = tmux::CliTmux.pane_tty(pane_id).unwrap_or_default();
     let transcript_path = input
         .get("transcript_path")
         .and_then(|v| v.as_str())
@@ -250,32 +214,6 @@ fn ps_field(pid: u32, field: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// The tmux session id (e.g. `$1`) that contains the given pane, used to
-/// address its per-session handler.
-fn tmux_session_of(pane_id: &str) -> Option<String> {
-    let out = Command::new("tmux")
-        .args(["display", "-t", pane_id, "-p", "#{session_id}"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
-
-fn query_pane_tty(pane_id: &str) -> String {
-    let out = Command::new("tmux")
-        .args(["display", "-t", pane_id, "-p", "#{pane_tty}"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => String::new(),
-    }
 }
 
 fn pane_recent(server_id: &str, pane_id: &str, window: Duration) -> bool {

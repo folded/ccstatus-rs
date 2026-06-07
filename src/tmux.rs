@@ -1,8 +1,166 @@
-//! Helpers for inspecting the tmux environment.
+//! Helpers for inspecting the tmux environment, and the one-shot tmux
+//! command seam (`Tmux`).
 
 use std::env;
+use std::process::Command;
 
 use sha2::{Digest, Sha256};
+
+/// One-shot tmux commands (each forks a `tmux` process). The persistent
+/// control connection (`control.rs`) is a SEPARATE seam: it carries focus
+/// events and `refresh-client -S`, and must never fork or send a size.
+pub trait Tmux {
+    // Queries
+    /// `display-message -t S -p '#{pane_id}'` — the session's focused pane.
+    fn focused_pane(&self, session: &str) -> Option<String>;
+    /// `display -t P -p '#{session_id}'` — the session containing a pane.
+    fn session_of(&self, pane: &str) -> Option<String>;
+    /// `display -t P -p '#{pane_tty}'` — a pane's controlling tty.
+    fn pane_tty(&self, pane: &str) -> Option<String>;
+
+    // Session-local overrides (the handler's writes)
+    /// `set-option -t S name value`.
+    fn set_session(&self, session: &str, name: &str, value: &str);
+    /// `set-option -u -t S name`.
+    fn unset_session(&self, session: &str, name: &str);
+
+    // Global options (only --tmux-reset touches these)
+    /// `show-options -gv name` (trimmed). The user's global value, never the
+    /// session-effective one, so our overrides can't feed back into a later
+    /// compose.
+    fn global(&self, name: &str) -> String;
+    /// `set-option -g name value`.
+    fn set_global(&self, name: &str, value: &str);
+    /// `set-option -gu name`.
+    fn unset_global(&self, name: &str);
+
+    /// Repaint all clients. One-shot fork — used by `--tmux-reset` ONLY. The
+    /// handler refreshes over its control connection (`Writer`), not here.
+    fn refresh(&self);
+}
+
+/// Production adapter: each method builds args and spawns `tmux`.
+pub struct CliTmux;
+
+impl CliTmux {
+    fn display(&self, target: &str, fmt: &str) -> Option<String> {
+        let out = Command::new("tmux")
+            .args(["display-message", "-t", target, "-p", fmt])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+}
+
+impl Tmux for CliTmux {
+    fn focused_pane(&self, session: &str) -> Option<String> {
+        self.display(session, "#{pane_id}")
+    }
+
+    fn session_of(&self, pane: &str) -> Option<String> {
+        self.display(pane, "#{session_id}")
+    }
+
+    fn pane_tty(&self, pane: &str) -> Option<String> {
+        self.display(pane, "#{pane_tty}")
+    }
+
+    fn set_session(&self, session: &str, name: &str, value: &str) {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", session, name, value])
+            .status();
+    }
+
+    fn unset_session(&self, session: &str, name: &str) {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-u", "-t", session, name])
+            .status();
+    }
+
+    fn global(&self, name: &str) -> String {
+        let out = Command::new("tmux").args(["show-options", "-gv", name]).output();
+        match out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn set_global(&self, name: &str, value: &str) {
+        let _ = Command::new("tmux").args(["set-option", "-g", name, value]).status();
+    }
+
+    fn unset_global(&self, name: &str) {
+        let _ = Command::new("tmux").args(["set-option", "-gu", name]).status();
+    }
+
+    fn refresh(&self) {
+        let _ = Command::new("tmux").arg("refresh-client").status();
+    }
+}
+
+/// The session-local bar options the handler overrides (and `restore_session`
+/// reverts).
+pub const SESSION_BAR_OPTS: [&str; 4] = ["status-format", "status", "status-left", "status-right"];
+
+/// Drop every bar override for a session, reverting it to inheriting the
+/// user's global config.
+pub fn restore_session(t: &dyn Tmux, session: &str) {
+    for opt in SESSION_BAR_OPTS {
+        t.unset_session(session, opt);
+    }
+}
+
+/// tmux's `status` is a choice option (`off`/`on`/`2`..`5`); `"1"` is
+/// rejected, so a single row must be spelled `on`.
+pub fn status_value(rows: usize) -> String {
+    match rows {
+        0 => "off".to_string(),
+        1 => "on".to_string(),
+        n => n.to_string(),
+    }
+}
+
+/// The effective global `status-format[0]` (the powerline window list),
+/// falling back to tmux's built-in default template when empty.
+pub fn powerline_row(t: &dyn Tmux) -> String {
+    let value = t.global("status-format[0]");
+    if value.is_empty() {
+        DEFAULT_STATUS_FORMAT_0.to_string()
+    } else {
+        value
+    }
+}
+
+/// Restore the global bar to tmux defaults. Manual cleanup for when a handler
+/// left ccstatus content in the tmux status options and there's no live
+/// handler to restore it. Use after a crash or when ccstatus is uninstalled.
+pub fn reset(t: &dyn Tmux) {
+    // status-format[0] must be written back to tmux's built-in default
+    // template explicitly. `set -gu` does NOT restore it once the slot has
+    // been touched (macOS tmux leaves it empty -> black bar), so unsetting
+    // here is exactly what left the bar broken.
+    t.set_global("status-format[0]", DEFAULT_STATUS_FORMAT_0);
+    // Higher slots have no built-in default and only render as extra rows
+    // when status >= 2; unsetting them is correct.
+    for name in [
+        "@ccstatus-active",
+        "status-format[1]",
+        "status-format[2]",
+        "status-format[3]",
+        "status-format[4]",
+        "status-format[5]",
+    ] {
+        t.unset_global(name);
+    }
+    t.set_global("status", "on");
+    t.refresh();
+}
 
 /// tmux's built-in default value for `status-format[0]` — the powerline
 /// window list (status-left + `#{W:…}` window loop + status-right).
@@ -40,9 +198,118 @@ fn short_hash(s: &str) -> String {
     )
 }
 
+/// A recorded mutation, for asserting the ordered write log in tests.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Write {
+    SetSession(String, String, String),
+    UnsetSession(String, String),
+    SetGlobal(String, String),
+    UnsetGlobal(String),
+    Refresh,
+}
+
+/// Test adapter: records writes, serves canned reads.
+#[cfg(test)]
+pub struct FakeTmux {
+    pub focused: std::cell::RefCell<std::collections::HashMap<String, String>>, // session -> pane
+    pub globals: std::cell::RefCell<std::collections::HashMap<String, String>>, // name -> value
+    pub writes: std::cell::RefCell<Vec<Write>>, // ordered log of mutations
+}
+
+#[cfg(test)]
+impl FakeTmux {
+    pub fn new() -> Self {
+        Self {
+            focused: std::cell::RefCell::new(std::collections::HashMap::new()),
+            globals: std::cell::RefCell::new(std::collections::HashMap::new()),
+            writes: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Tmux for FakeTmux {
+    fn focused_pane(&self, session: &str) -> Option<String> {
+        self.focused.borrow().get(session).cloned()
+    }
+
+    fn session_of(&self, _pane: &str) -> Option<String> {
+        None
+    }
+
+    fn pane_tty(&self, _pane: &str) -> Option<String> {
+        None
+    }
+
+    fn set_session(&self, session: &str, name: &str, value: &str) {
+        self.writes.borrow_mut().push(Write::SetSession(
+            session.to_string(),
+            name.to_string(),
+            value.to_string(),
+        ));
+    }
+
+    fn unset_session(&self, session: &str, name: &str) {
+        self.writes
+            .borrow_mut()
+            .push(Write::UnsetSession(session.to_string(), name.to_string()));
+    }
+
+    fn global(&self, name: &str) -> String {
+        self.globals.borrow().get(name).cloned().unwrap_or_default()
+    }
+
+    fn set_global(&self, name: &str, value: &str) {
+        self.writes
+            .borrow_mut()
+            .push(Write::SetGlobal(name.to_string(), value.to_string()));
+    }
+
+    fn unset_global(&self, name: &str) {
+        self.writes.borrow_mut().push(Write::UnsetGlobal(name.to_string()));
+    }
+
+    fn refresh(&self) {
+        self.writes.borrow_mut().push(Write::Refresh);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_session_emits_four_unsets() {
+        let t = FakeTmux::new();
+        restore_session(&t, "$1");
+        assert_eq!(
+            *t.writes.borrow(),
+            vec![
+                Write::UnsetSession("$1".into(), "status-format".into()),
+                Write::UnsetSession("$1".into(), "status".into()),
+                Write::UnsetSession("$1".into(), "status-left".into()),
+                Write::UnsetSession("$1".into(), "status-right".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_value_spells_single_row_as_on() {
+        assert_eq!(status_value(0), "off");
+        assert_eq!(status_value(1), "on");
+        assert_eq!(status_value(3), "3");
+    }
+
+    #[test]
+    fn powerline_row_falls_back_to_default() {
+        let t = FakeTmux::new();
+        assert_eq!(powerline_row(&t), DEFAULT_STATUS_FORMAT_0);
+        t.globals
+            .borrow_mut()
+            .insert("status-format[0]".into(), "custom".into());
+        assert_eq!(powerline_row(&t), "custom");
+    }
 
     #[test]
     fn short_hash_is_stable_and_8_chars() {

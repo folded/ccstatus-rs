@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ use crate::control::{self, Connection, EventStream, Writer};
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
 use crate::state;
-use crate::tmux;
+use crate::tmux::{self, Tmux};
 
 /// Grace after the last Claude pane goes before the handler exits. The bar
 /// is already restored by then; this only governs respawn cost.
@@ -94,7 +94,7 @@ pub fn run(session: String) -> ExitCode {
     // Crash recovery: a predecessor handler may have died mid-active,
     // leaving this session's bar overridden. Clear it before we start; the
     // reconcile below re-applies the correct state.
-    restore_session(&session);
+    tmux::restore_session(&tmux::CliTmux, &session);
 
     let mut conn = match Connection::attach(&session) {
         Ok(c) => c,
@@ -131,6 +131,7 @@ pub fn run(session: String) -> ExitCode {
         active: false,
         last_warmth: None,
         last_activity: Instant::now(),
+        tmux: Box::new(tmux::CliTmux),
         writer,
         log,
     };
@@ -154,6 +155,9 @@ struct Handler {
     active: bool,
     last_warmth: Option<&'static str>,
     last_activity: Instant,
+    /// One-shot tmux command seam (option get/set/unset, focus query). The
+    /// control connection (`writer`) is a separate seam for `refresh-client`.
+    tmux: Box<dyn Tmux>,
     /// The control connection's write half: used to send `refresh-client`
     /// and to keep the connection (and thus the event stream) alive —
     /// dropping it detaches the control client.
@@ -192,7 +196,7 @@ impl Handler {
             }
         }
         // Graceful exit (session still alive): revert our overrides.
-        restore_session(&self.session);
+        tmux::restore_session(self.tmux.as_ref(), &self.session);
         self.refresh();
     }
 
@@ -218,17 +222,11 @@ impl Handler {
     /// Re-query the session's focused pane (active pane of the active
     /// window). Cheap one-shot; triggered by focus events and the timer.
     fn requery_focus(&mut self) {
-        let out = Command::new("tmux")
-            .args(["display-message", "-t", &self.session, "-p", "#{pane_id}"])
-            .output();
-        if let Ok(o) = out
-            && o.status.success()
+        if let Some(p) = self.tmux.focused_pane(&self.session)
+            && Some(p.as_str()) != self.focused_pane.as_deref()
         {
-            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !p.is_empty() && Some(p.as_str()) != self.focused_pane.as_deref() {
-                self.log.write(&format!("focus -> {p}"));
-                self.focused_pane = Some(p);
-            }
+            self.log.write(&format!("focus -> {p}"));
+            self.focused_pane = Some(p);
         }
     }
 
@@ -294,7 +292,7 @@ impl Handler {
             }
             (true, false) => {
                 self.log.write("deactivate (focus left Claude)");
-                restore_session(&self.session);
+                tmux::restore_session(self.tmux.as_ref(), &self.session);
                 self.active = false;
                 self.last_warmth = None;
                 self.refresh();
@@ -346,12 +344,16 @@ impl Handler {
                 .filter(|s| !s.is_empty())
                 .collect();
             let joined = render_tmux::join_segments(parts.iter().map(String::as_str));
-            let tmux = render_tmux::ansi_to_tmux(&joined);
-            set_session(&self.session, &format!("status-format[{idx}]"), &tmux);
+            let row = render_tmux::ansi_to_tmux(&joined);
+            self.tmux.set_session(&self.session, &format!("status-format[{idx}]"), &row);
             idx += 1;
         }
-        set_session(&self.session, &format!("status-format[{idx}]"), &global_powerline_row());
-        set_session(&self.session, "status", &status_value(idx + 1));
+        self.tmux.set_session(
+            &self.session,
+            &format!("status-format[{idx}]"),
+            &tmux::powerline_row(self.tmux.as_ref()),
+        );
+        self.tmux.set_session(&self.session, "status", &tmux::status_value(idx + 1));
 
         self.write_powerline_side(Dest::Left, "status-left", &content);
         self.write_powerline_side(Dest::Right, "status-right", &content);
@@ -373,77 +375,23 @@ impl Handler {
         if parts.is_empty() {
             // Revert to inheriting the global (handles a hot-reload that
             // removed the elements; no-op on a fresh activate).
-            let _ = Command::new("tmux")
-                .args(["set-option", "-u", "-t", &self.session, option])
-                .status();
+            self.tmux.unset_session(&self.session, option);
             return;
         }
         let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(
             parts.iter().map(String::as_str),
         ));
-        let user = global_option(option);
+        let user = self.tmux.global(option);
         let combined = match (user.is_empty(), dest) {
             (true, _) => mine,
             (false, Dest::Left) => format!("{mine} {user}"),
             (false, _) => format!("{user} {mine}"),
         };
-        set_session(&self.session, option, &combined);
+        self.tmux.set_session(&self.session, option, &combined);
     }
 
     fn should_exit(&self) -> bool {
         self.panes.is_empty() && !self.active && self.last_activity.elapsed() > IDLE_EXIT_AFTER
-    }
-}
-
-/// `set-option -t <session> <name> <value>` (session-local override).
-fn set_session(session: &str, name: &str, value: &str) {
-    let _ = Command::new("tmux")
-        .args(["set-option", "-t", session, name, value])
-        .status();
-}
-
-/// Drop all bar overrides for a session, reverting it to inheriting the
-/// user's global config.
-fn restore_session(session: &str) {
-    for opt in ["status-format", "status", "status-left", "status-right"] {
-        let _ = Command::new("tmux")
-            .args(["set-option", "-u", "-t", session, opt])
-            .status();
-    }
-}
-
-/// Read a global (user) option value — never the session-effective one, so
-/// our own session-local overrides can't feed back into a later compose.
-fn global_option(name: &str) -> String {
-    let out = Command::new("tmux")
-        .args(["show-options", "-gv", name])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
-        }
-        _ => String::new(),
-    }
-}
-
-/// The effective global `status-format[0]` (the powerline window list),
-/// falling back to tmux's built-in default template when empty.
-fn global_powerline_row() -> String {
-    let value = global_option("status-format[0]");
-    if value.is_empty() {
-        tmux::DEFAULT_STATUS_FORMAT_0.to_string()
-    } else {
-        value
-    }
-}
-
-/// tmux's `status` is a choice option (`off`/`on`/`2`..`5`); `"1"` is
-/// rejected, so a single row must be spelled `on`.
-fn status_value(rows: usize) -> String {
-    match rows {
-        0 => "off".to_string(),
-        1 => "on".to_string(),
-        n => n.to_string(),
     }
 }
 
