@@ -28,7 +28,9 @@
 //! ```
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
@@ -111,6 +113,8 @@ pub fn run() -> ExitCode {
     spawn_tmux_reader(events, tx.clone());
     spawn_socket_reader(socket, tx);
 
+    let log = DaemonLog::for_server(&server_id);
+    log.write(&format!("startup: snapshot status={} pos={}", &snap.status, &snap.status_position));
     let mut daemon = Daemon {
         server_id: server_id.clone(),
         writer,
@@ -119,6 +123,7 @@ pub fn run() -> ExitCode {
         focused_pane: None,
         state: BarState::Idle,
         last_activity: Instant::now(),
+        log,
     };
     daemon.main_loop(rx);
 
@@ -135,6 +140,34 @@ struct Daemon {
     focused_pane: Option<String>,
     state: BarState,
     last_activity: Instant,
+    log: DaemonLog,
+}
+
+struct DaemonLog {
+    path: PathBuf,
+}
+
+impl DaemonLog {
+    fn for_server(server_id: &str) -> Self {
+        let path = crate::cache::cache_dir()
+            .join("server")
+            .join(server_id)
+            .join("daemon.log");
+        Self { path }
+    }
+
+    fn write(&self, msg: &str) {
+        // Best-effort append. If logging fails, drop silently — diagnostics
+        // shouldn't be the reason the daemon halts.
+        let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) else {
+            return;
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{ts} {msg}");
+    }
 }
 
 impl Daemon {
@@ -157,12 +190,14 @@ impl Daemon {
 
     fn handle_tmux(&mut self, ev: control::Event) {
         if let control::Event::Notification { name, args } = ev {
+            self.log.write(&format!("tmux event: %{name} {args}"));
             match name.as_str() {
                 // `%window-pane-changed @<window> %<pane>` — args is two
                 // tokens. The second is the now-active pane.
                 "window-pane-changed" => {
                     if let Some(p) = args.split_whitespace().nth(1) {
                         if Some(p) != self.focused_pane.as_deref() {
+                            self.log.write(&format!("focus -> {p}"));
                             self.focused_pane = Some(p.to_string());
                         }
                     }
@@ -178,6 +213,7 @@ impl Daemon {
     }
 
     fn handle_registrar(&mut self, line: String) {
+        self.log.write(&format!("registrar: {line}"));
         let mut parts = line.split_whitespace();
         let kind = parts.next().unwrap_or("");
         match kind {
@@ -207,19 +243,23 @@ impl Daemon {
             .cloned();
         match (&self.state, target) {
             (BarState::Idle, Some(pane)) => {
+                self.log.write(&format!("reconcile: Idle -> Active({pane})"));
                 self.activate(&pane);
                 self.state = BarState::Active(pane);
             }
             (BarState::Active(_), None) => {
+                self.log.write(&format!(
+                    "reconcile: Active -> Idle (focused={:?}, panes={:?})",
+                    self.focused_pane, self.panes.keys().collect::<Vec<_>>()
+                ));
                 self.deactivate();
                 self.state = BarState::Idle;
             }
             (BarState::Active(active), Some(pane)) if active != &pane => {
+                self.log.write(&format!("reconcile: Active({active}) -> Active({pane})"));
                 self.activate(&pane);
                 self.state = BarState::Active(pane);
             }
-            // Active(p) with target Some(p) → still active; re-render so
-            // the warmth indicator updates between events.
             (BarState::Active(active), Some(pane)) if active == &pane => {
                 self.refresh_rows(&pane);
             }
