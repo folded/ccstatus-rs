@@ -56,6 +56,9 @@ height on pane focus. This produced several defects:
   Each tick it:
   - enumerates panes + their tmux sessions in one `tmux list-panes -a -F …`
     call (also detects closed panes);
+  - prunes registered panes whose tmux pane is gone **or whose `claude_pid`
+    has exited** — so the bar collapses when the user quits Claude even if
+    the shell pane stays open ("last Claude exited", not "pane closed");
   - reconciles each session's bar against whether it currently holds a
     registered Claude pane;
   - rewrites live elements (warmth) for sessions that have one.
@@ -72,8 +75,10 @@ height on pane focus. This produced several defects:
   rendered lines/elements routed to a dedicated tmux row) + 1 for the
   powerline row.
 - **Lifecycle.** Spawn on first registrar ping. Exit when the server is gone
-  (socket/`list-sessions` fails) or no Claude panes remain after a grace
-  period. No control-mode EOF dependency.
+  (`list-panes` fails) or no Claude panes remain after a short grace (5s).
+  Bar deactivation is decoupled from process exit — a session's bar collapses
+  the moment its last Claude pane goes, regardless of when the daemon exits —
+  so the grace only governs respawn cost, not bar correctness.
 
 ## Routing
 

@@ -47,9 +47,13 @@ use crate::server_dir::ServerDir;
 use crate::state;
 use crate::tmux;
 
-/// Idle time after which a daemon with no Claude panes left exits. The
-/// registrar respawns it cheaply the next time a Claude pane renders.
-const IDLE_EXIT_AFTER: Duration = Duration::from_secs(60);
+/// Grace period after the last Claude pane goes before the daemon exits.
+/// The bar is already restored at that point (deactivation is decoupled
+/// from process exit), so this only governs respawn cost: short enough that
+/// cleanup is prompt and frequently exercised, long enough to absorb a
+/// quick session restart without churning the process. The registrar
+/// respawns the daemon the next time a Claude pane renders.
+const IDLE_EXIT_AFTER: Duration = Duration::from_secs(5);
 
 /// Maximum time the main loop blocks when nothing is happening. Registrar
 /// pings wake it immediately; this bounds how quickly we notice a closed
@@ -195,16 +199,34 @@ impl Daemon {
             return Reconcile::ServerGone;
         };
 
-        // Drop registrations whose pane no longer exists.
+        // Drop registrations whose tmux pane no longer exists OR whose
+        // Claude process has exited. The latter is what makes the bar
+        // collapse when the user quits Claude but leaves the shell pane
+        // open — "last Claude exited", not "pane closed".
         let live_pane_ids: HashSet<&str> = live.iter().map(|(p, _)| p.as_str()).collect();
+        let server_id = self.server_id.clone();
+        let keep: HashSet<String> = self
+            .panes
+            .keys()
+            .filter(|pane| live_pane_ids.contains(pane.as_str()))
+            .filter(|pane| {
+                state::read_pane(&server_id, pane)
+                    .map(|p| pid_alive(p.claude_pid))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
         let before = self.panes.len();
-        self.panes.retain(|pane, _| live_pane_ids.contains(pane.as_str()));
+        self.panes.retain(|pane, _| keep.contains(pane));
         if self.panes.len() != before {
             self.log.write(&format!(
-                "pruned {} closed pane(s); {} remain",
+                "pruned {} pane(s) (closed or Claude exited); {} remain",
                 before - self.panes.len(),
                 self.panes.len()
             ));
+            // Reset the idle clock so the exit grace runs from when the
+            // last pane actually went, not the last registrar ping.
+            self.last_activity = Instant::now();
         }
 
         // pane_id -> tmux session for live panes.
@@ -340,6 +362,20 @@ impl Daemon {
 enum Reconcile {
     Ok,
     ServerGone,
+}
+
+/// Whether a process is still alive. `kill(pid, 0)` sends no signal but
+/// performs the permission/existence checks: `0` means it exists; `EPERM`
+/// means it exists but we can't signal it (still alive); `ESRCH` means
+/// gone.
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// tmux's `status` is a choice option (`off`/`on`/`2`..`5`); `"1"` is
