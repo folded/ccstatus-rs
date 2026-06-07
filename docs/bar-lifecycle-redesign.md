@@ -1,0 +1,127 @@
+# ccstatus bar lifecycle redesign
+
+## Problem
+
+The daemon drives the tmux status bar by writing **server-global** options
+(`set-option -g status`, `set-option -g status-format[*]`), toggling the bar
+height on pane focus. This produced several defects:
+
+1. **Black bar with no daemon running.** `set -gu status-format[0]` does *not*
+   restore tmux's built-in window-list template once the slot has been touched
+   — on macOS tmux it leaves the slot empty, which renders as a blank bar over
+   the user's `status-style` background. After the first activate/deactivate
+   cycle the user's powerline window list was gone for good, server-wide, even
+   with no daemon running. (Mitigated already by writing the default template
+   back explicitly, but the global write is the root cause.)
+
+2. **Pollution detection.** Because global options persist after a crash, the
+   daemon sniffs `@ccstatus-active` and `status-format[1..5]` on startup and
+   resets to defaults — a heuristic that clobbers a user's legitimate
+   `status=2` config.
+
+3. **Cross-session bleed.** `status` is a *session* option whose `-g` value is
+   the server-wide default. A Claude pane focused in session A grows the bar in
+   session B too, and focus tracking via `list-clients` picks an arbitrary
+   client in a multi-session/multi-client setup.
+
+4. **Reflow on focus.** Bar height is a session/client-display property.
+   Toggling it on pane focus resizes every pane in the displayed window and
+   fires SIGWINCH, so switching panes makes content jump.
+
+## Verified tmux facts
+
+- One **server** per socket; it owns all sessions/windows/panes. Commands from
+  any connection reach the whole server.
+- `status`, `status-format[*]`, `status-position`, `status-left`,
+  `status-right`, `status-style`, `window-status-*` are **session** options.
+  `set -g` writes the global default inherited by every session;
+  `set -t <session>` writes a session-local override; `set -u -t <session>`
+  drops the override back to inheriting the global. The global is never touched
+  by per-session overrides.
+- A control-mode client (`tmux -C attach`) always has a *current* session and
+  **dies when that session is killed**, even if other sessions remain
+  (`%session-changed` → `%exit`, no migration). There is no "global attach".
+- Changing `status` height changes the pane row budget for the displayed
+  window → SIGWINCH reflow.
+
+## Architecture
+
+**One polling daemon per tmux server.** No persistent control-mode attach.
+
+- The registrar (statusline render in a Claude pane) writes per-pane state and
+  pings the daemon over the per-server unix socket, spawning it if absent
+  (unchanged transport).
+- The daemon wakes on a timer (a few seconds; warmth/cache-expiry flips on a
+  time threshold, so sub-second resolution is unnecessary) and on socket pings.
+  Each tick it:
+  - enumerates panes + their tmux sessions in one `tmux list-panes -a -F …`
+    call (also detects closed panes);
+  - reconciles each session's bar against whether it currently holds a
+    registered Claude pane;
+  - rewrites live elements (warmth) for sessions that have one.
+- All bar mutations are **session-local** (`set -t <session> …`), composed with
+  the user's captured values, and removed with `set -u -t <session> …` on
+  teardown. **The global config is never written**, so:
+  - the black bar is structurally impossible (we never blank the global
+    `status-format[0]`);
+  - pollution detection is deleted — a crash leaves at most a session-local
+    override, cleared on next startup by unsetting our own overrides.
+- **Fixed height, keyed to Claude presence, not focus.** A session's bar grows
+  when it gains its *first* Claude pane and shrinks when it loses its *last*;
+  switching between panes within a session never reflows. Height = (number of
+  rendered lines/elements routed to a dedicated tmux row) + 1 for the
+  powerline row.
+- **Lifecycle.** Spawn on first registrar ping. Exit when the server is gone
+  (socket/`list-sessions` fails) or no Claude panes remain after a grace
+  period. No control-mode EOF dependency.
+
+## Routing
+
+Each rendered piece is independently routable to one of:
+
+- **`tmux-row-N`** — a dedicated status row (adds height);
+- **`powerline-left` / `powerline-right`** — injected into the existing
+  powerline row via per-session `status-left` / `status-right` overrides
+  (composed with the user's captured value); zero added height, still live;
+- **`claude`** — printed to stdout so Claude renders it in its own statusline
+  (updates only on Claude activity — *not* live; unsuitable for warmth);
+- **`off`**.
+
+Config is a single file read by both registrar and daemon, hot-reloaded on
+mtime change:
+
+```toml
+# ~/.config/ccstatus/config.toml
+[route]
+model        = "powerline-left"
+tokens       = "tmux-row-1"
+warmth       = "powerline-right"
+heatmap_main = "tmux-row-2"
+heatmap_sub  = "off"
+effort       = "claude"
+```
+
+**Constraint:** the live cache-expiry indicator only ticks on a
+daemon-controlled surface (`tmux-row-*` or `powerline-*`). Routed to `claude`
+it updates only when Claude re-renders.
+
+## Phases
+
+### Phase 1 — structural
+
+- Polling daemon (drop control mode; remove `control.rs` once unused).
+- Per-session session-local overrides; capture/restore `status`,
+  `status-position`, `status-format[*]` per session.
+- Fixed height keyed to Claude presence per session.
+- Delete pollution detection; crash recovery = unset our own session overrides
+  on startup.
+- Routing at line granularity (the 3 existing lines).
+
+### Phase 2 — element granularity
+
+- Decompose `render()` into addressable named segments (`model`, `cwd`,
+  `tokens`, `effort`, `limits`, `version`, `warmth`, `heatmap_main`,
+  `heatmap_sub`).
+- Element-level routing including `powerline-left/right` injection via
+  per-session `status-left`/`status-right` composition.
+- Config-file routing table + hot reload.
