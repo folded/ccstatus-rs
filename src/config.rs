@@ -649,4 +649,35 @@ mod tests {
         assert_eq!(parse_hex_rgb("1a1b26"), None);
         assert_eq!(parse_hex_rgb("#xxyyzz"), None);
     }
+
+    /// The bundled example config (== the documented migration of the old
+    /// flat layout). Pins the resolved destinations so the in-tmux bar keeps
+    /// the same status-format slots: heatmap_main on tmux line 1
+    /// (status-format[0]), tokens/limits on line 2 (status-format[1]), the
+    /// segments on the base-row edges (line 0).
+    #[test]
+    fn example_config_resolves_in_both_contexts() {
+        let v = cfg(include_str!("../examples/config.json"));
+
+        let t = Routing::from_value(Some(v.clone()), true);
+        let l = |line, align| Dest::Tmux { line, align };
+        let c = |line, align| Dest::Claude { line, align };
+        assert_eq!(t.dest(Element::Model), l(0, Align::Left)); // status-left
+        assert_eq!(t.dest(Element::Warmth), l(0, Align::Right)); // status-right
+        assert_eq!(t.dest(Element::HeatmapMain), l(1, Align::Left)); // -> slot 0
+        assert_eq!(t.dest(Element::Tokens), l(2, Align::Left)); // -> slot 1
+        assert_eq!(t.dest(Element::Limits), l(2, Align::Left));
+        assert_eq!(t.dest(Element::Cwd), c(0, Align::Left)); // claude statusline
+        assert_eq!(t.dest(Element::Version), c(0, Align::Right));
+        assert_eq!(t.dest(Element::HeatmapSub), Dest::Off); // unlisted
+        assert_eq!(t.dest(Element::Updates), Dest::Off);
+
+        let d = Routing::from_value(Some(v), false);
+        assert_eq!(d.dest(Element::Model), c(0, Align::Left));
+        assert_eq!(d.dest(Element::Version), c(0, Align::Right));
+        assert_eq!(d.dest(Element::Tokens), c(1, Align::Left));
+        assert_eq!(d.dest(Element::HeatmapMain), c(2, Align::Left));
+        assert_eq!(d.dest(Element::Warmth), Dest::Off); // not listed -> off
+        assert!(!d.any_tmux());
+    }
 }
