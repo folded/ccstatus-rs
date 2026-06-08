@@ -91,9 +91,12 @@ dedicated rows and Claude's lines can.
   `left`/`right`-routed elements this is reflow-free; for `row*` elements the
   status height changes, so that session's panes reflow on the switch — route
   to `left`/`right` if you want zero reflow.
-- **`warmth` only ticks live on a tmux surface** (`row*`, `left`, `right`).
-  Routed to `claude` it can't update on its own, so it's best on `right` or
-  a row.
+- **`warmth` ticks live on a tmux surface** (`row*`, `left`, `right`), driven
+  by the daemon. Routed to `claude` it is recomputed on each statusline run, so
+  it ticks warm→cold only as often as Claude re-renders — `--install` sets
+  `statusLine.refreshInterval` (60s) so it still flips while the session is
+  idle. Default outside tmux is `off`; route it to `claude`/`claude.right` to
+  opt in.
 - **No config file** = the default layout (rich line + heatmap rows on
   dedicated rows, the base row below).
 - **Outside tmux**, the tmux-only destinations (`row*`/`left`/`right`) have no

@@ -95,7 +95,7 @@ fn main() -> ExitCode {
     // the fleet sees it even outside tmux (where no pane state is written).
     write_session_presence(&input);
 
-    let elements = render_elements(&input, &cfg);
+    let mut elements = render_elements(&input, &cfg);
 
     // Inside tmux, routing decides where each element goes; outside tmux
     // there is no tmux surface, so everything falls back to Claude's
@@ -114,6 +114,21 @@ fn main() -> ExitCode {
     {
         let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
         ipc::notify_register(&server_id, &tmux_session, pane_id);
+    }
+
+    // `warmth` is computed live from session state, not by render_elements.
+    // The daemon owns it on tmux surfaces; here we produce it ourselves when
+    // it's routed to Claude's statusline (done after register_pane so it never
+    // lands in the daemon's pane state). With statusLine.refreshInterval set,
+    // the periodic re-run lets it tick warm->cold on its own.
+    if matches!(
+        routing.dest(config::Element::Warmth),
+        config::Dest::Claude { .. }
+    ) && let Some(sid) = resolve_session_id(&input)
+        && let Some(sess) = state::read_session(&sid)
+        && let Some(seg) = render_tmux::warmth_segment(&sess)
+    {
+        elements.push((config::Element::Warmth, seg));
     }
 
     // Print the elements routed to Claude's own statusline.

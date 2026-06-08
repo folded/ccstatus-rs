@@ -45,9 +45,14 @@ pub fn run() -> Result<(), String> {
         ));
     }
 
+    // refreshInterval re-runs the command every N seconds on top of
+    // event-driven renders, so the live `warmth` indicator (and clock-like
+    // limits data) can tick while the session is idle. 60s keeps the warm->cold
+    // flip prompt enough against the ~270s threshold without re-rendering often.
     settings["statusLine"] = json!({
         "type": "command",
         "command": exe_str,
+        "refreshInterval": 60,
     });
 
     // Wire the hooks that feed per-session state: Stop (turn finished) and

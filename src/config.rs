@@ -204,8 +204,9 @@ impl Routing {
     /// Every element to Claude's statusline. Used outside tmux, where there
     /// is no tmux surface to route to. Segments land on the first line; the
     /// two heatmap rows take the lines below it (reproducing the stdout
-    /// layout). The live `warmth` element is dropped (it can't tick on
-    /// Claude's statusline).
+    /// layout). `warmth` defaults to `off` — it only ticks if the user opts in
+    /// by routing it to `claude` *and* `statusLine.refreshInterval` re-runs the
+    /// command (see [`outside_tmux`]).
     pub fn all_claude() -> Self {
         let mut dests = [Dest::CLAUDE; 10];
         dests[Element::Warmth as usize] = Dest::Off;
@@ -226,6 +227,11 @@ impl Routing {
     /// tmux-only destinations (`row*`/`left`/`right`) have no surface here, so
     /// they keep the [`all_claude`] fallback rather than vanishing; route an
     /// element to `claude.right` to right-align it outside tmux.
+    ///
+    /// `warmth` defaults to `off`, but — unlike on a tmux surface — it *can* be
+    /// opted in here by routing it to `claude`: the registrar computes it from
+    /// session state on each run, so with `statusLine.refreshInterval` set it
+    /// flips warm→cold on the timer rather than only on Claude's own renders.
     pub fn outside_tmux() -> Self {
         Self::outside_tmux_from(read_config())
     }
@@ -245,8 +251,6 @@ impl Routing {
                 }
             }
         }
-        // warmth can't tick on Claude's statusline regardless of config.
-        r.dests[Element::Warmth as usize] = Dest::Off;
         r
     }
 
@@ -518,9 +522,23 @@ mod tests {
         // tmux-only surfaces fall back to the all_claude default (line 0 left)
         assert_eq!(r.dest(Element::Model), Dest::CLAUDE);
         assert_eq!(r.dest(Element::Limits), Dest::CLAUDE);
-        // warmth is always off outside tmux; nothing routes to a tmux surface
+        // warmth left unrouted keeps the all_claude default (off)
         assert_eq!(r.dest(Element::Warmth), Dest::Off);
         assert!(!r.any_tmux());
+    }
+
+    #[test]
+    fn outside_tmux_can_opt_warmth_onto_claude() {
+        let v: Value =
+            serde_json::from_str(r#"{ "route": { "warmth": "claude.right" } }"#).unwrap();
+        let r = Routing::outside_tmux_from(Some(v));
+        assert_eq!(
+            r.dest(Element::Warmth),
+            Dest::Claude {
+                line: 0,
+                align: Align::Right
+            }
+        );
     }
 
     #[test]
