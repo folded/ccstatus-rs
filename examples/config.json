@@ -1,14 +1,22 @@
 {
-  "route": {
-    "model": "left",
-    "warmth": "right",
-    "heatmap_main": "row0",
-    "tokens": "row1",
-    "limits": "row1",
-    "cwd": "claude",
-    "effort": "claude",
-    "version": "claude",
-    "heatmap_sub": "off",
-    "updates": "off"
+  "tmux": {
+    "claude": {
+      "left": "cwd, effort",
+      "right": "version"
+    },
+    "tmux": {
+      "left": "model",
+      "right": "warmth",
+      "left.1": "heatmap_main",
+      "left.2": "tokens, limits"
+    }
+  },
+  "default": {
+    "claude": {
+      "left": "model, cwd, effort",
+      "right": "version",
+      "left.1": "tokens, limits",
+      "left.2": "heatmap_main"
+    }
   }
 }

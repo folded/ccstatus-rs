@@ -4,105 +4,86 @@ Copy [`config.json`](./config.json) to `~/.config/ccstatus/config.json`
 (or `$XDG_CONFIG_HOME/ccstatus/config.json`). The daemon hot-reloads on
 save — no restart needed.
 
+## Structure
+
+The config is keyed by **layout**, chosen at runtime: `tmux` when Claude Code
+runs inside tmux, `default` otherwise. Each layout holds **surfaces**, and each
+surface maps a **region** to an ordered, comma-separated element list:
+
+```
+<layout>:                 tmux | default
+  <surface>:              claude | tmux
+    background: "#hex"     (optional, per surface)
+    <side>[.<line>]: "el, el, …"
+```
+
+- **Surfaces.** `claude` is Claude's own statusline (the lines above the
+  prompt), available in every layout. `tmux` is the daemon-driven status bar,
+  only in the `tmux` layout.
+- **Regions.** `left`/`right` plus an optional line index: `left`, `right`,
+  `left.1`, `right.2`, …. A bare side is line 0. On the `claude` surface a line
+  is a printed line; on the `tmux` surface line 0 is the base status row (its
+  `status-left`/`status-right` edges) and lines ≥1 are dedicated rows.
+- **Order.** The element list is rendered in the order you write it.
+- **Off.** An element you don't list anywhere is hidden — there's no `"off"`.
+- **Conflicts.** If an element appears on both surfaces of a layout, the
+  `claude` surface wins.
+
 ## What this example does
 
-It spreads the status elements across every destination kind:
-
-```
-route:
-  model         -> left      base-row status-left (pinned far left)
-  warmth         -> right    base-row status-right (live warm/cold pip)
-  heatmap_main  -> row0      dedicated row, nearest the panes
-  tokens        -> row1      dedicated row, with limits beside it
-  limits        -> row1      (shares row1 with tokens, joined by " | ")
-  cwd           -> claude    Claude's own statusline
-  effort        -> claude    Claude's own statusline
-  version       -> claude    Claude's own statusline
-  heatmap_sub   -> off
-  updates       -> off
-```
-
-Resulting tmux bar while a Claude pane is focused (status at the bottom):
+Inside tmux (status at the bottom):
 
 ```
 ┌───────────────────────── pane(s) ─────────────────────────┐
-│                                                            │
 └────────────────────────────────────────────────────────────┘
- <heatmap_main>                                                  row0  (nearest panes)
- 6k/200k (3% · cache 83%) | 5h 12% @14:30 | 7d 40%               row1
- Opus | <your status-left>  <window list>  <your status-right> | warm   base row
+ <heatmap_main>                                              tmux left.1
+ 44k/200k (22% · cache 90%) | 5h 12% | 7d 40%                tmux left.2
+ model | <your status-left>  <window list>  <…right> | warm  base row (line 0)
 ```
 
-and in Claude's own statusline (above the prompt):
+and on Claude's own statusline (above the prompt):
 
 ```
-~/demo@main (+3 -1) | effort: high | v2.1.0
+~/demo@main (+3 -1) | effort: high                       v2.1.0
 ```
 
-## Destinations
+Outside tmux, the `default` layout puts everything on Claude's statusline:
 
-| value     | surface                                            | height | live? |
-|-----------|----------------------------------------------------|--------|-------|
-| `row0`…`rowN` | a dedicated tmux status row (`row0` nearest panes) | adds 1 row | yes |
-| `left`    | base row `status-left`, composed with yours        | none   | yes |
-| `right`   | base row `status-right`, composed with yours       | none   | yes |
-| `claude`  | Claude's own statusline (stdout)                   | n/a    | no — updates only when Claude re-renders |
-| `off`     | hidden                                             | —      | — |
+```
+Opus 4.8 | demo@main (+3 -1) | effort: high              v2.1.0
+44k/200k (22% · cache 90%) | 5h 12% | 7d 40%
+<heatmap_main>
+```
 
-Elements on the same row/side join with ` | ` in this fixed order:
-`model, cwd, tokens, effort, limits, version, updates, warmth`. The
-heatmap elements are full-width rows.
+## Background
 
-### Claude statusline layout (`claude.<line>.<align>`)
-
-`claude` accepts an optional printed line and horizontal alignment, so the
-statusline Claude renders above its prompt can be more than one left-packed
-line:
-
-- `claude` — first line, left (the default).
-- `claude.right` — first line, right-aligned (padded out to the terminal width).
-- `claude.1` — second printed line, left.
-- `claude.1.right` — second line, right-aligned.
-
-Tokens and line may appear in either order (`claude.1.right` == `claude.right.1`).
-Left- and right-aligned groups on the same line are padded apart; heatmap
-elements always take their own full-width line. This layout applies both inside
-and outside tmux.
-
-### Background (`background`)
-
-A top-level `"background"` hex colour paints the surfaces ccstatus owns so the
-bar reads consistently regardless of the terminal or tmux theme:
+`background` is a reserved per-surface key (`#rrggbb`) so the bar reads
+consistently regardless of the terminal or tmux theme:
 
 ```json
-{ "background": "#1a1b26", "route": { "model": "row2" } }
+{ "tmux": { "tmux": { "background": "#1a1b26", "left": "model" } } }
 ```
 
-Inside tmux it is applied via the session's `status-style` (preserving your
-foreground/attributes) and reverts when Claude exits; outside tmux each printed
-line is filled to the full width with the colour. The base-row *edges*
-(`left`/`right`) share your own status bar, so they can't be repainted —
-dedicated rows and Claude's lines can.
+On the `tmux` surface it's applied via the session's `status-style` (preserving
+your foreground/attributes) and reverts when Claude exits. On the `claude`
+surface each printed line is filled to the full width with the colour. The
+base-row *edges* (`left`/`right` on line 0) share your own status bar, so they
+can't be repainted — dedicated rows and Claude's lines can.
 
 ## Notes
 
-- **The bar shows only while the focused pane is running Claude.** Switching
-  to any other pane in the session clears the ccstatus content. For
-  `left`/`right`-routed elements this is reflow-free; for `row*` elements the
-  status height changes, so that session's panes reflow on the switch — route
-  to `left`/`right` if you want zero reflow.
-- **`warmth` ticks live on a tmux surface** (`row*`, `left`, `right`), driven
-  by the daemon. Routed to `claude` it is recomputed on each statusline run, so
-  it ticks warm→cold only as often as Claude re-renders — `--install` sets
+- **The bar shows only while the focused pane is running Claude.** Switching to
+  another pane clears the ccstatus content. Base-row edges (line 0) are
+  reflow-free; dedicated rows (lines ≥1) change the status height, so the
+  session's panes reflow on the switch — keep elements on line 0 if you want
+  zero reflow.
+- **`warmth` ticks live on the tmux surface**, driven by the daemon. On the
+  `claude` surface it is recomputed on each statusline run, so it ticks
+  warm→cold only as often as Claude re-renders — `--install` sets
   `statusLine.refreshInterval` (60s) so it still flips while the session is
-  idle. Default outside tmux is `off`; route it to `claude`/`claude.right` to
-  opt in.
-- **No config file** = the default layout (rich line + heatmap rows on
-  dedicated rows, the base row below).
-- **Outside tmux**, the tmux-only destinations (`row*`/`left`/`right`) have no
-  surface, so those elements fall back to Claude's first line; explicit
-  `claude.<line>.<align>` and `off` choices are still honored. Route to
-  `claude.right` for right alignment without tmux.
+  idle.
+- **No matching layout in the file** = a sensible built-in (rich row + heatmap
+  rows in tmux; everything on Claude's statusline otherwise).
 - Your base status row (the window list) and your `status-left`/`status-right`
   theme are never overwritten — ccstatus composes alongside them per session
   and reverts cleanly when Claude exits.

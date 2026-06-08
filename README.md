@@ -85,16 +85,31 @@ Claude's own statusline, which can span multiple lines and right-align segments
 (see below).
 
 Which elements land where is controlled by an optional
-`~/.config/ccstatus/config.json` — each element (`model`, `cwd`, `tokens`,
-`effort`, `limits`, `version`, `updates`, `warmth`, `heatmap_main`,
-`heatmap_sub`) routes to a dedicated tmux row, the base row's
-`status-left`/`status-right`, Claude's statusline (optionally a specific line
-and left/right alignment, e.g. `claude.1.right`), or `off`. An optional
-`"background"` hex colour (e.g. `"#1a1b26"`) paints ccstatus's surfaces a
-consistent colour instead of inheriting the terminal or tmux theme. The file
-hot-reloads on save. See [`examples/README.md`](examples/README.md) for a
-worked config and the destination table. With no config file, ccstatus uses a
-sensible default layout.
+`~/.config/ccstatus/config.json`, keyed by **layout** (`tmux` when inside tmux,
+else `default`), then **surface** (`claude` = the statusline, `tmux` = the
+bar), then **region** (`left`/`right` with an optional line index, e.g.
+`left.1`):
+
+```json
+{
+  "tmux": {
+    "claude": { "left": "cwd, effort", "right": "version" },
+    "tmux":   { "left": "model", "right": "warmth",
+                "left.1": "heatmap_main", "left.2": "tokens, limits" }
+  },
+  "default": {
+    "claude": { "left": "model, cwd, effort", "right": "version",
+                "left.1": "tokens, limits", "left.2": "heatmap_main" }
+  }
+}
+```
+
+A region's value is an ordered element list (list order is render order);
+unlisted elements are hidden. `background` is a reserved per-surface key
+(`"#rrggbb"`) that paints that surface a consistent colour instead of
+inheriting the terminal or tmux theme. The file hot-reloads on save. See
+[`examples/README.md`](examples/README.md) for the full grammar. With no
+matching layout, ccstatus uses a sensible built-in.
 
 If a crashed helper ever leaves the bar in a bad state, `ccstatus --tmux-reset`
 restores the tmux defaults.
