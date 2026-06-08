@@ -360,6 +360,8 @@ impl Handler {
             &tmux::base_row(self.tmux.as_ref()),
             &self.tmux.global("status-left"),
             &self.tmux.global("status-right"),
+            config::background(),
+            &self.tmux.global("status-style"),
         );
         apply(self.tmux.as_ref(), &self.session, &plan);
     }
@@ -399,6 +401,9 @@ pub struct BarPlan {
     pub status: String,
     pub left: Side,
     pub right: Side,
+    /// The session's `status-style`: an explicit value (the user's style with
+    /// the configured background applied) or revert to inheriting the global.
+    pub style: Side,
 }
 
 /// A base-row edge (`status-left` / `status-right`): an explicit value to set,
@@ -418,6 +423,8 @@ pub fn plan_bar(
     base_row: &str,
     user_left: &str,
     user_right: &str,
+    bg: Option<(u8, u8, u8)>,
+    user_status_style: &str,
 ) -> BarPlan {
     let mut formats: Vec<String> = routing
         .rows_used()
@@ -437,11 +444,21 @@ pub fn plan_bar(
     formats.push(base_row.to_string());
     let status = tmux::status_value(formats.len());
 
+    // An explicit background is applied via the session's status-style, which
+    // both the dedicated rows' `#[default]` resets and tmux's trailing
+    // row-fill honour — so the whole bar reads with one background instead of
+    // the inherited theme. Preserve the user's other style tokens.
+    let style = match bg {
+        Some(rgb) => Side::Set(tmux::with_bg(user_status_style, rgb)),
+        None => Side::Inherit,
+    };
+
     BarPlan {
         formats,
         status,
         left: plan_side(routing, content, Dest::Left, user_left),
         right: plan_side(routing, content, Dest::Right, user_right),
+        style,
     }
 }
 
@@ -486,6 +503,10 @@ fn apply(t: &dyn Tmux, session: &str, plan: &BarPlan) {
     match &plan.right {
         Side::Set(v) => t.set_session(session, "status-right", v),
         Side::Inherit => t.unset_session(session, "status-right"),
+    }
+    match &plan.style {
+        Side::Set(v) => t.set_session(session, "status-style", v),
+        Side::Inherit => t.unset_session(session, "status-style"),
     }
 }
 
@@ -608,12 +629,32 @@ mod tests {
     fn plan_bar_default_has_three_rows_plus_base_row() {
         let routing = Routing::default();
         let content = |e: Element| (e == Element::Model).then(|| "M".to_string());
-        let plan = plan_bar(&routing, &content, "BASE", "", "");
+        let plan = plan_bar(&routing, &content, "BASE", "", "", None, "");
         assert_eq!(plan.formats.len(), 4); // rows 0/1/2 + base row
         assert_eq!(plan.formats[3], "BASE");
         assert_eq!(plan.status, "4");
         assert!(matches!(plan.left, Side::Inherit));
         assert!(matches!(plan.right, Side::Inherit));
+        assert!(matches!(plan.style, Side::Inherit)); // no background configured
+    }
+
+    #[test]
+    fn plan_bar_applies_background_over_user_style() {
+        let routing = Routing::default();
+        let content = |_: Element| None;
+        let plan = plan_bar(
+            &routing,
+            &content,
+            "BASE",
+            "",
+            "",
+            Some((0x1a, 0x1b, 0x26)),
+            "fg=colour137,bg=colour234",
+        );
+        match plan.style {
+            Side::Set(s) => assert_eq!(s, "fg=colour137,bg=#1a1b26"),
+            Side::Inherit => panic!("expected an explicit status-style"),
+        }
     }
 
     #[test]
@@ -625,7 +666,7 @@ mod tests {
             Element::Cwd => Some("C".to_string()),
             _ => None,
         };
-        let plan = plan_bar(&routing, &content, "BASE", "", "");
+        let plan = plan_bar(&routing, &content, "BASE", "", "", None, "");
         let expected = render_tmux::ansi_to_tmux(&render_tmux::join_segments(["M", "C"]));
         assert_eq!(plan.formats[0], expected);
         assert!(expected.contains('|')); // the ` | ` separator survived
@@ -635,7 +676,7 @@ mod tests {
     fn plan_bar_composes_user_side_on_correct_edge() {
         let routing = Routing::from_pairs(&[(Element::Tokens, Dest::Right)]);
         let content = |e: Element| (e == Element::Tokens).then(|| "T".to_string());
-        let plan = plan_bar(&routing, &content, "BASE", "UL", "UR");
+        let plan = plan_bar(&routing, &content, "BASE", "UL", "UR", None, "");
         let mine = render_tmux::ansi_to_tmux("T");
         match plan.right {
             Side::Set(s) => assert_eq!(s, format!("UR {mine}")), // user value on the left edge
@@ -653,6 +694,7 @@ mod tests {
             status: "2".into(),
             left: Side::Set("L".into()),
             right: Side::Inherit,
+            style: Side::Set("bg=#1a1b26".into()),
         };
         apply(&t, "$1", &plan);
         assert_eq!(
@@ -663,12 +705,13 @@ mod tests {
                 Write::SetSession("$1".into(), "status".into(), "2".into()),
                 Write::SetSession("$1".into(), "status-left".into(), "L".into()),
                 Write::UnsetSession("$1".into(), "status-right".into()),
+                Write::SetSession("$1".into(), "status-style".into(), "bg=#1a1b26".into()),
             ]
         );
     }
 
     #[test]
-    fn deactivate_restore_emits_four_unsets() {
+    fn deactivate_restore_unsets_every_bar_option() {
         let t = FakeTmux::new();
         tmux::restore_session(&t, "$1");
         assert_eq!(
@@ -678,6 +721,7 @@ mod tests {
                 Write::UnsetSession("$1".into(), "status".into()),
                 Write::UnsetSession("$1".into(), "status-left".into()),
                 Write::UnsetSession("$1".into(), "status-right".into()),
+                Write::UnsetSession("$1".into(), "status-style".into()),
             ]
         );
     }

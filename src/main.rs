@@ -117,7 +117,12 @@ fn main() -> ExitCode {
     }
 
     // Print the elements routed to Claude's own statusline.
-    let claude = compose_claude(&elements, &routing, term::columns(120));
+    let claude = compose_claude(
+        &elements,
+        &routing,
+        term::columns(120),
+        config::background(),
+    );
     if !claude.is_empty() {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
@@ -442,11 +447,13 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
 /// elements are grouped by their configured line (ascending); on each line the
 /// inline segments are laid out as a left group and a right group, the right
 /// group padded out to column `cols`, and any full-width row element (heatmap)
-/// follows on its own physical line.
+/// follows on its own physical line. When `bg` is set, every physical line is
+/// painted to the full width with that background.
 fn compose_claude(
     elements: &[(config::Element, String)],
     routing: &config::Routing,
     cols: u16,
+    bg: Option<(u8, u8, u8)>,
 ) -> String {
     use config::{Align, Kind};
     let find = |e: config::Element| {
@@ -485,7 +492,23 @@ fn compose_claude(
             }
         }
     }
+    if let Some(bg) = bg {
+        for line in &mut physical {
+            *line = paint_background(line, cols, bg);
+        }
+    }
     physical.join("\n")
+}
+
+/// Paint a physical line with an explicit background: prefix the colour,
+/// re-assert it after every full reset (`\x1b[0m` would otherwise clear the
+/// background mid-line), pad to the full width so the colour fills the row,
+/// and reset at the end so the terminal background resumes afterwards.
+fn paint_background(line: &str, cols: u16, (r, g, b): (u8, u8, u8)) -> String {
+    let prefix = format!("\x1b[48;2;{r};{g};{b}m");
+    let body = line.replace(RESET, &format!("{RESET}{prefix}"));
+    let pad = (cols as usize).saturating_sub(render_tmux::visible_width(line));
+    format!("{prefix}{body}{}{RESET}", " ".repeat(pad))
 }
 
 /// Lay out one Claude line from its left and right segment groups: pad between
@@ -651,10 +674,24 @@ mod tests {
             (Element::Tokens, "T".to_string()),
             (Element::Cwd, "C".to_string()),
         ];
-        let out = compose_claude(&elements, &routing, 10);
+        let out = compose_claude(&elements, &routing, 10, None);
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "M        T"); // model left, tokens right at col 10
         assert_eq!(lines[1], "C"); // line 1, left
+    }
+
+    #[test]
+    fn background_fills_to_width_and_reasserts_after_reset() {
+        // A model segment carries a fg colour and a trailing RESET.
+        let painted = paint_background(&format!("{BLUE}M{RESET}"), 5, (0x1a, 0x1b, 0x26));
+        let bg = "\x1b[48;2;26;27;38m";
+        assert_eq!(
+            painted,
+            // bg, fg, "M", reset, bg re-asserted, 4 pad cols, final reset.
+            format!("{bg}{BLUE}M{RESET}{bg}    {RESET}")
+        );
+        // The visible width (ignoring escapes) fills the line exactly.
+        assert_eq!(render_tmux::visible_width(&painted), 5);
     }
 }

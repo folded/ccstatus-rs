@@ -133,7 +133,28 @@ impl Tmux for CliTmux {
 
 /// The session-local bar options the handler overrides (and `restore_session`
 /// reverts).
-pub const SESSION_BAR_OPTS: [&str; 4] = ["status-format", "status", "status-left", "status-right"];
+pub const SESSION_BAR_OPTS: [&str; 5] = [
+    "status-format",
+    "status",
+    "status-left",
+    "status-right",
+    "status-style",
+];
+
+/// Override the background of a tmux style string, preserving its other
+/// tokens. e.g. `with_bg("fg=red,bg=black", (26,27,38))` -> `"fg=red,bg=#1a1b26"`.
+/// Used to paint the daemon-driven rows with an explicit background without
+/// discarding the user's foreground/attributes.
+pub fn with_bg(style: &str, (r, g, b): (u8, u8, u8)) -> String {
+    let bg = format!("bg=#{r:02x}{g:02x}{b:02x}");
+    let mut parts: Vec<&str> = style
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with("bg="))
+        .collect();
+    parts.push(&bg);
+    parts.join(",")
+}
 
 /// Drop every bar override for a session, reverting it to inheriting the
 /// user's global config.
@@ -317,7 +338,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restore_session_emits_four_unsets() {
+    fn restore_session_unsets_every_bar_option() {
         let t = FakeTmux::new();
         restore_session(&t, "$1");
         assert_eq!(
@@ -327,8 +348,20 @@ mod tests {
                 Write::UnsetSession("$1".into(), "status".into()),
                 Write::UnsetSession("$1".into(), "status-left".into()),
                 Write::UnsetSession("$1".into(), "status-right".into()),
+                Write::UnsetSession("$1".into(), "status-style".into()),
             ]
         );
+    }
+
+    #[test]
+    fn with_bg_overrides_only_the_background() {
+        assert_eq!(
+            with_bg("fg=red,bg=black", (0x1a, 0x1b, 0x26)),
+            "fg=red,bg=#1a1b26"
+        );
+        // No prior bg: append one. Empty style: just the bg.
+        assert_eq!(with_bg("fg=red", (0, 0, 0)), "fg=red,bg=#000000");
+        assert_eq!(with_bg("", (0xff, 0xff, 0xff)), "bg=#ffffff");
     }
 
     #[test]

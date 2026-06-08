@@ -321,6 +321,32 @@ fn jump_command_from(v: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// An explicit status background colour (`"background": "#rrggbb"` in the
+/// config file), applied to the surfaces this tool owns — the Claude
+/// statusline lines outside tmux, and the daemon-driven rows inside it — so
+/// the bar reads consistently regardless of the terminal or tmux theme.
+/// `None` leaves the inherited background untouched.
+pub fn background() -> Option<(u8, u8, u8)> {
+    background_from(read_config().as_ref())
+}
+
+fn background_from(v: Option<&Value>) -> Option<(u8, u8, u8)> {
+    parse_hex_rgb(v?.get("background")?.as_str()?)
+}
+
+/// Parse `#rrggbb` (case-insensitive) into an RGB triple.
+fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.strip_prefix('#')?;
+    if h.len() != 6 {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&h[0..2], 16).ok()?,
+        u8::from_str_radix(&h[2..4], 16).ok()?,
+        u8::from_str_radix(&h[4..6], 16).ok()?,
+    ))
+}
+
 pub fn config_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .ok()
@@ -436,6 +462,19 @@ mod tests {
         let blank: Value = serde_json::from_str(r#"{ "jump": { "linux": "" } }"#).unwrap();
         assert_eq!(jump_command_from(Some(&blank)), None);
         assert_eq!(jump_command_from(None), None);
+    }
+
+    #[test]
+    fn background_parses_hex_and_rejects_junk() {
+        let v: Value = serde_json::from_str(r##"{ "background": "#1a1b26" }"##).unwrap();
+        assert_eq!(background_from(Some(&v)), Some((0x1a, 0x1b, 0x26)));
+        // missing key, bad length, non-hex, and no config all yield None.
+        let none: Value = serde_json::from_str(r#"{ "route": {} }"#).unwrap();
+        assert_eq!(background_from(Some(&none)), None);
+        assert_eq!(parse_hex_rgb("#1a1b2"), None);
+        assert_eq!(parse_hex_rgb("1a1b26"), None);
+        assert_eq!(parse_hex_rgb("#xxyyzz"), None);
+        assert_eq!(background_from(None), None);
     }
 
     #[test]
