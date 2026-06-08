@@ -69,7 +69,66 @@ pub fn run() -> Result<(), String> {
         "ccstatus: wired statusLine.command + Stop/UserPromptSubmit hooks -> {exe_str} in {}",
         settings_path.display()
     );
+
+    // Discoverability, not configuration: the routing config is optional (no
+    // file = sensible default layout), so we point at it rather than write it.
+    println!(
+        "\nOptional: customize status-element routing in {} (see examples/config.json).",
+        crate::config::config_path().display()
+    );
+    // On Linux, a heads-up if the default non-tmux "jump" actuator can't work
+    // here yet (see `window.rs` / examples/jump-linux.sh).
+    if let Some(note) = jump_note() {
+        println!("{note}");
+    }
     Ok(())
+}
+
+/// A one-line heads-up when ccstatus's bundled non-tmux "jump" actuator won't
+/// work in this environment (Linux only; `None` otherwise). Pure decision in
+/// [`jump_hint`]; this resolves the environment.
+#[cfg(target_os = "linux")]
+fn jump_note() -> Option<&'static str> {
+    let set = |k: &str| env::var(k).ok().filter(|v| !v.is_empty()).is_some();
+    jump_hint(
+        set("WAYLAND_DISPLAY"),
+        set("DISPLAY"),
+        crate::config::jump_command().is_some(),
+        on_path("wmctrl") || on_path("xdotool"),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn jump_note() -> Option<&'static str> {
+    None
+}
+
+/// Pure: which (if any) jump heads-up to print, given the graphical display in
+/// play, whether the user set `jump.linux`, and whether an X11 tool is present.
+/// `None` when jumping is already covered or irrelevant (headless / configured
+/// / X11 with a tool installed).
+#[cfg(target_os = "linux")]
+fn jump_hint(wayland: bool, x11: bool, configured: bool, x11_tool: bool) -> Option<&'static str> {
+    if configured || (!wayland && !x11) {
+        return None;
+    }
+    if wayland {
+        // The bundled default is X11-only; Wayland has no portable actuator.
+        return Some(
+            "note: non-tmux \"jump\" under Wayland has no built-in default \u{2014} set `jump.linux` (see examples/README.md).",
+        );
+    }
+    (!x11_tool).then_some(
+        "note: non-tmux \"jump\" on X11 needs `wmctrl` or `xdotool` (neither found) \u{2014} install one, or set `jump.linux`.",
+    )
+}
+
+/// Whether `bin` is an existing file on `$PATH`.
+#[cfg(target_os = "linux")]
+fn on_path(bin: &str) -> bool {
+    env::var_os("PATH")
+        .map(|path| env::split_paths(&path).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
 }
 
 /// Ensure `settings.hooks.<event>` runs `<exe> --hook <kind>`, idempotently:
@@ -158,6 +217,30 @@ mod tests {
         let cmds = stop_commands(&s);
         assert!(cmds.contains(&"/other/tool --do-thing".to_string()));
         assert!(cmds.contains(&"/bin/ccstatus --hook stop".to_string()));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn jump_hint_covers_the_environments() {
+        // Headless (no display): jump is irrelevant -> no note.
+        assert_eq!(jump_hint(false, false, false, false), None);
+        // User set jump.linux: they've handled it -> no note, any display.
+        assert_eq!(jump_hint(true, false, true, false), None);
+        assert_eq!(jump_hint(false, true, true, false), None);
+        // X11 with no tool: nudge to install one.
+        assert!(
+            jump_hint(false, true, false, false)
+                .unwrap()
+                .contains("X11")
+        );
+        // X11 with a tool present: good to go -> no note.
+        assert_eq!(jump_hint(false, true, false, true), None);
+        // Wayland: no built-in default, even if an X11 tool happens to exist.
+        assert!(
+            jump_hint(true, false, false, true)
+                .unwrap()
+                .contains("Wayland")
+        );
     }
 
     #[test]
