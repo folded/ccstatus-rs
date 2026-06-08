@@ -30,20 +30,19 @@ pub struct DaemonLock {
 
 impl ServerDir {
     pub fn for_current(server_id: &str) -> Result<Self, String> {
-        let root = cache::cache_dir()
-            .join("server")
-            .join(sanitize(server_id));
-        fs::create_dir_all(&root)
-            .map_err(|e| format!("creating {}: {e}", root.display()))?;
+        let root = cache::cache_dir().join("server").join(sanitize(server_id));
+        fs::create_dir_all(&root).map_err(|e| format!("creating {}: {e}", root.display()))?;
         Ok(Self { root })
     }
 
     pub fn lock_path(&self, session: &str) -> PathBuf {
-        self.root.join(format!("handler{}.lock", sanitize_session(session)))
+        self.root
+            .join(format!("handler{}.lock", sanitize_session(session)))
     }
 
     pub fn socket_path(&self, session: &str) -> PathBuf {
-        self.root.join(format!("handler{}.sock", sanitize_session(session)))
+        self.root
+            .join(format!("handler{}.sock", sanitize_session(session)))
     }
 
     /// Try to acquire the per-session handler lock. Returns
@@ -81,8 +80,7 @@ impl ServerDir {
     pub fn bind_socket(&self, session: &str) -> Result<UnixListener, String> {
         let path = self.socket_path(session);
         let _ = fs::remove_file(&path);
-        UnixListener::bind(&path)
-            .map_err(|e| format!("binding {}: {e}", path.display()))
+        UnixListener::bind(&path).map_err(|e| format!("binding {}: {e}", path.display()))
     }
 }
 

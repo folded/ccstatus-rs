@@ -224,7 +224,11 @@ impl Routing {
             return r;
         };
         for e in Element::ALL {
-            if let Some(d) = route.get(e.key()).and_then(|x| x.as_str()).and_then(Dest::parse) {
+            if let Some(d) = route
+                .get(e.key())
+                .and_then(|x| x.as_str())
+                .and_then(Dest::parse)
+            {
                 r.dests[e as usize] = d;
             }
         }
@@ -237,7 +241,11 @@ fn config_path() -> PathBuf {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("ccstatus").join("config.json")
 }
@@ -280,10 +288,9 @@ mod tests {
 
     #[test]
     fn from_value_overrides_only_named_keys() {
-        let v: Value = serde_json::from_str(
-            r#"{ "route": { "tokens": "claude", "heatmap_sub": "off" } }"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{ "route": { "tokens": "claude", "heatmap_sub": "off" } }"#)
+                .unwrap();
         let r = Routing::from_value(Some(v));
         assert_eq!(r.dest(Element::Tokens), Dest::Claude);
         assert_eq!(r.dest(Element::HeatmapSub), Dest::Off);

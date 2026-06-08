@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::cache;
 
@@ -136,14 +136,8 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
     Some(SessionState {
         last_turn_ts: v.get("last_turn_ts").and_then(|x| x.as_i64()),
         last_prompt_ts: v.get("last_prompt_ts").and_then(|x| x.as_i64()),
-        model: v
-            .get("model")
-            .and_then(|x| x.as_str())
-            .map(str::to_string),
-        turn_count: v
-            .get("turn_count")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
+        model: v.get("model").and_then(|x| x.as_str()).map(str::to_string),
+        turn_count: v.get("turn_count").and_then(|x| x.as_u64()).unwrap_or(0),
         context_pct_used: v
             .get("context_pct_used")
             .and_then(|x| x.as_u64())

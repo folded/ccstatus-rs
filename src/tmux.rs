@@ -88,21 +88,27 @@ impl Tmux for CliTmux {
     }
 
     fn global(&self, name: &str) -> String {
-        let out = Command::new("tmux").args(["show-options", "-gv", name]).output();
+        let out = Command::new("tmux")
+            .args(["show-options", "-gv", name])
+            .output();
         match out {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
-            }
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim_end_matches('\n')
+                .to_string(),
             _ => String::new(),
         }
     }
 
     fn set_global(&self, name: &str, value: &str) {
-        let _ = Command::new("tmux").args(["set-option", "-g", name, value]).status();
+        let _ = Command::new("tmux")
+            .args(["set-option", "-g", name, value])
+            .status();
     }
 
     fn unset_global(&self, name: &str) {
-        let _ = Command::new("tmux").args(["set-option", "-gu", name]).status();
+        let _ = Command::new("tmux")
+            .args(["set-option", "-gu", name])
+            .status();
     }
 
     fn refresh(&self) {
@@ -113,9 +119,15 @@ impl Tmux for CliTmux {
         // select-pane sets the active pane within its window; select-window
         // makes that the active window of its session; switch-client moves the
         // attached client onto that session. Together: jump to the pane.
-        let _ = Command::new("tmux").args(["select-pane", "-t", pane]).status();
-        let _ = Command::new("tmux").args(["select-window", "-t", pane]).status();
-        let _ = Command::new("tmux").args(["switch-client", "-t", pane]).status();
+        let _ = Command::new("tmux")
+            .args(["select-pane", "-t", pane])
+            .status();
+        let _ = Command::new("tmux")
+            .args(["select-window", "-t", pane])
+            .status();
+        let _ = Command::new("tmux")
+            .args(["switch-client", "-t", pane])
+            .status();
     }
 }
 
@@ -284,7 +296,9 @@ impl Tmux for FakeTmux {
     }
 
     fn unset_global(&self, name: &str) {
-        self.writes.borrow_mut().push(Write::UnsetGlobal(name.to_string()));
+        self.writes
+            .borrow_mut()
+            .push(Write::UnsetGlobal(name.to_string()));
     }
 
     fn refresh(&self) {
@@ -292,7 +306,9 @@ impl Tmux for FakeTmux {
     }
 
     fn focus_pane(&self, pane: &str) {
-        self.writes.borrow_mut().push(Write::Focus(pane.to_string()));
+        self.writes
+            .borrow_mut()
+            .push(Write::Focus(pane.to_string()));
     }
 }
 

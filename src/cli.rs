@@ -15,10 +15,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let heatmap = env::var("STATUSLINE_HEATMAP")
-            .as_deref()
-            .unwrap_or("true")
-            != "false";
+        let heatmap = env::var("STATUSLINE_HEATMAP").as_deref().unwrap_or("true") != "false";
         let updates = env::var("STATUSLINE_CHECK_UPDATES")
             .as_deref()
             .unwrap_or("false")

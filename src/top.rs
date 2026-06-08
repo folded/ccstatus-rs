@@ -17,6 +17,7 @@ use std::io::{self, IsTerminal, Stdout};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::crossterm::execute;
@@ -28,7 +29,6 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table, TableState};
-use ratatui::Frame;
 
 use crate::fleet::{self, Activity, SessionView};
 use crate::ipc;
@@ -209,8 +209,14 @@ fn sep() -> Span<'static> {
 }
 
 fn header_line(views: &[SessionView]) -> Line<'static> {
-    let working = views.iter().filter(|v| v.activity == Activity::Working).count();
-    let waiting = views.iter().filter(|v| v.activity == Activity::Waiting).count();
+    let working = views
+        .iter()
+        .filter(|v| v.activity == Activity::Working)
+        .count();
+    let waiting = views
+        .iter()
+        .filter(|v| v.activity == Activity::Waiting)
+        .count();
     let mut spans = vec![
         Span::styled("ccstatus", Style::default().fg(C_BLUE)),
         sep(),
@@ -234,9 +240,15 @@ fn usage_spans() -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut pct = |label: &str, p: i64| {
         spans.push(sep());
-        spans.push(Span::styled(label.to_string(), Style::default().fg(C_WHITE)));
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(C_WHITE),
+        ));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(format!("{p}%"), Style::default().fg(usage_color(p))));
+        spans.push(Span::styled(
+            format!("{p}%"),
+            Style::default().fg(usage_color(p)),
+        ));
     };
     if let Some(p) = u.five_hour_pct {
         pct("5h", p);
@@ -295,8 +307,14 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>) -> Row<'a> {
         Activity::Idle => Span::styled("idle", dim()),
         Activity::Unknown => Span::styled("-", dim()),
     };
-    let model = Span::styled(v.model.as_deref().unwrap_or("Claude"), Style::default().fg(C_WHITE));
-    let ctx = v.context_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "-".into());
+    let model = Span::styled(
+        v.model.as_deref().unwrap_or("Claude"),
+        Style::default().fg(C_WHITE),
+    );
+    let ctx = v
+        .context_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "-".into());
     let age = v.idle_secs.map(human_age).unwrap_or_else(|| "-".into());
     // `*` = on a different tmux server than us (still jumpable via its handler).
     let here = match &v.address {
@@ -316,7 +334,10 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>) -> Row<'a> {
         Line::from(activity),
         Line::from(model),
         Line::from(vec![Span::styled("ctx ", dim()), Span::raw(ctx)]),
-        Line::from(vec![Span::styled("idle ", dim()), Span::raw(format!("{age}{here}"))]),
+        Line::from(vec![
+            Span::styled("idle ", dim()),
+            Span::raw(format!("{age}{here}")),
+        ]),
         Line::from(cwd),
         Line::styled(note, dim()),
     ])

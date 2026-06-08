@@ -187,7 +187,11 @@ impl Handler {
             self.requery_focus();
             self.prune_dead_panes();
             self.reconcile();
-            if should_exit(self.panes.is_empty(), self.active, self.last_activity.elapsed()) {
+            if should_exit(
+                self.panes.is_empty(),
+                self.active,
+                self.last_activity.elapsed(),
+            ) {
                 self.log.write("idle with no Claude panes; exiting");
                 break;
             }
@@ -293,7 +297,12 @@ impl Handler {
         let warmth = focused_claude.as_deref().and_then(|p| self.pane_warmth(p));
         let warmth_changed = warmth != self.last_warmth;
 
-        match decide(self.active, focused_claude.as_deref(), force, warmth_changed) {
+        match decide(
+            self.active,
+            focused_claude.as_deref(),
+            force,
+            warmth_changed,
+        ) {
             Action::Activate(pane) => {
                 self.log.write(&format!("activate via focused {pane}"));
                 self.render_and_apply(&pane);
@@ -323,7 +332,11 @@ impl Handler {
         let session = state::read_session(&pane.session_id)?;
         let last_turn = session.last_turn_ts?;
         let idle = crate::util::now_unix().saturating_sub(last_turn);
-        Some(if idle < render_tmux::WARM_THRESHOLD_SECS { "warm" } else { "cold" })
+        Some(if idle < render_tmux::WARM_THRESHOLD_SECS {
+            "warm"
+        } else {
+            "cold"
+        })
     }
 
     /// Read the (focused, Claude) pane's content, build the bar plan from the
@@ -416,7 +429,9 @@ pub fn plan_bar(
                 .filter_map(content)
                 .filter(|s| !s.is_empty())
                 .collect();
-            render_tmux::ansi_to_tmux(&render_tmux::join_segments(parts.iter().map(String::as_str)))
+            render_tmux::ansi_to_tmux(&render_tmux::join_segments(
+                parts.iter().map(String::as_str),
+            ))
         })
         .collect();
     formats.push(base_row.to_string());
@@ -447,7 +462,9 @@ fn plan_side(
         // the elements; no-op on a fresh activate).
         return Side::Inherit;
     }
-    let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(parts.iter().map(String::as_str)));
+    let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(
+        parts.iter().map(String::as_str),
+    ));
     let combined = match (user.is_empty(), dest) {
         (true, _) => mine,
         (false, Dest::Left) => format!("{mine} {user}"),
@@ -479,27 +496,29 @@ fn should_exit(panes_empty: bool, active: bool, idle: Duration) -> bool {
 }
 
 fn spawn_tmux_reader(mut events: EventStream, tx: mpsc::Sender<Incoming>) {
-    thread::spawn(move || loop {
-        let ev = match events.next_event() {
-            Ok(ev) => ev,
-            Err(_) => return,
-        };
-        // Forward only what the handler reacts to; tmux emits a lot of
-        // chatter (%output, command frames) that would just backpressure.
-        let forward = match &ev {
-            control::Event::Notification { name, .. } => matches!(
-                name.as_str(),
-                "window-pane-changed" | "session-window-changed"
-            ),
-            control::Event::Exit => true,
-            _ => false,
-        };
-        if !forward {
-            continue;
-        }
-        let exit = matches!(ev, control::Event::Exit);
-        if tx.send(Incoming::Tmux(ev)).is_err() || exit {
-            return;
+    thread::spawn(move || {
+        loop {
+            let ev = match events.next_event() {
+                Ok(ev) => ev,
+                Err(_) => return,
+            };
+            // Forward only what the handler reacts to; tmux emits a lot of
+            // chatter (%output, command frames) that would just backpressure.
+            let forward = match &ev {
+                control::Event::Notification { name, .. } => matches!(
+                    name.as_str(),
+                    "window-pane-changed" | "session-window-changed"
+                ),
+                control::Event::Exit => true,
+                _ => false,
+            };
+            if !forward {
+                continue;
+            }
+            let exit = matches!(ev, control::Event::Exit);
+            if tx.send(Incoming::Tmux(ev)).is_err() || exit {
+                return;
+            }
         }
     });
 }
@@ -532,7 +551,11 @@ impl DaemonLog {
     }
 
     fn write(&self, msg: &str) {
-        let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) else {
+        let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        else {
             return;
         };
         let ts = std::time::SystemTime::now()
@@ -559,15 +582,24 @@ mod tests {
     #[test]
     fn decide_covers_the_transition_table() {
         // inactive + Claude focused -> activate
-        assert_eq!(decide(false, Some("%1"), false, false), Action::Activate("%1".into()));
+        assert_eq!(
+            decide(false, Some("%1"), false, false),
+            Action::Activate("%1".into())
+        );
         // active + focus left Claude -> deactivate
         assert_eq!(decide(true, None, false, false), Action::Deactivate);
         // active + Claude focused, nothing changed -> noop
         assert_eq!(decide(true, Some("%1"), false, false), Action::Noop);
         // active + Claude focused, forced -> rerender
-        assert_eq!(decide(true, Some("%1"), true, false), Action::Rerender("%1".into()));
+        assert_eq!(
+            decide(true, Some("%1"), true, false),
+            Action::Rerender("%1".into())
+        );
         // active + Claude focused, warmth flipped -> rerender
-        assert_eq!(decide(true, Some("%1"), false, true), Action::Rerender("%1".into()));
+        assert_eq!(
+            decide(true, Some("%1"), false, true),
+            Action::Rerender("%1".into())
+        );
         // inactive + nothing focused -> noop
         assert_eq!(decide(false, None, true, true), Action::Noop);
     }
@@ -586,10 +618,8 @@ mod tests {
 
     #[test]
     fn plan_bar_joins_row_segments_with_separator() {
-        let routing = Routing::from_pairs(&[
-            (Element::Model, Dest::Row(0)),
-            (Element::Cwd, Dest::Row(0)),
-        ]);
+        let routing =
+            Routing::from_pairs(&[(Element::Model, Dest::Row(0)), (Element::Cwd, Dest::Row(0))]);
         let content = |e: Element| match e {
             Element::Model => Some("M".to_string()),
             Element::Cwd => Some("C".to_string()),
@@ -661,9 +691,21 @@ mod tests {
 
     #[test]
     fn should_exit_requires_no_panes_inactive_and_grace_elapsed() {
-        assert!(should_exit(true, false, IDLE_EXIT_AFTER + Duration::from_secs(1)));
-        assert!(!should_exit(false, false, IDLE_EXIT_AFTER + Duration::from_secs(1))); // panes remain
-        assert!(!should_exit(true, true, IDLE_EXIT_AFTER + Duration::from_secs(1))); // active
+        assert!(should_exit(
+            true,
+            false,
+            IDLE_EXIT_AFTER + Duration::from_secs(1)
+        ));
+        assert!(!should_exit(
+            false,
+            false,
+            IDLE_EXIT_AFTER + Duration::from_secs(1)
+        )); // panes remain
+        assert!(!should_exit(
+            true,
+            true,
+            IDLE_EXIT_AFTER + Duration::from_secs(1)
+        )); // active
         assert!(!should_exit(true, false, Duration::from_secs(0))); // within grace
     }
 }

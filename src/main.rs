@@ -11,8 +11,8 @@ mod git;
 mod heatmap;
 mod hooks;
 mod install;
-mod oauth;
 mod ipc;
+mod oauth;
 mod render_tmux;
 mod server_dir;
 mod state;
@@ -257,7 +257,10 @@ fn write_session_presence(input: &Value) {
     s.claude_pid = Some(resolve_claude_pid());
     // Terminal identity for a non-tmux window jump. Constant for the process,
     // so this only contributes to the first write and never churns after.
-    s.term_program = env::var("TERM_PROGRAM").ok().filter(|v| !v.is_empty()).or(s.term_program);
+    s.term_program = env::var("TERM_PROGRAM")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or(s.term_program);
     s.iterm_session_id = env::var("ITERM_SESSION_ID")
         .ok()
         .filter(|v| !v.is_empty())
@@ -275,7 +278,11 @@ fn write_session_presence(input: &Value) {
     let current = input_tokens + cache_create + cache_read;
     s.context_pct_used = Some((current * 100 / size).min(100) as u32);
     let denom = input_tokens + cache_create + cache_read;
-    s.cache_read_pct = Some(if denom > 0 { (cache_read * 100 / denom) as u32 } else { 0 });
+    s.cache_read_pct = Some(if denom > 0 {
+        (cache_read * 100 / denom) as u32
+    } else {
+        0
+    });
 
     if s == before {
         return;
@@ -365,7 +372,11 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     if cfg.tokens {
         let cache_pct = {
             let denom = input_tokens + cache_create + cache_read;
-            if denom > 0 { (cache_read * 100 / denom) as i64 } else { 0 }
+            if denom > 0 {
+                (cache_read * 100 / denom) as i64
+            } else {
+                0
+            }
         };
         let cache_color = match cache_pct {
             p if p >= 80 => GREEN,
@@ -374,13 +385,19 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
         };
         let sub_pct: Option<i64> = heatmap_result.as_ref().and_then(|r| {
             let total = r.today_main_raw + r.today_sub_raw;
-            if total == 0 { None } else { Some((r.today_sub_raw * 100 / total) as i64) }
+            if total == 0 {
+                None
+            } else {
+                Some((r.today_sub_raw * 100 / total) as i64)
+            }
         });
         let mut s = format!(
             "{ORANGE}{used_str}/{total_str}{RESET} {DIM}({RESET}{GREEN}{pct_used}%{RESET} {DIM}·{RESET} {WHITE}cache{RESET} {cache_color}{cache_pct}%{RESET}"
         );
         if let Some(p) = sub_pct {
-            s.push_str(&format!(" {DIM}·{RESET} {WHITE}sub{RESET} {WHITE}{p}%{RESET}"));
+            s.push_str(&format!(
+                " {DIM}·{RESET} {WHITE}sub{RESET} {WHITE}{p}%{RESET}"
+            ));
         }
         s.push_str(&format!("{DIM}){RESET}"));
         out.push((E::Tokens, s));
@@ -459,7 +476,9 @@ fn compose_claude(elements: &[(config::Element, String)], routing: &config::Rout
 }
 
 fn u64_at(v: Option<&Value>, key: &str) -> u64 {
-    v.and_then(|v| v.get(key)).and_then(|v| v.as_u64()).unwrap_or(0)
+    v.and_then(|v| v.get(key))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
 }
 
 fn resolve_effort(input: &Value, config_dir: &str) -> String {

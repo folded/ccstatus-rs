@@ -79,7 +79,10 @@ pub fn resolve_session_id(input: &Value) -> Option<String> {
     }
     let path = input.get("transcript_path").and_then(|v| v.as_str())?;
     let basename = path.rsplit('/').next()?;
-    let stem = basename.rsplit_once('.').map(|(s, _)| s).unwrap_or(basename);
+    let stem = basename
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(basename);
     if stem.is_empty() {
         None
     } else {
@@ -95,18 +98,24 @@ mod tests {
     fn interactive_claude_accepts_both_launcher_forms() {
         assert!(ic("claude"));
         assert!(ic("/Users/x/.local/bin/claude"));
-        assert!(ic("/Users/x/.local/share/claude/versions/2.1.168 --some-flag"));
+        assert!(ic(
+            "/Users/x/.local/share/claude/versions/2.1.168 --some-flag"
+        ));
     }
 
     #[test]
     fn interactive_claude_rejects_daemon_and_helpers() {
         // The shared daemon (ppid 1, immortal).
-        assert!(!ic("/Users/x/.local/bin/claude daemon run --origin transient"));
+        assert!(!ic(
+            "/Users/x/.local/bin/claude daemon run --origin transient"
+        ));
         // Background pty-host / spare helpers spawned by the daemon.
         assert!(!ic(
             "/Users/x/.local/share/claude/versions/2.1.168 --bg-pty-host /tmp/x.sock 200 50"
         ));
-        assert!(!ic("/Users/x/.local/share/claude/versions/2.1.168 --bg-spare /tmp/x.sock"));
+        assert!(!ic(
+            "/Users/x/.local/share/claude/versions/2.1.168 --bg-spare /tmp/x.sock"
+        ));
     }
 
     #[test]

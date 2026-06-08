@@ -14,7 +14,10 @@ pub fn collect(cwd: &str) -> Option<GitInfo> {
     if !branch_out.status.success() {
         return None;
     }
-    let branch = String::from_utf8(branch_out.stdout).ok()?.trim().to_string();
+    let branch = String::from_utf8(branch_out.stdout)
+        .ok()?
+        .trim()
+        .to_string();
     if branch.is_empty() {
         return None;
     }

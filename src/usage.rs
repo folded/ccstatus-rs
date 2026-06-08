@@ -180,8 +180,14 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
                 let iso_5h = v.pointer("/five_hour/resets_at").and_then(|x| x.as_str());
                 let c = usage_color(pct_5h);
                 out.push_str(&sep);
-                push_fmt(&mut out, format_args!("{WHITE}5h{RESET} {c}{pct_5h}%{RESET}"));
-                if let Some(reset) = iso_5h.and_then(iso_to_epoch).and_then(|e| format_local(e, "%H:%M")) {
+                push_fmt(
+                    &mut out,
+                    format_args!("{WHITE}5h{RESET} {c}{pct_5h}%{RESET}"),
+                );
+                if let Some(reset) = iso_5h
+                    .and_then(iso_to_epoch)
+                    .and_then(|e| format_local(e, "%H:%M"))
+                {
                     push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
                 }
 
@@ -193,9 +199,13 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
                 let iso_7d = v.pointer("/seven_day/resets_at").and_then(|x| x.as_str());
                 let c7 = usage_color(pct_7d);
                 out.push_str(&sep);
-                push_fmt(&mut out, format_args!("{WHITE}7d{RESET} {c7}{pct_7d}%{RESET}"));
-                if let Some(reset) =
-                    iso_7d.and_then(iso_to_epoch).and_then(|e| format_local(e, "%a %b %-d, %H:%M"))
+                push_fmt(
+                    &mut out,
+                    format_args!("{WHITE}7d{RESET} {c7}{pct_7d}%{RESET}"),
+                );
+                if let Some(reset) = iso_7d
+                    .and_then(iso_to_epoch)
+                    .and_then(|e| format_local(e, "%a %b %-d, %H:%M"))
                 {
                     push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
                 }
@@ -230,7 +240,9 @@ fn effective_builtin(input: &Value) -> bool {
     let use_builtin = p5.is_some() || p7.is_some();
     use_builtin && {
         let nonzero = |v: Option<&Value>| -> bool {
-            v.and_then(|x| x.as_f64()).map(|n| n.round() as i64 != 0).unwrap_or(false)
+            v.and_then(|x| x.as_f64())
+                .map(|n| n.round() as i64 != 0)
+                .unwrap_or(false)
         };
         let has_reset = |v: Option<&Value>| -> bool {
             match v {
@@ -252,7 +264,11 @@ fn render_extra_usage(data: &str, sep: &str, out: &mut String) {
         Some(x) if x.is_object() => x,
         _ => return,
     };
-    if !extra.get("is_enabled").and_then(|x| x.as_bool()).unwrap_or(false) {
+    if !extra
+        .get("is_enabled")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+    {
         return;
     }
     let pct = extra
@@ -260,12 +276,24 @@ fn render_extra_usage(data: &str, sep: &str, out: &mut String) {
         .and_then(|x| x.as_f64())
         .unwrap_or(0.0)
         .round() as i64;
-    let used_cents = extra.get("used_credits").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    let limit_cents = extra.get("monthly_limit").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let used_cents = extra
+        .get("used_credits")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
+    let limit_cents = extra
+        .get("monthly_limit")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
     let color = usage_color(pct);
 
-    let has_used = extra.get("used_credits").map(|v| v.is_number()).unwrap_or(false);
-    let has_limit = extra.get("monthly_limit").map(|v| v.is_number()).unwrap_or(false);
+    let has_used = extra
+        .get("used_credits")
+        .map(|v| v.is_number())
+        .unwrap_or(false);
+    let has_limit = extra
+        .get("monthly_limit")
+        .map(|v| v.is_number())
+        .unwrap_or(false);
     if has_used && has_limit {
         let used = used_cents / 100.0;
         let limit = limit_cents / 100.0;
@@ -279,7 +307,10 @@ fn render_extra_usage(data: &str, sep: &str, out: &mut String) {
         );
     } else {
         out.push_str(sep);
-        push_fmt(out, format_args!("{WHITE}extra{RESET} {GREEN}enabled{RESET}"));
+        push_fmt(
+            out,
+            format_args!("{WHITE}extra{RESET} {GREEN}enabled{RESET}"),
+        );
     }
 }
 

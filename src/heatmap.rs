@@ -204,7 +204,10 @@ fn ingest_line(line: &str, today: NaiveDate, aggs: &mut Aggregates) {
     if weighted == 0 && raw == 0 {
         return;
     }
-    let is_sub = v.get("isSidechain").and_then(|x| x.as_bool()).unwrap_or(false);
+    let is_sub = v
+        .get("isSidechain")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
 
     if date == today {
         let s = slot as usize;
@@ -216,7 +219,11 @@ fn ingest_line(line: &str, today: NaiveDate, aggs: &mut Aggregates) {
             aggs.today_main_raw[s] += raw;
         }
     }
-    let history = if is_sub { &mut aggs.history_sub } else { &mut aggs.history_main };
+    let history = if is_sub {
+        &mut aggs.history_sub
+    } else {
+        &mut aggs.history_main
+    };
     *history.entry((date, slot)).or_insert(0) += weighted;
 }
 
@@ -260,8 +267,18 @@ struct CachedHeatmap {
 
 impl CachedHeatmap {
     fn from_aggregates(aggs: Aggregates) -> Self {
-        let mut main_samples: Vec<u64> = aggs.history_main.values().copied().filter(|n| *n > 0).collect();
-        let mut sub_samples: Vec<u64> = aggs.history_sub.values().copied().filter(|n| *n > 0).collect();
+        let mut main_samples: Vec<u64> = aggs
+            .history_main
+            .values()
+            .copied()
+            .filter(|n| *n > 0)
+            .collect();
+        let mut sub_samples: Vec<u64> = aggs
+            .history_sub
+            .values()
+            .copied()
+            .filter(|n| *n > 0)
+            .collect();
         main_samples.sort_unstable();
         sub_samples.sort_unstable();
         CachedHeatmap {

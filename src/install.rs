@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::oauth;
 
@@ -30,10 +30,7 @@ pub fn run() -> Result<(), String> {
     };
 
     if !settings.is_object() {
-        return Err(format!(
-            "{} is not a JSON object",
-            settings_path.display()
-        ));
+        return Err(format!("{} is not a JSON object", settings_path.display()));
     }
 
     if let Some(existing) = settings
@@ -57,7 +54,12 @@ pub fn run() -> Result<(), String> {
     // Wire the hooks that feed per-session state: Stop (turn finished) and
     // UserPromptSubmit (turn started → "working" in `ccstatus top`).
     ensure_hook(&mut settings, "Stop", "stop", exe_str);
-    ensure_hook(&mut settings, "UserPromptSubmit", "user-prompt-submit", exe_str);
+    ensure_hook(
+        &mut settings,
+        "UserPromptSubmit",
+        "user-prompt-submit",
+        exe_str,
+    );
 
     let pretty = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("serializing settings: {e}"))?;
@@ -122,7 +124,11 @@ mod tests {
                     .iter()
                     .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
                     .flatten()
-                    .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(str::to_string))
+                    .filter_map(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -159,7 +165,12 @@ mod tests {
     fn different_kinds_coexist() {
         let mut s = json!({});
         ensure_hook(&mut s, "Stop", "stop", "/bin/ccstatus");
-        ensure_hook(&mut s, "UserPromptSubmit", "user-prompt-submit", "/bin/ccstatus");
+        ensure_hook(
+            &mut s,
+            "UserPromptSubmit",
+            "user-prompt-submit",
+            "/bin/ccstatus",
+        );
         assert_eq!(stop_commands(&s), vec!["/bin/ccstatus --hook stop"]);
         assert_eq!(
             s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],

@@ -104,13 +104,16 @@ pub fn build_views(
             let idle_secs = s.last_turn_ts.map(|t| (now - t).max(0));
             let address = pane_index.get(id).cloned();
             // A non-tmux session has no pane; fall back to an OS window target.
-            let window = address.is_none().then(|| {
-                window::target_for(
-                    s.term_program.as_deref(),
-                    s.iterm_session_id.as_deref(),
-                    s.claude_pid,
-                )
-            }).flatten();
+            let window = address
+                .is_none()
+                .then(|| {
+                    window::target_for(
+                        s.term_program.as_deref(),
+                        s.iterm_session_id.as_deref(),
+                        s.claude_pid,
+                    )
+                })
+                .flatten();
             let pane_jumpable = address
                 .as_ref()
                 .map(|a| live_servers.contains(&a.server_id))
@@ -168,9 +171,7 @@ pub fn collect() -> Vec<SessionView> {
 /// only the latest is current. Recency is the freshest of the prompt/turn
 /// timestamps; ties break on session id for determinism. Sessions with no pid
 /// pass through untouched.
-fn dedup_to_current(
-    sessions: HashMap<String, SessionState>,
-) -> HashMap<String, SessionState> {
+fn dedup_to_current(sessions: HashMap<String, SessionState>) -> HashMap<String, SessionState> {
     fn recency(s: &SessionState) -> Option<i64> {
         s.last_prompt_ts.max(s.last_turn_ts)
     }
@@ -293,7 +294,10 @@ mod tests {
     }
 
     fn addr(server: &str, pane: &str) -> PaneAddr {
-        PaneAddr { server_id: server.into(), pane_id: pane.into() }
+        PaneAddr {
+            server_id: server.into(),
+            pane_id: pane.into(),
+        }
     }
 
     /// Build a session with an explicit pid and recency timestamps.
@@ -316,7 +320,10 @@ mod tests {
     fn dedup_keeps_most_recently_active_per_pid() {
         let mut s = HashMap::new();
         // Same pid 100: current conversation (recent prompt) vs an old one.
-        s.insert("current".into(), sess_pid(Some(100), Some(9_999), Some(9_000)));
+        s.insert(
+            "current".into(),
+            sess_pid(Some(100), Some(9_999), Some(9_000)),
+        );
         s.insert("old".into(), sess_pid(Some(100), None, Some(1_000)));
         // A distinct pid survives independently.
         s.insert("other".into(), sess_pid(Some(200), None, Some(5_000)));
@@ -367,11 +374,17 @@ mod tests {
     fn activity_derivation() {
         let now = 10_000;
         // Prompt newer than last turn -> working.
-        assert_eq!(activity(Some(now), Some(now - 50), Some(50)), Activity::Working);
+        assert_eq!(
+            activity(Some(now), Some(now - 50), Some(50)),
+            Activity::Working
+        );
         // Prompt, never completed -> working.
         assert_eq!(activity(Some(now), None, None), Activity::Working);
         // Completed after the prompt, recently -> waiting.
-        assert_eq!(activity(Some(now - 100), Some(now - 10), Some(10)), Activity::Waiting);
+        assert_eq!(
+            activity(Some(now - 100), Some(now - 10), Some(10)),
+            Activity::Waiting
+        );
         // Completed long ago -> idle.
         assert_eq!(
             activity(Some(now - 5000), Some(now - 4000), Some(4000)),
@@ -418,10 +431,7 @@ mod tests {
         // No pane file -> not in tmux, but the iTerm2 window is addressable.
         let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
         assert!(views[0].address.is_none());
-        assert!(matches!(
-            views[0].window,
-            Some(WindowTarget::ITerm2 { .. })
-        ));
+        assert!(matches!(views[0].window, Some(WindowTarget::ITerm2 { .. })));
         assert!(views[0].jumpable);
     }
 
@@ -439,7 +449,13 @@ mod tests {
         live.insert("L".to_string());
 
         let views = build_views(&sessions, &panes, &live, now);
-        let by = |s: &str| views.iter().find(|v| v.claude_session == s).unwrap().clone();
+        let by = |s: &str| {
+            views
+                .iter()
+                .find(|v| v.claude_session == s)
+                .unwrap()
+                .clone()
+        };
         assert!(by("live").jumpable); // pane on a live server
         assert_eq!(by("live").address, Some(addr("L", "%1")));
         assert!(!by("deadsrv").jumpable); // pane, but no live handler

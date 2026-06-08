@@ -143,9 +143,7 @@ return "0""#
     /// Run an AppleScript and report whether it returned our "found" sentinel.
     fn run_osascript(script: &str) -> bool {
         match Command::new("osascript").arg("-e").arg(script).output() {
-            Ok(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim() == "1"
-            }
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == "1",
             _ => false,
         }
     }
@@ -167,7 +165,11 @@ return "0""#
         if t.is_empty() || t == "??" || t == "?" {
             return None;
         }
-        let path = if t.starts_with("/dev/") { t } else { format!("/dev/{t}") };
+        let path = if t.starts_with("/dev/") {
+            t
+        } else {
+            format!("/dev/{t}")
+        };
         let body = path.strip_prefix("/dev/").unwrap_or("");
         let ok = !body.is_empty()
             && body
@@ -191,7 +193,10 @@ mod tests {
 
     #[test]
     fn rejects_guid_with_no_colon_or_bad_chars() {
-        assert_eq!(iterm_session_guid("noseparator"), Some("noseparator".to_string()));
+        assert_eq!(
+            iterm_session_guid("noseparator"),
+            Some("noseparator".to_string())
+        );
         // A value carrying AppleScript-breaking characters is refused.
         assert_eq!(iterm_session_guid("w0t0p0:bad\"quote"), None);
         assert_eq!(iterm_session_guid("w0t0p0:"), None);
