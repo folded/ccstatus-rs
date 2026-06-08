@@ -8,190 +8,318 @@
 //! handler (which lives in the right tmux environment) via
 //! [`crate::ipc::notify_focus`].
 //!
-//! Hand-rolled raw-mode TUI (termios + ANSI), matching the crate's no-TUI-deps
-//! style. The terminal is always restored on exit through an RAII guard.
+//! Built on `ratatui` (with its bundled `crossterm` backend): the `Table`
+//! widget owns column layout, truncation, and selection, and ratatui's
+//! double-buffered renderer owns the redraw — so there's no hand-rolled
+//! cursor/clear/width bookkeeping here.
 
-use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::io::{self, IsTerminal, Stdout};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use crate::color::*;
+use ratatui::Terminal;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::prelude::CrosstermBackend;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Row, Table, TableState};
+use ratatui::Frame;
+
 use crate::fleet::{self, Activity, SessionView};
 use crate::ipc;
 use crate::tmux::{self, Tmux};
 use crate::usage;
+use crate::window;
 
-/// How often the table re-reads the state dir when idle (also the input poll
-/// timeout, so keys stay responsive).
+/// How often the table re-reads the state dir (also the input poll timeout, so
+/// keys stay responsive while we wait for the next refresh).
 const REFRESH: Duration = Duration::from_millis(1500);
 
-pub fn run() -> ExitCode {
-    let stdin = io::stdin();
-    if !is_tty(stdin.as_raw_fd()) {
-        eprintln!("ccstatus top: not a terminal");
-        return ExitCode::FAILURE;
-    }
-    let _raw = match RawMode::enable(stdin.as_raw_fd()) {
-        Some(r) => r,
-        None => {
-            eprintln!("ccstatus top: failed to set raw mode");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut screen = Screen::enter();
+// Truecolor palette, mirroring `crate::color` for the ANSI statusline.
+const C_BLUE: Color = Color::Rgb(0, 153, 255);
+const C_ORANGE: Color = Color::Rgb(255, 176, 85);
+const C_GREEN: Color = Color::Rgb(0, 160, 0);
+const C_CYAN: Color = Color::Rgb(46, 149, 153);
+const C_WHITE: Color = Color::Rgb(220, 220, 220);
+const C_RED: Color = Color::Rgb(255, 85, 85);
+const C_YELLOW: Color = Color::Rgb(230, 200, 0);
 
+fn dim() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
+pub fn run() -> ExitCode {
+    match run_inner() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("ccstatus top: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_inner() -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        return Err(io::Error::other("not a terminal"));
+    }
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    terminal.hide_cursor()?;
+
+    let res = event_loop(&mut terminal);
+
+    // Restore the terminal regardless of how the loop ended.
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    res
+}
+
+fn event_loop(terminal: &mut Term) -> io::Result<()> {
     let my_server = tmux::server_id();
     let mut views = fleet::collect();
-    let mut selected = 0usize;
+    let mut state = TableState::default();
+    state.select(selected_index(0, views.len()));
     let mut last_refresh = Instant::now();
 
     loop {
-        clamp(&mut selected, views.len());
-        screen.draw(&render(&views, selected, my_server.as_deref()));
+        terminal.draw(|f| ui(f, &views, &mut state, my_server.as_deref()))?;
 
-        match read_key(REFRESH) {
-            Some(Key::Quit) => break,
-            Some(Key::Up) => selected = selected.saturating_sub(1),
-            Some(Key::Down) => selected += 1,
-            Some(Key::Jump) => {
-                if let Some(v) = views.get(selected)
-                    && v.jumpable
-                {
-                    jump(v, my_server.as_deref());
-                    break; // jumping switches the client away; nothing to show
+        // Block for input only until the next scheduled refresh.
+        let timeout = REFRESH.saturating_sub(last_refresh.elapsed());
+        if event::poll(timeout)?
+            && let Event::Key(k) = event::read()?
+            && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            match k.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('j') | KeyCode::Down => move_selection(&mut state, &views, 1),
+                KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, &views, -1),
+                KeyCode::Char('r') => {
+                    views = fleet::collect();
+                    last_refresh = Instant::now();
+                    reclamp(&mut state, &views);
                 }
+                KeyCode::Enter => {
+                    if let Some(v) = state.selected().and_then(|i| views.get(i))
+                        && v.jumpable
+                    {
+                        jump(v, my_server.as_deref());
+                        break; // jumping switches the client away; nothing to show
+                    }
+                }
+                _ => {}
             }
-            Some(Key::Refresh) | None => {}
         }
 
-        if read_key_pending() || last_refresh.elapsed() >= REFRESH {
+        if last_refresh.elapsed() >= REFRESH {
             views = fleet::collect();
             last_refresh = Instant::now();
+            reclamp(&mut state, &views);
         }
     }
-    ExitCode::SUCCESS
+    Ok(())
 }
 
-/// Perform the jump. Same server as us → straight through the tmux seam (fast).
-/// Different server (or we're not in tmux) → route through that server's
-/// handler, which runs in the correct tmux environment. No-op for a session
-/// with no pane (a non-tmux Claude — caller gates on `jumpable`).
+/// Perform the jump. In tmux: same server as us → straight through the tmux
+/// seam (fast); a different server (or we're not in tmux) → route through that
+/// server's handler, which runs in the correct tmux environment. Not in tmux:
+/// raise the hosting OS terminal window (iTerm2/Terminal). Caller gates on
+/// `jumpable`, so at least one path applies.
 fn jump(v: &SessionView, my_server: Option<&str>) {
-    let Some(addr) = &v.address else { return };
-    if my_server == Some(addr.server_id.as_str()) {
-        tmux::CliTmux.focus_pane(&addr.pane_id);
-    } else {
-        ipc::notify_focus(&addr.server_id, &addr.pane_id);
+    if let Some(addr) = &v.address {
+        if my_server == Some(addr.server_id.as_str()) {
+            tmux::CliTmux.focus_pane(&addr.pane_id);
+        } else {
+            ipc::notify_focus(&addr.server_id, &addr.pane_id);
+        }
+        return;
+    }
+    if let Some(w) = &v.window {
+        window::focus(w);
     }
 }
 
-fn clamp(selected: &mut usize, len: usize) {
-    if len == 0 {
-        *selected = 0;
-    } else if *selected >= len {
-        *selected = len - 1;
+// ---- selection -----------------------------------------------------------
+
+/// The valid selection for a list of `len` rows given a desired index: `None`
+/// when empty, else clamped into range.
+fn selected_index(want: usize, len: usize) -> Option<usize> {
+    (len > 0).then(|| want.min(len - 1))
+}
+
+fn move_selection(state: &mut TableState, views: &[SessionView], delta: i64) {
+    if views.is_empty() {
+        state.select(None);
+        return;
     }
+    let cur = state.selected().unwrap_or(0) as i64;
+    let next = (cur + delta).clamp(0, views.len() as i64 - 1) as usize;
+    state.select(Some(next));
+}
+
+/// Keep the selection in range after the row set changes under us.
+fn reclamp(state: &mut TableState, views: &[SessionView]) {
+    state.select(selected_index(state.selected().unwrap_or(0), views.len()));
 }
 
 // ---- rendering -----------------------------------------------------------
 
-fn render(views: &[SessionView], selected: usize, my_server: Option<&str>) -> String {
-    let cols = crate::term::columns(100) as usize;
-    let mut out = String::new();
+fn ui(f: &mut Frame, views: &[SessionView], state: &mut TableState, my_server: Option<&str>) {
+    let [header, divider, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(f.area());
 
-    let working = views.iter().filter(|v| v.activity == Activity::Working).count();
-    let waiting = views.iter().filter(|v| v.activity == Activity::Waiting).count();
-    out.push_str(&format!(
-        "{BLUE}ccstatus{RESET} {DIM}·{RESET} {} session(s) {DIM}·{RESET} {GREEN}{working} working{RESET} {DIM}·{RESET} {ORANGE}{waiting} waiting{RESET}{}\r\n",
-        views.len(),
-        usage_header(),
-    ));
-    out.push_str(&format!(
-        "{DIM}{}{RESET}\r\n",
-        "─".repeat(cols.min(80))
-    ));
+    f.render_widget(Paragraph::new(header_line(views)), header);
+    f.render_widget(divider_line(divider), divider);
 
     if views.is_empty() {
-        out.push_str(&format!("{DIM}No live Claude sessions.{RESET}\r\n"));
+        f.render_widget(
+            Paragraph::new(Span::styled("No live Claude sessions.", dim())),
+            body,
+        );
     } else {
-        for (i, v) in views.iter().enumerate() {
-            out.push_str(&row(v, i == selected, my_server, cols));
-            out.push_str("\r\n");
-        }
+        f.render_stateful_widget(table(views, my_server), body, state);
     }
 
-    out.push_str(&format!(
-        "\r\n{DIM}j/k or ↑/↓ move · Enter jump · r refresh · q quit{RESET}\r\n"
-    ));
-    out
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            "j/k or ↑/↓ move · Enter jump · r refresh · q quit",
+            dim(),
+        )),
+        footer,
+    );
+}
+
+fn sep() -> Span<'static> {
+    Span::styled(" · ", dim())
+}
+
+fn header_line(views: &[SessionView]) -> Line<'static> {
+    let working = views.iter().filter(|v| v.activity == Activity::Working).count();
+    let waiting = views.iter().filter(|v| v.activity == Activity::Waiting).count();
+    let mut spans = vec![
+        Span::styled("ccstatus", Style::default().fg(C_BLUE)),
+        sep(),
+        Span::raw(format!("{} session(s)", views.len())),
+        sep(),
+        Span::styled(format!("{working} working"), Style::default().fg(C_GREEN)),
+        sep(),
+        Span::styled(format!("{waiting} waiting"), Style::default().fg(C_ORANGE)),
+    ];
+    spans.extend(usage_spans());
+    Line::from(spans)
 }
 
 /// The account-global usage tail of the header (5h/7d/extra), or empty when no
 /// usage cache exists. Account usage is identical across sessions, so it lives
 /// once in the header rather than per row.
-fn usage_header() -> String {
+fn usage_spans() -> Vec<Span<'static>> {
     let Some(u) = usage::summary() else {
-        return String::new();
+        return Vec::new();
     };
-    let mut s = String::new();
+    let mut spans = Vec::new();
+    let mut pct = |label: &str, p: i64| {
+        spans.push(sep());
+        spans.push(Span::styled(label.to_string(), Style::default().fg(C_WHITE)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!("{p}%"), Style::default().fg(usage_color(p))));
+    };
     if let Some(p) = u.five_hour_pct {
-        s.push_str(&format!(" {DIM}·{RESET} {WHITE}5h{RESET} {}{p}%{RESET}", usage_color(p)));
+        pct("5h", p);
     }
     if let Some(p) = u.seven_day_pct {
-        s.push_str(&format!(" {DIM}·{RESET} {WHITE}7d{RESET} {}{p}%{RESET}", usage_color(p)));
+        pct("7d", p);
     }
     if u.extra_enabled {
-        match (u.extra_used, u.extra_limit) {
-            (Some(used), Some(limit)) if used > 0.0 || limit > 0.0 => s.push_str(&format!(
-                " {DIM}·{RESET} {WHITE}extra{RESET} {GREEN}${used:.2}/${limit:.2}{RESET}"
-            )),
-            _ => s.push_str(&format!(" {DIM}·{RESET} {WHITE}extra{RESET} {GREEN}enabled{RESET}")),
-        }
+        spans.push(sep());
+        spans.push(Span::styled("extra", Style::default().fg(C_WHITE)));
+        spans.push(Span::raw(" "));
+        let tail = match (u.extra_used, u.extra_limit) {
+            (Some(used), Some(limit)) if used > 0.0 || limit > 0.0 => {
+                format!("${used:.2}/${limit:.2}")
+            }
+            _ => "enabled".to_string(),
+        };
+        spans.push(Span::styled(tail, Style::default().fg(C_GREEN)));
     }
-    s
+    spans
 }
 
-fn row(v: &SessionView, selected: bool, my_server: Option<&str>, cols: usize) -> String {
-    let marker = if selected { format!("{BLUE}▶{RESET} ") } else { "  ".to_string() };
-    // Lead status: what the session is doing (the "needs me?" axis).
-    let (label, lcolor) = match v.activity {
-        Activity::Working => ("working", GREEN),
-        Activity::Waiting => ("waiting", ORANGE),
-        Activity::Idle => ("idle", DIM),
-        Activity::Unknown => ("-", DIM),
+fn usage_color(pct: i64) -> Color {
+    match pct {
+        p if p >= 90 => C_RED,
+        p if p >= 70 => C_ORANGE,
+        p if p >= 50 => C_YELLOW,
+        _ => C_GREEN,
+    }
+}
+
+fn divider_line(area: Rect) -> Paragraph<'static> {
+    Paragraph::new(Span::styled("─".repeat(area.width as usize), dim()))
+}
+
+fn table<'a>(views: &'a [SessionView], my_server: Option<&str>) -> Table<'a> {
+    let rows = views.iter().map(|v| session_row(v, my_server));
+    let widths = [
+        Constraint::Length(8),  // activity
+        Constraint::Length(22), // model (longest is "Opus 4.8 (1M context)")
+        Constraint::Length(8),  // ctx N%
+        Constraint::Length(10), // idle <age>
+        Constraint::Min(10),    // cwd; ratatui clips the tail
+        Constraint::Length(13), // note (jumpability) — own column so a long cwd
+                                // can't clip it off ("(not in tmux)" = 13)
+    ];
+    Table::new(rows, widths)
+        .column_spacing(1)
+        .highlight_symbol(Span::styled("▶ ", Style::default().fg(C_BLUE)))
+}
+
+fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>) -> Row<'a> {
+    let activity = match v.activity {
+        Activity::Working => Span::styled("working", Style::default().fg(C_GREEN)),
+        Activity::Waiting => Span::styled("waiting", Style::default().fg(C_ORANGE)),
+        Activity::Idle => Span::styled("idle", dim()),
+        Activity::Unknown => Span::styled("-", dim()),
     };
-    let model = v.model.as_deref().unwrap_or("Claude");
-    let ctx = v
-        .context_pct
-        .map(|p| format!("{p}%"))
-        .unwrap_or_else(|| "-".to_string());
-    let age = v
-        .idle_secs
-        .map(human_age)
-        .unwrap_or_else(|| "-".to_string());
+    let model = Span::styled(v.model.as_deref().unwrap_or("Claude"), Style::default().fg(C_WHITE));
+    let ctx = v.context_pct.map(|p| format!("{p}%")).unwrap_or_else(|| "-".into());
+    let age = v.idle_secs.map(human_age).unwrap_or_else(|| "-".into());
     // `*` = on a different tmux server than us (still jumpable via its handler).
     let here = match &v.address {
-        Some(a) if my_server == Some(a.server_id.as_str()) => "",
-        Some(_) => "*",
-        None => "",
+        Some(a) if my_server != Some(a.server_id.as_str()) => "*",
+        _ => "",
     };
-    let note = match &v.address {
-        None => format!(" {DIM}(not in tmux){RESET}"),
-        Some(_) if !v.jumpable => format!(" {DIM}(no handler){RESET}"),
-        Some(_) => String::new(),
+    let cwd = Span::styled(v.cwd.as_deref().unwrap_or(""), Style::default().fg(C_CYAN));
+    let note = match (&v.address, &v.window) {
+        (Some(_), _) if !v.jumpable => "(no handler)",
+        (Some(_), _) => "",
+        // No tmux pane: jumpable iff we can raise its OS window.
+        (None, Some(_)) => "",
+        (None, None) => "(not in tmux)",
     };
 
-    // Fixed-ish left columns, then cwd fills the rest.
-    let left = format!(
-        "{marker}{lcolor}{label:<8}{RESET}{WHITE}{model:<14}{RESET} {DIM}ctx{RESET} {ctx:<4} {DIM}idle{RESET} {age:<5}{here} "
-    );
-    // Budget the cwd column by terminal width, ignoring ANSI in the estimate.
-    let used = 2 + 8 + 15 + 5 + 5 + 6 + 5 + here.len() + 1;
-    let budget = cols.saturating_sub(used).max(8);
-    let cwd = v.cwd.as_deref().unwrap_or("");
-    let cwd = truncate(cwd, budget);
-    format!("{left}{CYAN}{cwd}{RESET}{note}")
+    Row::new(vec![
+        Line::from(activity),
+        Line::from(model),
+        Line::from(vec![Span::styled("ctx ", dim()), Span::raw(ctx)]),
+        Line::from(vec![Span::styled("idle ", dim()), Span::raw(format!("{age}{here}"))]),
+        Line::from(cwd),
+        Line::styled(note, dim()),
+    ])
 }
 
 fn human_age(secs: i64) -> String {
@@ -204,142 +332,6 @@ fn human_age(secs: i64) -> String {
     } else {
         format!("{}d", secs / 86400)
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".to_string();
-    }
-    let head: String = s.chars().take(max - 1).collect();
-    format!("{head}…")
-}
-
-// ---- terminal handling ---------------------------------------------------
-
-/// Alternate-screen + hidden-cursor guard. Restores on drop.
-struct Screen;
-
-impl Screen {
-    fn enter() -> Self {
-        // Alt screen, clear, hide cursor.
-        print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
-        let _ = io::stdout().flush();
-        Screen
-    }
-
-    fn draw(&mut self, body: &str) {
-        // Home, then clear-to-end-of-screen as we write each line ends with a
-        // CRLF; a final clear-below removes any leftover from a longer frame.
-        let mut out = io::stdout().lock();
-        let _ = write!(out, "\x1b[H{body}\x1b[J");
-        let _ = out.flush();
-    }
-}
-
-impl Drop for Screen {
-    fn drop(&mut self) {
-        // Show cursor, leave alt screen.
-        print!("\x1b[?25h\x1b[?1049l");
-        let _ = io::stdout().flush();
-    }
-}
-
-/// Raw-mode guard over a tty fd. Disables canonical mode and echo so we get
-/// keystrokes immediately; restores the original termios on drop.
-struct RawMode {
-    fd: i32,
-    orig: libc::termios,
-}
-
-impl RawMode {
-    fn enable(fd: i32) -> Option<Self> {
-        let mut term: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
-            return None;
-        }
-        let orig = term;
-        // Keep ISIG (Ctrl-C still aborts; Drop restores either way).
-        term.c_lflag &= !(libc::ICANON | libc::ECHO);
-        term.c_cc[libc::VMIN] = 1;
-        term.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
-            return None;
-        }
-        Some(RawMode { fd, orig })
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
-    }
-}
-
-fn is_tty(fd: i32) -> bool {
-    unsafe { libc::isatty(fd) == 1 }
-}
-
-// ---- input ---------------------------------------------------------------
-
-#[derive(Debug, PartialEq, Eq)]
-enum Key {
-    Up,
-    Down,
-    Jump,
-    Refresh,
-    Quit,
-}
-
-/// Whether stdin has a byte ready right now (zero-timeout poll).
-fn read_key_pending() -> bool {
-    poll_stdin(0)
-}
-
-/// Block up to `timeout` for a keystroke. Returns `None` on timeout (caller
-/// should refresh). Reads the whole burst in one `libc::read` so a multi-byte
-/// escape (e.g. arrow = `ESC [ A`) arrives intact — going through buffered
-/// `io::stdin` would swallow the tail of the sequence and mis-read every arrow
-/// as a lone Esc.
-fn read_key(timeout: Duration) -> Option<Key> {
-    if !poll_stdin(timeout.as_millis() as i32) {
-        return None;
-    }
-    let mut buf = [0u8; 8];
-    let n = unsafe {
-        libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
-    if n <= 0 {
-        return Some(Key::Quit); // EOF / error
-    }
-    Some(decode(&buf[..n as usize]))
-}
-
-/// Decode a raw input burst into a key. Pure, so the escape handling is
-/// testable. A lone `Esc` quits; `Esc [ A/B` is an arrow.
-fn decode(b: &[u8]) -> Key {
-    match b {
-        [b'q', ..] => Key::Quit,
-        [b'j', ..] => Key::Down,
-        [b'k', ..] => Key::Up,
-        [b'r', ..] => Key::Refresh,
-        [b'\r', ..] | [b'\n', ..] => Key::Jump,
-        [0x1b, b'[', b'A', ..] => Key::Up,
-        [0x1b, b'[', b'B', ..] => Key::Down,
-        [0x1b] => Key::Quit,
-        _ => Key::Refresh,
-    }
-}
-
-fn poll_stdin(timeout_ms: i32) -> bool {
-    let mut fds = [libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN,
-        revents: 0,
-    }];
-    unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) > 0 && (fds[0].revents & libc::POLLIN) != 0 }
 }
 
 #[cfg(test)]
@@ -355,35 +347,69 @@ mod tests {
     }
 
     #[test]
-    fn truncate_adds_ellipsis() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("abcdefgh", 4), "abc…");
-        assert_eq!(truncate("x", 1), "x");
+    fn selection_clamps_to_row_count() {
+        assert_eq!(selected_index(0, 0), None);
+        assert_eq!(selected_index(5, 0), None);
+        assert_eq!(selected_index(5, 3), Some(2));
+        assert_eq!(selected_index(1, 3), Some(1));
     }
 
     #[test]
-    fn decode_arrows_and_keys() {
-        assert_eq!(decode(b"q"), Key::Quit);
-        assert_eq!(decode(b"j"), Key::Down);
-        assert_eq!(decode(b"k"), Key::Up);
-        assert_eq!(decode(b"r"), Key::Refresh);
-        assert_eq!(decode(b"\r"), Key::Jump);
-        assert_eq!(decode(b"\n"), Key::Jump);
-        // Arrow escape sequences arrive as one burst.
-        assert_eq!(decode(&[0x1b, b'[', b'A']), Key::Up);
-        assert_eq!(decode(&[0x1b, b'[', b'B']), Key::Down);
-        // Lone Esc quits; an unknown escape just refreshes.
-        assert_eq!(decode(&[0x1b]), Key::Quit);
-        assert_eq!(decode(&[0x1b, b'[', b'C']), Key::Refresh);
+    fn usage_color_thresholds() {
+        assert_eq!(usage_color(95), C_RED);
+        assert_eq!(usage_color(75), C_ORANGE);
+        assert_eq!(usage_color(55), C_YELLOW);
+        assert_eq!(usage_color(10), C_GREEN);
     }
 
+    fn view(cwd: &str, address: Option<crate::fleet::PaneAddr>, jumpable: bool) -> SessionView {
+        SessionView {
+            claude_session: "s".into(),
+            model: Some("Opus 4.8 (1M context)".into()),
+            cwd: Some(cwd.into()),
+            context_pct: Some(7),
+            activity: Activity::Waiting,
+            idle_secs: Some(42),
+            address,
+            window: None,
+            jumpable,
+        }
+    }
+
+    /// Render one frame to ratatui's test backend and read the cells back as
+    /// text: confirms the header, the row, and the not-in-tmux note all land,
+    /// and (the bug that started this) that the long cwd is clipped to the
+    /// table width rather than overrunning it.
     #[test]
-    fn clamp_keeps_selection_in_range() {
-        let mut s = 5;
-        clamp(&mut s, 3);
-        assert_eq!(s, 2);
-        let mut s = 5;
-        clamp(&mut s, 0);
-        assert_eq!(s, 0);
+    fn renders_header_row_and_clips_cwd() {
+        use ratatui::backend::TestBackend;
+
+        let long = "/Users/tjs/populationgenomics/metamist/.claude/worktrees/some-very-long-branch";
+        let views = vec![view(long, None, false)];
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        let mut state = TableState::default();
+        state.select(Some(0));
+        term.draw(|f| ui(f, &views, &mut state, None)).unwrap();
+
+        let buf = term.backend().buffer();
+        let mut lines: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            lines.push(s.trim_end().to_string());
+        }
+        let text = lines.join("\n");
+
+        assert!(text.contains("ccstatus"), "header missing:\n{text}");
+        assert!(text.contains("1 session(s)"), "count missing:\n{text}");
+        assert!(text.contains("▶"), "selection marker missing:\n{text}");
+        assert!(text.contains("waiting"), "activity missing:\n{text}");
+        assert!(text.contains("(not in tmux)"), "note missing:\n{text}");
+        // No physical line exceeds the 80-col terminal.
+        for l in &lines {
+            assert!(l.chars().count() <= 80, "line over width: {l:?}");
+        }
     }
 }

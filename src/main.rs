@@ -21,6 +21,7 @@ mod tmux;
 mod top;
 mod usage;
 mod util;
+mod window;
 
 use std::collections::HashMap;
 use std::env;
@@ -181,14 +182,16 @@ fn register_pane(
     Some(session_id)
 }
 
-/// Walk up the process tree from our parent until `comm` matches `claude`,
-/// then return that pid. Falls back to `$PPID` after a bounded number of
-/// hops. Bound prevents pathological loops on weird systems.
+/// Walk up the process tree from our parent until we hit an *interactive*
+/// Claude session process (not the shared daemon or a `--bg-*` helper — see
+/// [`util::is_interactive_claude`]), then return that pid. Binding to the
+/// daemon would make the session immortal in the fleet. Falls back to `$PPID`
+/// after a bounded number of hops; the bound prevents pathological loops.
 fn resolve_claude_pid() -> u32 {
     let ppid = unsafe { libc::getppid() } as u32;
     let mut pid = ppid;
     for _ in 0..8 {
-        if process_is_claude(pid) {
+        if util::is_interactive_claude(pid) {
             return pid;
         }
         match parent_of(pid) {
@@ -197,14 +200,6 @@ fn resolve_claude_pid() -> u32 {
         }
     }
     ppid
-}
-
-fn process_is_claude(pid: u32) -> bool {
-    let Some(comm) = ps_field(pid, "comm=") else {
-        return false;
-    };
-    let leaf = comm.rsplit('/').next().unwrap_or(&comm);
-    leaf == "claude" || leaf.starts_with("claude-") || leaf.starts_with("claude ")
 }
 
 fn parent_of(pid: u32) -> Option<u32> {
@@ -260,6 +255,13 @@ fn write_session_presence(input: &Value) {
         s.cwd = Some(cwd.to_string());
     }
     s.claude_pid = Some(resolve_claude_pid());
+    // Terminal identity for a non-tmux window jump. Constant for the process,
+    // so this only contributes to the first write and never churns after.
+    s.term_program = env::var("TERM_PROGRAM").ok().filter(|v| !v.is_empty()).or(s.term_program);
+    s.iterm_session_id = env::var("ITERM_SESSION_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or(s.iterm_session_id);
 
     let usage = input.pointer("/context_window/current_usage");
     let size = input

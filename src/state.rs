@@ -67,6 +67,12 @@ pub struct SessionState {
     /// The Claude process pid (presence) — the fleet's liveness anchor for
     /// sessions with no pane file (i.e. outside tmux).
     pub claude_pid: Option<u32>,
+    /// `TERM_PROGRAM` of the hosting terminal (`iTerm.app`, `Apple_Terminal`,
+    /// `tmux`, …). Lets the fleet raise the OS window for a non-tmux Claude.
+    pub term_program: Option<String>,
+    /// `ITERM_SESSION_ID` (`wNtNpN:GUID`) when hosted directly in iTerm2 — the
+    /// addressable handle for an iTerm2 window jump (see [`crate::window`]).
+    pub iterm_session_id: Option<String>,
 }
 
 pub fn pane_path(server_id: &str, pane_id: &str) -> PathBuf {
@@ -151,6 +157,14 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
             .get("claude_pid")
             .and_then(|x| x.as_u64())
             .and_then(|n| u32::try_from(n).ok()),
+        term_program: v
+            .get("term_program")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        iterm_session_id: v
+            .get("iterm_session_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -164,6 +178,8 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
         "cache_read_pct": s.cache_read_pct,
         "cwd": s.cwd,
         "claude_pid": s.claude_pid,
+        "term_program": s.term_program,
+        "iterm_session_id": s.iterm_session_id,
     });
     cache::write_atomic(&session_path(session_id), &v.to_string())
 }

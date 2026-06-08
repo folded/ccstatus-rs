@@ -23,7 +23,8 @@ use std::os::unix::net::UnixStream;
 
 use crate::cache;
 use crate::state::{self, SessionState};
-use crate::util::{now_unix, pid_alive};
+use crate::util::{is_interactive_claude, now_unix, pid_alive};
+use crate::window::{self, WindowTarget};
 
 /// How long after a turn completes a session is still "waiting for you"
 /// before it's considered idle (you've moved on).
@@ -79,7 +80,12 @@ pub struct SessionView {
     pub idle_secs: Option<i64>,
     /// The tmux pane backing this session, or `None` for a non-tmux Claude.
     pub address: Option<PaneAddr>,
-    /// Addressable *and* a handler is live on its server, so a jump can land.
+    /// The OS terminal window backing a *non-tmux* Claude (iTerm2/Terminal on
+    /// macOS), or `None` when there's no addressable window. Mutually exclusive
+    /// with `address` in practice — a session is in tmux or it isn't.
+    pub window: Option<WindowTarget>,
+    /// A jump can land: a pane on a live-handler server, or an addressable
+    /// non-tmux window.
     pub jumpable: bool,
 }
 
@@ -97,10 +103,19 @@ pub fn build_views(
         .map(|(id, s)| {
             let idle_secs = s.last_turn_ts.map(|t| (now - t).max(0));
             let address = pane_index.get(id).cloned();
-            let jumpable = address
+            // A non-tmux session has no pane; fall back to an OS window target.
+            let window = address.is_none().then(|| {
+                window::target_for(
+                    s.term_program.as_deref(),
+                    s.iterm_session_id.as_deref(),
+                    s.claude_pid,
+                )
+            }).flatten();
+            let pane_jumpable = address
                 .as_ref()
                 .map(|a| live_servers.contains(&a.server_id))
                 .unwrap_or(false);
+            let jumpable = pane_jumpable || window.is_some();
             SessionView {
                 claude_session: id.clone(),
                 model: s.model.clone(),
@@ -109,6 +124,7 @@ pub fn build_views(
                 activity: activity(s.last_prompt_ts, s.last_turn_ts, idle_secs),
                 idle_secs,
                 address,
+                window,
                 jumpable,
             }
         })
@@ -124,16 +140,62 @@ pub fn build_views(
 }
 
 /// IO shell: read every session presence record, drop those whose Claude
-/// process has exited, attach pane addressing, probe handler liveness, and
+/// process has exited (or whose recorded pid is the shared daemon / a `--bg-*`
+/// helper rather than a live interactive session), collapse prior conversations
+/// of the same process, attach pane addressing, probe handler liveness, and
 /// fold into [`SessionView`]s.
 pub fn collect() -> Vec<SessionView> {
     let sessions: HashMap<String, SessionState> = read_sessions()
         .into_iter()
-        .filter(|(_, s)| s.claude_pid.map(pid_alive).unwrap_or(false))
+        // `pid_alive` is a cheap syscall; `is_interactive_claude` spawns `ps`,
+        // so gate it behind the liveness check (and short-circuit on dead pids).
+        .filter(|(_, s)| {
+            s.claude_pid
+                .is_some_and(|p| pid_alive(p) && is_interactive_claude(p))
+        })
         .collect();
+    let sessions = dedup_to_current(sessions);
     let pane_index = read_pane_index();
     let live_servers = live_servers();
     build_views(&sessions, &pane_index, &live_servers, now_unix())
+}
+
+/// Pure: collapse sessions that share a `claude_pid` down to the most
+/// recently active one. A Claude process hosts conversations *sequentially*
+/// (start one, `/clear` or resume into another), and every conversation writes
+/// its own session file stamped with that process's pid — so several live
+/// session files with the same pid are prior conversations of one process, and
+/// only the latest is current. Recency is the freshest of the prompt/turn
+/// timestamps; ties break on session id for determinism. Sessions with no pid
+/// pass through untouched.
+fn dedup_to_current(
+    sessions: HashMap<String, SessionState>,
+) -> HashMap<String, SessionState> {
+    fn recency(s: &SessionState) -> Option<i64> {
+        s.last_prompt_ts.max(s.last_turn_ts)
+    }
+    let mut best: HashMap<u32, (String, SessionState)> = HashMap::new();
+    let mut out: HashMap<String, SessionState> = HashMap::new();
+    for (id, s) in sessions {
+        let Some(pid) = s.claude_pid else {
+            out.insert(id, s);
+            continue;
+        };
+        let wins = match best.get(&pid) {
+            None => true,
+            Some((cur_id, cur)) => {
+                let (rs, rc) = (recency(&s), recency(cur));
+                rs > rc || (rs == rc && id < *cur_id)
+            }
+        };
+        if wins {
+            best.insert(pid, (id, s));
+        }
+    }
+    for (_, (id, s)) in best {
+        out.insert(id, s);
+    }
+    out
 }
 
 /// Map each session id to its tmux pane address, from `pane/<server>/<pane>`
@@ -225,11 +287,55 @@ mod tests {
             cache_read_pct: None,
             cwd: None,
             claude_pid: Some(1234),
+            term_program: None,
+            iterm_session_id: None,
         }
     }
 
     fn addr(server: &str, pane: &str) -> PaneAddr {
         PaneAddr { server_id: server.into(), pane_id: pane.into() }
+    }
+
+    /// Build a session with an explicit pid and recency timestamps.
+    fn sess_pid(pid: Option<u32>, prompt: Option<i64>, turn: Option<i64>) -> SessionState {
+        SessionState {
+            last_turn_ts: turn,
+            last_prompt_ts: prompt,
+            model: None,
+            turn_count: 0,
+            context_pct_used: None,
+            cache_read_pct: None,
+            cwd: None,
+            claude_pid: pid,
+            term_program: None,
+            iterm_session_id: None,
+        }
+    }
+
+    #[test]
+    fn dedup_keeps_most_recently_active_per_pid() {
+        let mut s = HashMap::new();
+        // Same pid 100: current conversation (recent prompt) vs an old one.
+        s.insert("current".into(), sess_pid(Some(100), Some(9_999), Some(9_000)));
+        s.insert("old".into(), sess_pid(Some(100), None, Some(1_000)));
+        // A distinct pid survives independently.
+        s.insert("other".into(), sess_pid(Some(200), None, Some(5_000)));
+        let out = dedup_to_current(s);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains_key("current"));
+        assert!(out.contains_key("other"));
+        assert!(!out.contains_key("old"));
+    }
+
+    #[test]
+    fn dedup_breaks_recency_ties_on_id() {
+        let mut s = HashMap::new();
+        // Same pid, neither has any timestamp -> tie -> smaller id wins.
+        s.insert("bbb".into(), sess_pid(Some(7), None, None));
+        s.insert("aaa".into(), sess_pid(Some(7), None, None));
+        let out = dedup_to_current(s);
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("aaa"));
     }
 
     #[test]
@@ -293,10 +399,30 @@ mod tests {
         let now = 10_000;
         let mut sessions = HashMap::new();
         sessions.insert("s".to_string(), session(Some(now), None, None));
-        // No pane file for it -> not in tmux.
+        // No pane file, no addressable terminal -> not jumpable.
         let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
         assert!(views[0].address.is_none());
+        assert!(views[0].window.is_none());
         assert!(!views[0].jumpable);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn non_tmux_iterm_session_is_window_jumpable() {
+        let now = 10_000;
+        let mut s = session(Some(now), None, None);
+        s.term_program = Some("iTerm.app".into());
+        s.iterm_session_id = Some("w0t0p0:CD4CA6CF-3A9C-464A-B736-B13BFEC9452C".into());
+        let mut sessions = HashMap::new();
+        sessions.insert("s".to_string(), s);
+        // No pane file -> not in tmux, but the iTerm2 window is addressable.
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        assert!(views[0].address.is_none());
+        assert!(matches!(
+            views[0].window,
+            Some(WindowTarget::ITerm2 { .. })
+        ));
+        assert!(views[0].jumpable);
     }
 
     #[test]
