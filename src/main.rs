@@ -285,11 +285,7 @@ fn write_session_presence(input: &Value) {
     let current = input_tokens + cache_create + cache_read;
     s.context_pct_used = Some((current * 100 / size).min(100) as u32);
     let denom = input_tokens + cache_create + cache_read;
-    s.cache_read_pct = Some(if denom > 0 {
-        (cache_read * 100 / denom) as u32
-    } else {
-        0
-    });
+    s.cache_read_pct = Some((cache_read * 100).checked_div(denom).unwrap_or(0) as u32);
 
     if s == before {
         return;
@@ -379,11 +375,7 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     if cfg.tokens {
         let cache_pct = {
             let denom = input_tokens + cache_create + cache_read;
-            if denom > 0 {
-                (cache_read * 100 / denom) as i64
-            } else {
-                0
-            }
+            (cache_read * 100).checked_div(denom).unwrap_or(0) as i64
         };
         let cache_color = match cache_pct {
             p if p >= 80 => GREEN,
@@ -392,11 +384,7 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
         };
         let sub_pct: Option<i64> = heatmap_result.as_ref().and_then(|r| {
             let total = r.today_main_raw + r.today_sub_raw;
-            if total == 0 {
-                None
-            } else {
-                Some((r.today_sub_raw * 100 / total) as i64)
-            }
+            (r.today_sub_raw * 100).checked_div(total).map(|v| v as i64)
         });
         let mut s = format!(
             "{ORANGE}{used_str}/{total_str}{RESET} {DIM}({RESET}{GREEN}{pct_used}%{RESET} {DIM}·{RESET} {WHITE}cache{RESET} {cache_color}{cache_pct}%{RESET}"

@@ -241,11 +241,14 @@ impl Routing {
 /// terminal window. It receives the Claude pid as `$CCSTATUS_CLAUDE_PID` and
 /// as its first argument. `None` falls back to ccstatus's bundled best-effort
 /// X11 default — set this to support a Wayland compositor or another emulator.
+/// Only consumed by the Linux jump path (`window::focus`); dead elsewhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn jump_command() -> Option<String> {
     jump_command_from(read_config().as_ref())
 }
 
 /// Pure core of [`jump_command`]: pull `jump.linux` from a parsed config.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn jump_command_from(v: Option<&Value>) -> Option<String> {
     v?.get("jump")?
         .get("linux")?
