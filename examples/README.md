@@ -90,8 +90,24 @@ can't be repainted — dedicated rows and Claude's lines can.
 
 ## Elements
 
-`model`, `cwd`, `tokens`, `effort`, `limits`, `version`, `updates`,
-`warmth`, `heatmap_main`, `heatmap_sub`.
+Use these names in a region's element list.
+
+| element | shows |
+|---------|-------|
+| `model` | the (shortened) model display name, e.g. `Opus 4.8` |
+| `cwd` | current directory basename, with git branch and `+added -deleted` counts |
+| `tokens` | context usage: `used/total (pct% · cache hit% · sub-agent%)` |
+| `effort` | reasoning effort level (`low`/`med`/`high`/`xhigh`/`max`) |
+| `limits` | rate-limit windows (5h / 7d usage % and reset times) |
+| `version` | installed Claude CLI version |
+| `updates` | a notice when a newer ccstatus release is available |
+| `warmth` | prompt-cache warm/cold pip — **live** (see the note above) |
+| `heatmap_main` | activity heatmap of main-agent token usage — **full-width row** |
+| `heatmap_sub` | activity heatmap of sub-agent token usage — **full-width row** |
+
+The two heatmaps are full-width: they ignore `left`/`right` and take the whole
+line they're placed on. Everything else is an inline segment that joins its
+region's siblings with ` | `.
 
 ## Jumping to a non-tmux session (Linux)
 
