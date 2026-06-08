@@ -85,9 +85,16 @@ pub fn ansi_to_tmux(input: &str) -> String {
             i += 1;
             continue;
         }
+        // tmux expands status strings through strftime, so a literal `%` is a
+        // date specifier (eaten, or `%H`/`%m`/… inject the time). Double it.
+        if b == b'%' {
+            out.push_str("%%");
+            i += 1;
+            continue;
+        }
         let start = i;
         i += 1;
-        while i < bytes.len() && bytes[i] != 0x1b && bytes[i] != b'#' {
+        while i < bytes.len() && bytes[i] != 0x1b && bytes[i] != b'#' && bytes[i] != b'%' {
             i += 1;
         }
         out.push_str(&input[start..i]);
@@ -165,6 +172,13 @@ mod tests {
     #[test]
     fn ansi_escapes_literal_hash() {
         assert_eq!(ansi_to_tmux("turn #42"), "turn ##42");
+    }
+
+    #[test]
+    fn ansi_escapes_literal_percent() {
+        // tmux strftime-expands status strings, so % must be doubled.
+        assert_eq!(ansi_to_tmux("22% cache"), "22%% cache");
+        assert_eq!(ansi_to_tmux("\x1b[2m100%\x1b[0m"), "#[dim]100%%#[default]");
     }
 
     #[test]
