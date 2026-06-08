@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu is the cross-platform guard: it compiles every cfg path,
+        # including the non-macOS `window::focus` stub and the Linux branch of
+        # `window::target_for`. macos exercises the osascript path and the
+        # macOS-only tests.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Compiles the binary, all tests, and every target for this OS — this is
+      # the check that catches a `cfg` mistake breaking the other platform.
+      - run: cargo check --all-targets
+      - run: cargo test
+      # Informational: the repo has pre-existing lints, so don't fail on them.
+      - run: cargo clippy --all-targets || true
