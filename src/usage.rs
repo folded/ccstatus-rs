@@ -110,11 +110,11 @@ fn load_usage(input: &Value, config_dir: &str) -> Option<String> {
         // Stampede guard: touch first so concurrent renders see a fresh
         // mtime and skip the fetch, then fetch and write the body.
         let _ = cache::touch(&cache_path);
-        if let Some(token) = oauth::get_oauth_token(config_dir) {
-            if let Some(body) = api::fetch_usage(&token) {
-                let _ = cache::write_atomic(&cache_path, &body);
-                usage_data = Some(body);
-            }
+        if let Some(token) = oauth::get_oauth_token(config_dir)
+            && let Some(body) = api::fetch_usage(&token)
+        {
+            let _ = cache::write_atomic(&cache_path, &body);
+            usage_data = Some(body);
         }
         cache::remove_if_empty(&cache_path);
         if usage_data.is_none() {
@@ -149,10 +149,10 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
             let c = usage_color(p);
             out.push_str(&sep);
             push_fmt(&mut out, format_args!("{WHITE}5h{RESET} {c}{p}%{RESET}"));
-            if let Some(epoch) = builtin_5h_reset.and_then(value_as_epoch) {
-                if let Some(s) = format_local(epoch, "%H:%M") {
-                    push_fmt(&mut out, format_args!(" {DIM}@{s}{RESET}"));
-                }
+            if let Some(epoch) = builtin_5h_reset.and_then(value_as_epoch)
+                && let Some(s) = format_local(epoch, "%H:%M")
+            {
+                push_fmt(&mut out, format_args!(" {DIM}@{s}{RESET}"));
             }
         }
         if let Some(pct) = builtin_7d_pct.and_then(|v| v.as_f64()) {
@@ -160,59 +160,59 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
             let c = usage_color(p);
             out.push_str(&sep);
             push_fmt(&mut out, format_args!("{WHITE}7d{RESET} {c}{p}%{RESET}"));
-            if let Some(epoch) = builtin_7d_reset.and_then(value_as_epoch) {
-                if let Some(s) = format_local(epoch, "%a %b %-d, %H:%M") {
-                    push_fmt(&mut out, format_args!(" {DIM}@{s}{RESET}"));
-                }
+            if let Some(epoch) = builtin_7d_reset.and_then(value_as_epoch)
+                && let Some(s) = format_local(epoch, "%a %b %-d, %H:%M")
+            {
+                push_fmt(&mut out, format_args!(" {DIM}@{s}{RESET}"));
             }
         }
         if let Some(data) = usage_json {
             render_extra_usage(data, &sep, &mut out);
         }
     } else if let Some(data) = usage_json {
-        if let Ok(v) = serde_json::from_str::<Value>(data) {
-            if v.get("five_hour").is_some() {
-                let pct_5h = v
-                    .pointer("/five_hour/utilization")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(0.0)
-                    .round() as i64;
-                let iso_5h = v.pointer("/five_hour/resets_at").and_then(|x| x.as_str());
-                let c = usage_color(pct_5h);
-                out.push_str(&sep);
-                push_fmt(
-                    &mut out,
-                    format_args!("{WHITE}5h{RESET} {c}{pct_5h}%{RESET}"),
-                );
-                if let Some(reset) = iso_5h
-                    .and_then(iso_to_epoch)
-                    .and_then(|e| format_local(e, "%H:%M"))
-                {
-                    push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
-                }
-
-                let pct_7d = v
-                    .pointer("/seven_day/utilization")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(0.0)
-                    .round() as i64;
-                let iso_7d = v.pointer("/seven_day/resets_at").and_then(|x| x.as_str());
-                let c7 = usage_color(pct_7d);
-                out.push_str(&sep);
-                push_fmt(
-                    &mut out,
-                    format_args!("{WHITE}7d{RESET} {c7}{pct_7d}%{RESET}"),
-                );
-                if let Some(reset) = iso_7d
-                    .and_then(iso_to_epoch)
-                    .and_then(|e| format_local(e, "%a %b %-d, %H:%M"))
-                {
-                    push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
-                }
-
-                render_extra_usage(data, &sep, &mut out);
-                return out;
+        if let Ok(v) = serde_json::from_str::<Value>(data)
+            && v.get("five_hour").is_some()
+        {
+            let pct_5h = v
+                .pointer("/five_hour/utilization")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0)
+                .round() as i64;
+            let iso_5h = v.pointer("/five_hour/resets_at").and_then(|x| x.as_str());
+            let c = usage_color(pct_5h);
+            out.push_str(&sep);
+            push_fmt(
+                &mut out,
+                format_args!("{WHITE}5h{RESET} {c}{pct_5h}%{RESET}"),
+            );
+            if let Some(reset) = iso_5h
+                .and_then(iso_to_epoch)
+                .and_then(|e| format_local(e, "%H:%M"))
+            {
+                push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
             }
+
+            let pct_7d = v
+                .pointer("/seven_day/utilization")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0)
+                .round() as i64;
+            let iso_7d = v.pointer("/seven_day/resets_at").and_then(|x| x.as_str());
+            let c7 = usage_color(pct_7d);
+            out.push_str(&sep);
+            push_fmt(
+                &mut out,
+                format_args!("{WHITE}7d{RESET} {c7}{pct_7d}%{RESET}"),
+            );
+            if let Some(reset) = iso_7d
+                .and_then(iso_to_epoch)
+                .and_then(|e| format_local(e, "%a %b %-d, %H:%M"))
+            {
+                push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
+            }
+
+            render_extra_usage(data, &sep, &mut out);
+            return out;
         }
         push_unknown(&mut out, &sep);
     } else {

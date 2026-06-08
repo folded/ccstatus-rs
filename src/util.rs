@@ -72,10 +72,10 @@ fn ps_command(pid: u32) -> Option<String> {
 /// `session_id` top-level field; falls back to the basename (without
 /// extension) of `transcript_path` so older / leaner payloads still work.
 pub fn resolve_session_id(input: &Value) -> Option<String> {
-    if let Some(s) = input.get("session_id").and_then(|v| v.as_str()) {
-        if !s.is_empty() {
-            return Some(s.to_string());
-        }
+    if let Some(s) = input.get("session_id").and_then(|v| v.as_str())
+        && !s.is_empty()
+    {
+        return Some(s.to_string());
     }
     let path = input.get("transcript_path").and_then(|v| v.as_str())?;
     let basename = path.rsplit('/').next()?;

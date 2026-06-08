@@ -135,12 +135,11 @@ fn project_subdir(cwd: &str) -> PathBuf {
 /// cwd-encoded path (Claude's own naming convention) so isolated invocations
 /// still work.
 fn resolve_project_dir(cwd: &str, transcript_path: Option<&str>) -> Option<PathBuf> {
-    if let Some(t) = transcript_path {
-        if let Some(parent) = PathBuf::from(t).parent() {
-            if parent.exists() {
-                return Some(parent.to_path_buf());
-            }
-        }
+    if let Some(t) = transcript_path
+        && let Some(parent) = PathBuf::from(t).parent()
+        && parent.exists()
+    {
+        return Some(parent.to_path_buf());
     }
     let sub = project_subdir(cwd);
     if sub.exists() { Some(sub) } else { None }
@@ -397,7 +396,7 @@ fn percentile(val: u64, sorted_samples: &[u64]) -> f64 {
 }
 
 fn jet(t: f64) -> (u8, u8, u8) {
-    let clamp = |x: f64| x.max(0.0).min(1.0);
+    let clamp = |x: f64| x.clamp(0.0, 1.0);
     let r = clamp((4.0 * t - 1.5).min(-4.0 * t + 4.5));
     let g = clamp((4.0 * t - 0.5).min(-4.0 * t + 3.5));
     let b = clamp((4.0 * t + 0.5).min(-4.0 * t + 2.5));

@@ -57,10 +57,10 @@ pub fn touch(path: &Path) -> io::Result<()> {
 }
 
 pub fn remove_if_empty(path: &Path) {
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.len() == 0 {
-            let _ = fs::remove_file(path);
-        }
+    if let Ok(meta) = fs::metadata(path)
+        && meta.len() == 0
+    {
+        let _ = fs::remove_file(path);
     }
 }
 

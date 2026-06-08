@@ -30,10 +30,10 @@ pub fn config_dir_hash(dir: &str) -> String {
 /// 3. `<config_dir>/.credentials.json`
 /// 4. GNOME Keyring (`secret-tool`)
 pub fn get_oauth_token(config_dir: &str) -> Option<String> {
-    if let Ok(token) = env::var("CLAUDE_CODE_OAUTH_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
+    if let Ok(token) = env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(token);
     }
 
     if let Some(token) = read_macos_keychain() {

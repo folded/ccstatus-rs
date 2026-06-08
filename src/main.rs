@@ -159,14 +159,13 @@ fn register_pane(
         .map(|(e, c)| (e.key().to_string(), c.clone()))
         .collect();
 
-    if let Some(existing) = state::read_pane(&server_id, pane_id) {
-        if existing.session_id == session_id
-            && existing.claude_pid == claude_pid
-            && existing.elements == element_map
-            && pane_recent(&server_id, pane_id, Duration::from_millis(500))
-        {
-            return Some(session_id);
-        }
+    if let Some(existing) = state::read_pane(&server_id, pane_id)
+        && existing.session_id == session_id
+        && existing.claude_pid == claude_pid
+        && existing.elements == element_map
+        && pane_recent(&server_id, pane_id, Duration::from_millis(500))
+    {
+        return Some(session_id);
     }
 
     let pane_state = PaneState {
@@ -347,15 +346,15 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     if cfg.cwd && !cwd.is_empty() {
         let display_dir = cwd.rsplit('/').next().unwrap_or(cwd);
         let mut s = format!("{CYAN}{display_dir}{RESET}");
-        if cfg.git {
-            if let Some(g) = git::collect(cwd) {
-                s.push_str(&format!("{DIM}@{RESET}{GREEN}{}{RESET}", g.branch));
-                if g.added + g.deleted > 0 {
-                    s.push_str(&format!(
-                        " {DIM}({RESET}{GREEN}+{}{RESET} {RED}-{}{RESET}{DIM}){RESET}",
-                        g.added, g.deleted
-                    ));
-                }
+        if cfg.git
+            && let Some(g) = git::collect(cwd)
+        {
+            s.push_str(&format!("{DIM}@{RESET}{GREEN}{}{RESET}", g.branch));
+            if g.added + g.deleted > 0 {
+                s.push_str(&format!(
+                    " {DIM}({RESET}{GREEN}+{}{RESET} {RED}-{}{RESET}{DIM}){RESET}",
+                    g.added, g.deleted
+                ));
             }
         }
         out.push((E::Cwd, s));
@@ -416,23 +415,23 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
         out.push((E::Effort, format!("effort: {level}")));
     }
 
-    if cfg.limits {
-        if let Some(s) = usage::render(input, &config_dir) {
-            out.push((E::Limits, s));
-        }
+    if cfg.limits
+        && let Some(s) = usage::render(input, &config_dir)
+    {
+        out.push((E::Limits, s));
     }
 
-    if cfg.cli_version {
-        if let Some(v) = cli_version_cached() {
-            out.push((E::Version, format!("{ORANGE}v{v}{RESET}")));
-        }
+    if cfg.cli_version
+        && let Some(v) = cli_version_cached()
+    {
+        out.push((E::Version, format!("{ORANGE}v{v}{RESET}")));
     }
 
-    if cfg.updates {
-        if let Some(line) = update_check_line() {
-            let line = line.strip_prefix('\n').unwrap_or(&line).to_string();
-            out.push((E::Updates, line));
-        }
+    if cfg.updates
+        && let Some(line) = update_check_line()
+    {
+        let line = line.strip_prefix('\n').unwrap_or(&line).to_string();
+        out.push((E::Updates, line));
     }
 
     if let Some(rows) = heatmap_result {
@@ -466,10 +465,10 @@ fn compose_claude(elements: &[(config::Element, String)], routing: &config::Rout
         lines.push(seg_line);
     }
     for e in [Element::HeatmapMain, Element::HeatmapSub] {
-        if routing.dest(e) == Dest::Claude {
-            if let Some(c) = find(e) {
-                lines.push(c.to_string());
-            }
+        if routing.dest(e) == Dest::Claude
+            && let Some(c) = find(e)
+        {
+            lines.push(c.to_string());
         }
     }
     lines.join("\n")
@@ -482,25 +481,23 @@ fn u64_at(v: Option<&Value>, key: &str) -> u64 {
 }
 
 fn resolve_effort(input: &Value, config_dir: &str) -> String {
-    if let Some(s) = input.pointer("/effort/level").and_then(|v| v.as_str()) {
-        if !s.is_empty() {
-            return s.to_string();
-        }
+    if let Some(s) = input.pointer("/effort/level").and_then(|v| v.as_str())
+        && !s.is_empty()
+    {
+        return s.to_string();
     }
-    if let Ok(v) = env::var("CLAUDE_CODE_EFFORT_LEVEL") {
-        if !v.is_empty() {
-            return v;
-        }
+    if let Ok(v) = env::var("CLAUDE_CODE_EFFORT_LEVEL")
+        && !v.is_empty()
+    {
+        return v;
     }
     let settings_path = format!("{config_dir}/settings.json");
-    if let Ok(text) = fs::read_to_string(&settings_path) {
-        if let Ok(v) = serde_json::from_str::<Value>(&text) {
-            if let Some(level) = v.get("effortLevel").and_then(|v| v.as_str()) {
-                if !level.is_empty() {
-                    return level.to_string();
-                }
-            }
-        }
+    if let Ok(text) = fs::read_to_string(&settings_path)
+        && let Ok(v) = serde_json::from_str::<Value>(&text)
+        && let Some(level) = v.get("effortLevel").and_then(|v| v.as_str())
+        && !level.is_empty()
+    {
+        return level.to_string();
     }
     "medium".to_string()
 }

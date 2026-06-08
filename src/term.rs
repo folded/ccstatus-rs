@@ -9,12 +9,11 @@ pub fn columns(default: u16) -> u16 {
     if let Some(n) = tty_cols() {
         return n;
     }
-    if let Ok(v) = env::var("COLUMNS") {
-        if let Ok(n) = v.parse::<u16>() {
-            if n > 0 {
-                return n;
-            }
-        }
+    if let Ok(v) = env::var("COLUMNS")
+        && let Ok(n) = v.parse::<u16>()
+        && n > 0
+    {
+        return n;
     }
     default
 }

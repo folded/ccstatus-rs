@@ -37,13 +37,12 @@ pub fn run() -> Result<(), String> {
         .get("statusLine")
         .and_then(|v| v.get("command"))
         .and_then(|v| v.as_str())
+        && !existing.contains("ccstatus")
     {
-        if !existing.contains("ccstatus") {
-            return Err(format!(
-                "{} already configures statusLine.command = {existing:?}; remove or edit it by hand before re-running --install",
-                settings_path.display()
-            ));
-        }
+        return Err(format!(
+            "{} already configures statusLine.command = {existing:?}; remove or edit it by hand before re-running --install",
+            settings_path.display()
+        ));
     }
 
     settings["statusLine"] = json!({
