@@ -1,7 +1,9 @@
 # Aggregate surfaces & "take me to this Claude"
 
-Status: design. First slice (`ccstatus top` + jump) is scoped as an issue;
-the rest is a roadmap.
+Status: first slice shipped (`ccstatus top` + jump, plus the working/waiting
+state it needed); the rest is a roadmap. The shipped architecture lives in
+`CONTEXT.md` (`top`, `fleet`, `jump`); this doc keeps the motivation and the
+unbuilt surfaces.
 
 ## Motivation
 
@@ -147,11 +149,11 @@ the thread to pull (tty → OS window). Best-effort, pluggable, out of MVP.
 
 ## Data-model gaps (not blockers, but wanted)
 
-- **Working vs. waiting-for-input** — the killer aggregate signal. We have
-  `last_turn_ts` (Stop hook = "just finished → now waiting") but no explicit
-  "currently generating" mark. Would need a turn-*start* hook
-  (UserPromptSubmit) or treating recent renders as activity. Likely a small
-  state addition (`status: working|waiting|idle`).
+- **Working vs. waiting-for-input** — *shipped.* The UserPromptSubmit hook
+  marks "working" on turn start and the Stop hook marks "waiting" on turn end;
+  `ccstatus top` folds these into a `working | waiting | idle` activity column
+  (see `fleet::Activity`). This was the killer aggregate signal called out
+  above.
 - **Cost / cumulative tokens** — per-render context counts exist; no per-session
   running total. `transcript_path` is in pane state, so it's derivable.
 
@@ -164,14 +166,14 @@ Guaranteeing jumpability for every session would mean spawning a lightweight
 "presence" handler regardless of bar routing — a policy decision, not an MVP
 blocker, but the one place "TUI sees it" and "TUI can jump to it" can diverge.
 
-## First slice (scoped as an issue)
+## First slice (shipped)
 
-1. **Read-model module** (`fleet`/`overview`): enumerate the state dir →
-   `Vec<SessionView>` + an account-usage summary. Pure over a filesystem read;
-   testable with fixture dirs.
-2. **`ccstatus top` TUI** on top of it: live table + account header.
-3. **Jump:** `Tmux::focus_pane`, the `focus` IPC verb, daemon dispatch, and the
-   TUI keybinding (same-server direct; cross-server via daemon).
+1. **Read-model module** (`fleet.rs`): enumerate the state dir →
+   `Vec<SessionView>` + an account-usage summary. Pure over a filesystem read
+   (`build_views`), testable with fixture dirs.
+2. **`ccstatus top` TUI** on top of it (`top.rs`): live table + account header.
+3. **Jump:** `Tmux::focus_pane`, the `focus` IPC verb, handler dispatch, and the
+   TUI keybinding (same-server direct; cross-server via the handler).
 
-Follow-ups: menubar/bar emitter (reuse the read model), notifications,
-title/badge surfaces, working-vs-waiting state, cost rollup, presence handler.
+Follow-ups still open: menubar/bar emitter (reuse the read model),
+notifications, title/badge surfaces, cost rollup, presence handler.
