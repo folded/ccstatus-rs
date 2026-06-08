@@ -264,6 +264,14 @@ fn write_session_presence(input: &Value) {
         .ok()
         .filter(|v| !v.is_empty())
         .or(s.iterm_session_id);
+    // The graphical display, for a non-tmux window jump on Linux. Wayland
+    // takes precedence (a session can carry a stale X11 `DISPLAY` under
+    // Wayland). Also constant for the process.
+    s.display = env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var("DISPLAY").ok().filter(|v| !v.is_empty()))
+        .or(s.display);
 
     let usage = input.pointer("/context_window/current_usage");
     let size = input

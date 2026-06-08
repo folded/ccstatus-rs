@@ -5,54 +5,97 @@
 //! the attached client onto the pane, which appears in the window you're already
 //! looking at. A Claude running *directly* in a terminal emulator has no tmux to
 //! switch — the actuator is the emulator's own scripting interface, and it's
-//! per-emulator. This module covers macOS iTerm2 and Terminal.app.
+//! per-platform. This module covers macOS (iTerm2 and Terminal.app) and Linux.
 //!
 //! Addressing comes from the session's presence record (see
 //! [`crate::state::SessionState`]), captured by the registrar from its
 //! environment:
-//! - **iTerm2** — `ITERM_SESSION_ID` is `wNtNpN:GUID`; the GUID is exactly what
-//!   iTerm2's AppleScript `id of session` returns, so we address the session
-//!   directly (stable across tab moves, unlike a tty which can be reused).
-//! - **Terminal.app** — no per-session id, so we match the controlling tty of
-//!   the Claude process (`ps -o tty=`), which equals a Terminal tab's `tty`.
+//! - **iTerm2** (macOS) — `ITERM_SESSION_ID` is `wNtNpN:GUID`; the GUID is
+//!   exactly what iTerm2's AppleScript `id of session` returns, so we address
+//!   the session directly (stable across tab moves, unlike a tty).
+//! - **Terminal.app** (macOS) — no per-session id, so we match the controlling
+//!   tty of the Claude process (`ps -o tty=`), which equals a Terminal tab's
+//!   `tty`.
+//! - **Linux** — there is no portable per-session window handle, so we defer to
+//!   a *jump command* (the user's `jump.linux`, else a bundled best-effort X11
+//!   script) that maps the Claude pid to its terminal window at focus time. A
+//!   session is window-jumpable only when it has a graphical display, so a
+//!   headless/SSH Claude stays correctly non-jumpable.
 //!
-//! Non-macOS builds keep the types but [`focus`] is a no-op and [`target_for`]
-//! yields `None`, so non-tmux sessions stay non-jumpable there.
+//! On any other platform [`focus`] is a no-op and [`target_for`] yields `None`,
+//! so non-tmux sessions stay non-jumpable there.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 /// A non-tmux terminal window/tab hosting a Claude session, addressable for
-/// "raise this window" on macOS. Built purely from presence fields by
-/// [`target_for`]; the tty (an extra `ps`) is resolved lazily in [`focus`],
-/// only when a Terminal.app jump actually fires.
+/// "raise this window". Built purely from presence fields by [`target_for`];
+/// the actual window lookup (an extra `ps`, or the WM query the jump command
+/// runs) is resolved lazily in [`focus`], only when a jump actually fires.
+///
+/// `allow(dead_code)`: which variants are constructed is platform-dependent —
+/// the macOS variants on macOS, [`LinuxWindow`](WindowTarget::LinuxWindow) on
+/// Linux — so each is "unused" on the other platform.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowTarget {
-    /// iTerm2 session, addressed by its stable session GUID.
+    /// iTerm2 session, addressed by its stable session GUID (macOS).
     ITerm2 { session_id: String },
     /// Terminal.app tab, matched by the Claude process's controlling tty
-    /// (resolved at focus time from this pid).
+    /// (resolved at focus time from this pid) (macOS).
     TerminalApp { claude_pid: u32 },
+    /// A Linux terminal window, raised by mapping this pid (or an ancestor —
+    /// the emulator) to its window via the jump command at focus time.
+    LinuxWindow { claude_pid: u32 },
 }
 
 /// Pure: derive a window target from a session's captured terminal identity.
-/// `None` when the terminal is unrecognised (e.g. inside tmux, where
-/// `TERM_PROGRAM` is `tmux`), when iTerm2 left no addressable GUID, or off
-/// macOS. Decides *window-jumpability* without any IO.
+/// `None` when the session isn't window-jumpable: inside tmux (`TERM_PROGRAM`
+/// is `tmux` — jump via `focus_pane` instead), when the terminal is
+/// unrecognised, when iTerm2 left no addressable GUID, when a Linux session has
+/// no graphical display, or on an unsupported OS. Decides *window-jumpability*
+/// without any IO.
 pub fn target_for(
     term_program: Option<&str>,
     iterm_session_id: Option<&str>,
     claude_pid: Option<u32>,
+    display: Option<&str>,
 ) -> Option<WindowTarget> {
-    if !cfg!(target_os = "macos") {
+    // A tmux session is jumped by switching its client (`focus_pane`), never by
+    // raising a window — its `TERM_PROGRAM` is `tmux` on every platform.
+    if term_program == Some("tmux") {
         return None;
     }
-    match term_program {
-        Some("iTerm.app") => {
-            let guid = iterm_session_guid(iterm_session_id?)?;
-            Some(WindowTarget::ITerm2 { session_id: guid })
+    #[cfg(target_os = "macos")]
+    {
+        let _ = display;
+        match term_program {
+            Some("iTerm.app") => {
+                let guid = iterm_session_guid(iterm_session_id?)?;
+                Some(WindowTarget::ITerm2 { session_id: guid })
+            }
+            Some("Apple_Terminal") => {
+                claude_pid.map(|p| WindowTarget::TerminalApp { claude_pid: p })
+            }
+            _ => None,
         }
-        Some("Apple_Terminal") => claude_pid.map(|p| WindowTarget::TerminalApp { claude_pid: p }),
-        _ => None,
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = iterm_session_id;
+        // No portable per-session window handle on Linux; the jump command maps
+        // the pid to its window at focus time. Addressable only with a
+        // graphical display (else there's nothing to raise — headless/SSH).
+        match (claude_pid, display) {
+            (Some(p), Some(d)) if !d.is_empty() => {
+                Some(WindowTarget::LinuxWindow { claude_pid: p })
+            }
+            _ => None,
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (term_program, iterm_session_id, claude_pid, display);
+        None
     }
 }
 
@@ -71,7 +114,10 @@ fn iterm_session_guid(iterm_session_id: &str) -> Option<String> {
 #[cfg(target_os = "macos")]
 pub use macos::focus;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub use linux::focus;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn focus(_target: &WindowTarget) -> bool {
     false
 }
@@ -93,6 +139,8 @@ mod macos {
                 Some(tty) => focus_terminal_app(&tty),
                 None => false,
             },
+            // Not produced on macOS (see `target_for`).
+            WindowTarget::LinuxWindow { .. } => false,
         }
     }
 
@@ -179,6 +227,64 @@ return "0""#
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    use super::WindowTarget;
+    use crate::config;
+
+    /// The bundled best-effort X11 jump, used when the user hasn't set
+    /// `jump.linux`. Piped to `sh` on stdin, so it needs no install step.
+    const DEFAULT_JUMP: &str = include_str!("../examples/jump-linux.sh");
+
+    /// Raise the terminal window hosting the Claude pid by running the jump
+    /// command — the user's `jump.linux` if set, else the bundled X11 default.
+    /// The pid goes through as `$CCSTATUS_CLAUDE_PID` and as the first
+    /// argument; the command maps it (or an ancestor — the emulator) to a
+    /// window and activates it. Best-effort: returns `false` when the command
+    /// finds no tool or matching window, so the jump shows as failed rather
+    /// than erroring.
+    pub fn focus(target: &WindowTarget) -> bool {
+        let WindowTarget::LinuxWindow { claude_pid } = target else {
+            return false;
+        };
+        let pid = claude_pid.to_string();
+        match config::jump_command() {
+            Some(cmd) => run_user_command(&cmd, &pid),
+            None => run_default(&pid),
+        }
+    }
+
+    /// Run a user `jump.linux` command via `sh -c`, with the pid as `$1` (and
+    /// `$CCSTATUS_CLAUDE_PID`).
+    fn run_user_command(cmd: &str, pid: &str) -> bool {
+        Command::new("sh")
+            .args(["-c", cmd, "sh", pid])
+            .env("CCSTATUS_CLAUDE_PID", pid)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Pipe the bundled default script to `sh -s`, with the pid as `$1`.
+    fn run_default(pid: &str) -> bool {
+        let Ok(mut child) = Command::new("sh")
+            .args(["-s", pid])
+            .env("CCSTATUS_CLAUDE_PID", pid)
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(DEFAULT_JUMP.as_bytes());
+        }
+        child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +315,7 @@ mod tests {
             Some("iTerm.app"),
             Some("w0t0p0:CD4CA6CF-3A9C-464A-B736-B13BFEC9452C"),
             Some(123),
+            None,
         );
         assert_eq!(
             t,
@@ -221,7 +328,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn target_for_terminal_uses_pid() {
-        let t = target_for(Some("Apple_Terminal"), None, Some(456));
+        let t = target_for(Some("Apple_Terminal"), None, Some(456), None);
         assert_eq!(t, Some(WindowTarget::TerminalApp { claude_pid: 456 }));
     }
 
@@ -229,9 +336,29 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn target_for_unrecognised_terminal_is_none() {
         // Inside tmux TERM_PROGRAM is "tmux" — not a window we address here.
-        assert_eq!(target_for(Some("tmux"), None, Some(1)), None);
-        assert_eq!(target_for(None, None, Some(1)), None);
+        assert_eq!(target_for(Some("tmux"), None, Some(1), None), None);
+        assert_eq!(target_for(None, None, Some(1), None), None);
         // iTerm with no session id can't be addressed.
-        assert_eq!(target_for(Some("iTerm.app"), None, Some(1)), None);
+        assert_eq!(target_for(Some("iTerm.app"), None, Some(1), None), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn target_for_linux_needs_a_display() {
+        // A non-tmux Claude with a pid and a display is window-jumpable.
+        assert_eq!(
+            target_for(None, None, Some(42), Some(":0")),
+            Some(WindowTarget::LinuxWindow { claude_pid: 42 })
+        );
+        // Wayland display works too; TERM_PROGRAM is irrelevant on Linux.
+        assert_eq!(
+            target_for(Some("foot"), None, Some(7), Some("wayland-1")),
+            Some(WindowTarget::LinuxWindow { claude_pid: 7 })
+        );
+        // No display (headless/SSH), no pid, empty display, or tmux -> none.
+        assert_eq!(target_for(None, None, Some(42), None), None);
+        assert_eq!(target_for(None, None, Some(42), Some("")), None);
+        assert_eq!(target_for(None, None, None, Some(":0")), None);
+        assert_eq!(target_for(Some("tmux"), None, Some(42), Some(":0")), None);
     }
 }

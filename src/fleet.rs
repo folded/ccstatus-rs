@@ -111,6 +111,7 @@ pub fn build_views(
                         s.term_program.as_deref(),
                         s.iterm_session_id.as_deref(),
                         s.claude_pid,
+                        s.display.as_deref(),
                     )
                 })
                 .flatten();
@@ -290,6 +291,7 @@ mod tests {
             claude_pid: Some(1234),
             term_program: None,
             iterm_session_id: None,
+            display: None,
         }
     }
 
@@ -313,6 +315,7 @@ mod tests {
             claude_pid: pid,
             term_program: None,
             iterm_session_id: None,
+            display: None,
         }
     }
 
@@ -432,6 +435,24 @@ mod tests {
         let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
         assert!(views[0].address.is_none());
         assert!(matches!(views[0].window, Some(WindowTarget::ITerm2 { .. })));
+        assert!(views[0].jumpable);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn non_tmux_linux_session_with_display_is_window_jumpable() {
+        let now = 10_000;
+        let mut s = session(Some(now), None, None); // has a pid
+        s.display = Some(":0".into());
+        let mut sessions = HashMap::new();
+        sessions.insert("s".to_string(), s);
+        // No pane file -> not in tmux; the graphical display makes it jumpable.
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        assert!(views[0].address.is_none());
+        assert!(matches!(
+            views[0].window,
+            Some(WindowTarget::LinuxWindow { .. })
+        ));
         assert!(views[0].jumpable);
     }
 

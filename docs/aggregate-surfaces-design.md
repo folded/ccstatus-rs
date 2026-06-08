@@ -157,20 +157,37 @@ session, a quit emulator, or denied macOS Automation permission all fail soft).
 - **Terminal.app** — no per-session id, so matched on the Claude process's
   controlling tty (`ps -o tty=`), which equals a Terminal tab's `tty`.
 
-The presence record carries `term_program` + `iterm_session_id`;
+**Shipped (Linux, `window.rs`):**
+- The presence record carries `display` (`WAYLAND_DISPLAY`, else `DISPLAY`).
+  Linux has no portable per-session window handle, so addressing is deferred to
+  a **jump command** that maps the Claude pid to its terminal window at focus
+  time — the emulator is an *ancestor* of the pid, so the command walks the pid
+  ancestry and asks the window manager which window owns one of them.
+- The default command is a **bundled best-effort X11 script**
+  (`examples/jump-linux.sh`, `include_str!`'d and piped to `sh` — no install
+  step) using `wmctrl`/`xdotool` (EWMH), covering most X11 desktops (GNOME,
+  KDE, XFCE, i3). Users on Wayland or an unusual emulator point the `jump.linux`
+  config key at their own command (e.g. `swaymsg`/`hyprctl`); the pid arrives as
+  `$CCSTATUS_CLAUDE_PID` / `$1`.
+- A session is jumpable only with a graphical `display`, so a headless/SSH
+  Claude stays correctly non-jumpable. Best-effort beyond that.
+
+The presence record carries `term_program` + `iterm_session_id` (+ `display`);
 `window::target_for` turns them into a `WindowTarget` purely (deciding
-window-jumpability with no IO), and `window::focus` does the `osascript`,
-resolving the tty lazily only when a Terminal jump fires. A paneless session is
-jumpable iff it has an addressable window.
+window-jumpability with no IO), and `window::focus` does the actuation —
+`osascript` on macOS (resolving the tty lazily only when a Terminal jump fires),
+the jump command on Linux. A paneless session is jumpable iff it has an
+addressable window.
 
 **Still open:**
 - **Cross-server tmux client window** — `focus_pane` switches a client, but if
   that client is attached in a *different, backgrounded* OS window, raising it
   needs the client tty (`tmux list-clients` → `client_tty`) → OS window. The
   same-window case (you ran `top` in the client being switched) needs nothing.
-- **Other emulators** — kitty/WezTerm/Ghostty remote control; Linux terminals.
-- **Linux** — `target_for` returns `None` off macOS, so non-tmux sessions stay
-  non-jumpable there.
+- **Other emulators** — kitty/WezTerm/Ghostty remote control.
+- **Wayland out of the box** — no generic activate-by-pid protocol, so there's
+  no portable default; covered only via a user `jump.linux` command. GNOME
+  Wayland in particular has no external focus API at all.
 
 ## Data-model gaps (not blockers, but wanted)
 

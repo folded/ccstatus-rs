@@ -73,6 +73,11 @@ pub struct SessionState {
     /// `ITERM_SESSION_ID` (`wNtNpN:GUID`) when hosted directly in iTerm2 — the
     /// addressable handle for an iTerm2 window jump (see [`crate::window`]).
     pub iterm_session_id: Option<String>,
+    /// The graphical display backing the session (`WAYLAND_DISPLAY`, else
+    /// `DISPLAY`), or `None` when there is none (a headless/SSH Claude). On
+    /// Linux this is what makes a non-tmux session window-jumpable: with no
+    /// display there is no window to raise (see [`crate::window`]).
+    pub display: Option<String>,
 }
 
 pub fn pane_path(server_id: &str, pane_id: &str) -> PathBuf {
@@ -159,6 +164,10 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
             .get("iterm_session_id")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        display: v
+            .get("display")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -174,6 +183,7 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
         "claude_pid": s.claude_pid,
         "term_program": s.term_program,
         "iterm_session_id": s.iterm_session_id,
+        "display": s.display,
     });
     cache::write_atomic(&session_path(session_id), &v.to_string())
 }

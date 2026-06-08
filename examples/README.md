@@ -75,3 +75,31 @@ heatmap elements are full-width rows.
 
 `model`, `cwd`, `tokens`, `effort`, `limits`, `version`, `updates`,
 `warmth`, `heatmap_main`, `heatmap_sub`.
+
+## Jumping to a non-tmux session (Linux)
+
+Pressing Enter in `ccstatus top` jumps to the selected session. Inside tmux it
+switches panes; for a Claude running directly in a terminal emulator it raises
+that emulator's OS window.
+
+On Linux the actuator is a **jump command** that maps the Claude pid (or an
+ancestor — the emulator) to its window. With nothing configured, ccstatus runs
+a bundled best-effort **X11** script ([`jump-linux.sh`](./jump-linux.sh)) using
+`wmctrl` or `xdotool` — install one of those and most X11 desktops (GNOME, KDE,
+XFCE, i3) just work.
+
+Wayland has no portable activate-by-pid protocol, so point `jump.linux` at your
+own command. It receives the Claude pid as `$CCSTATUS_CLAUDE_PID` (and as `$1`);
+resolve the emulator pid from the ancestry as the bundled script does:
+
+```json
+{
+  "jump": {
+    "linux": "swaymsg \"[pid=$(ps -o ppid= -p $CCSTATUS_CLAUDE_PID)] focus\""
+  }
+}
+```
+
+A session is only shown as jumpable when it has a graphical display, so a
+headless/SSH Claude stays non-jumpable. Jumps are best-effort: if no tool or
+matching window is found, the jump simply does nothing.

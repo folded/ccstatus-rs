@@ -236,7 +236,25 @@ impl Routing {
     }
 }
 
-fn config_path() -> PathBuf {
+/// The user-configured Linux window-jump command (`jump.linux` in the config
+/// file), run by [`crate::window::focus`] to raise a non-tmux Claude's
+/// terminal window. It receives the Claude pid as `$CCSTATUS_CLAUDE_PID` and
+/// as its first argument. `None` falls back to ccstatus's bundled best-effort
+/// X11 default — set this to support a Wayland compositor or another emulator.
+pub fn jump_command() -> Option<String> {
+    jump_command_from(read_config().as_ref())
+}
+
+/// Pure core of [`jump_command`]: pull `jump.linux` from a parsed config.
+fn jump_command_from(v: Option<&Value>) -> Option<String> {
+    v?.get("jump")?
+        .get("linux")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+pub fn config_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -303,6 +321,18 @@ mod tests {
         assert_eq!(r.dest(Element::Model), Dest::Claude);
         assert_eq!(r.dest(Element::Warmth), Dest::Off);
         assert!(!r.any_tmux());
+    }
+
+    #[test]
+    fn jump_command_reads_linux_key() {
+        let v: Value = serde_json::from_str(r#"{ "jump": { "linux": "myjump $1" } }"#).unwrap();
+        assert_eq!(jump_command_from(Some(&v)).as_deref(), Some("myjump $1"));
+        // Absent section, empty string, and no config all fall back.
+        let empty: Value = serde_json::from_str(r#"{ "route": {} }"#).unwrap();
+        assert_eq!(jump_command_from(Some(&empty)), None);
+        let blank: Value = serde_json::from_str(r#"{ "jump": { "linux": "" } }"#).unwrap();
+        assert_eq!(jump_command_from(Some(&blank)), None);
+        assert_eq!(jump_command_from(None), None);
     }
 
     #[test]

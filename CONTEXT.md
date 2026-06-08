@@ -60,11 +60,16 @@ nouns below are specific to ccstatus.
   (same-server direct; cross-server through that server's **handler** as a
   `focus <pane>` IPC message). Outside tmux, raise its OS terminal window (see
   **window**). See `docs/aggregate-surfaces-design.md`.
-- **window** — the non-tmux jump actuator (`window.rs`, macOS). Raises the
-  hosting terminal emulator's OS window: iTerm2 by session GUID (from
-  `ITERM_SESSION_ID`), Terminal.app by the Claude pid's controlling tty.
-  `target_for` decides window-jumpability purely; `focus` does the `osascript`.
-  Best-effort — a closed session or denied Automation permission fails soft.
+- **window** — the non-tmux jump actuator (`window.rs`). Raises the hosting
+  terminal emulator's OS window. macOS: iTerm2 by session GUID (from
+  `ITERM_SESSION_ID`), Terminal.app by the Claude pid's controlling tty, via
+  `osascript`. Linux: a **jump command** (the user's `jump.linux` config, else
+  a bundled best-effort X11 script piped to `sh`) that maps the Claude pid — or
+  an ancestor, the emulator — to its window via `wmctrl`/`xdotool`; jumpable
+  only with a graphical `display` (so headless/SSH stays non-jumpable).
+  `target_for` decides window-jumpability purely; `focus` runs the actuator.
+  Best-effort — a closed session, denied macOS Automation permission, or a
+  Wayland desktop with no configured command all fail soft.
 
 ## Deepened modules
 

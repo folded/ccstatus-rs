@@ -60,6 +60,12 @@ ccstatus top      Interactive table of every live Claude session, with
                   q quits. "htop for Claude sessions."
 ```
 
+Enter jumps to the selected session: in tmux it switches panes; for a Claude
+running directly in a terminal it raises that emulator's OS window (macOS
+iTerm2/Terminal out of the box; Linux X11 via `wmctrl`/`xdotool`, with a
+`jump.linux` config hook for Wayland or other setups — see
+[`examples/README.md`](examples/README.md)).
+
 Environment variables (overridden by CLI flags):
 
 - `STATUSLINE_HEATMAP=false` — same as `--no-heatmap`
