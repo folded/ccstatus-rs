@@ -95,7 +95,9 @@ Session/pane-local (models 1 & 2):
 ## "Take me to this Claude" (jump)
 
 Jump turns an aggregate surface from a read-only display into an **actuator**:
-select a session → focus its tmux window + pane, wherever it is.
+select a session → bring it to the foreground, wherever it lives. Inside tmux
+that's its window + pane; outside tmux it's the hosting terminal emulator's OS
+window.
 
 ### The daemon is the live addressing authority — no disk schema change
 
@@ -139,13 +141,36 @@ with the daemon.
 - **Graceful failure:** a session with no live daemon → connection refused →
   rendered "not jumpable." Correct by construction.
 
-### Layer 3 (deferred): raise the OS terminal window
+### Layer 3: raise the OS terminal window
 
-Within tmux, `focus_pane` is enough. Bringing the *hosting terminal emulator's*
-OS window to the foreground (needed for a menubar jump, not a TUI-internal one)
-is per-emulator: iTerm2 Python/AppleScript + addressable session GUIDs,
-Terminal.app AppleScript, kitty/wezterm/Ghostty remote control. `pane_tty` is
-the thread to pull (tty → OS window). Best-effort, pluggable, out of MVP.
+Within tmux, `focus_pane` is enough — `switch-client` lands the pane in the
+window you're already looking at. A Claude running *directly* in a terminal
+emulator (no tmux) has no client to switch, so the actuator is the emulator's
+own scripting interface. This is per-emulator and best-effort (a closed
+session, a quit emulator, or denied macOS Automation permission all fail soft).
+
+**Shipped (macOS, `window.rs`):**
+- **iTerm2** — addressed by session GUID. The registrar captures
+  `ITERM_SESSION_ID` (`wNtNpN:GUID`); the GUID is exactly what AppleScript
+  `id of session` returns, so the jump is precise and stable across tab moves
+  (unlike a tty, which can be reused).
+- **Terminal.app** — no per-session id, so matched on the Claude process's
+  controlling tty (`ps -o tty=`), which equals a Terminal tab's `tty`.
+
+The presence record carries `term_program` + `iterm_session_id`;
+`window::target_for` turns them into a `WindowTarget` purely (deciding
+window-jumpability with no IO), and `window::focus` does the `osascript`,
+resolving the tty lazily only when a Terminal jump fires. A paneless session is
+jumpable iff it has an addressable window.
+
+**Still open:**
+- **Cross-server tmux client window** — `focus_pane` switches a client, but if
+  that client is attached in a *different, backgrounded* OS window, raising it
+  needs the client tty (`tmux list-clients` → `client_tty`) → OS window. The
+  same-window case (you ran `top` in the client being switched) needs nothing.
+- **Other emulators** — kitty/WezTerm/Ghostty remote control; Linux terminals.
+- **Linux** — `target_for` returns `None` off macOS, so non-tmux sessions stay
+  non-jumpable there.
 
 ## Data-model gaps (not blockers, but wanted)
 
@@ -173,7 +198,9 @@ blocker, but the one place "TUI sees it" and "TUI can jump to it" can diverge.
    (`build_views`), testable with fixture dirs.
 2. **`ccstatus top` TUI** on top of it (`top.rs`): live table + account header.
 3. **Jump:** `Tmux::focus_pane`, the `focus` IPC verb, handler dispatch, and the
-   TUI keybinding (same-server direct; cross-server via the handler).
+   TUI keybinding (same-server direct; cross-server via the handler). Extended
+   to non-tmux sessions via Layer 3 (iTerm2/Terminal OS-window raise).
 
 Follow-ups still open: menubar/bar emitter (reuse the read model),
-notifications, title/badge surfaces, cost rollup, presence handler.
+notifications, title/badge surfaces, cost rollup, presence handler,
+cross-server tmux client window-raise, more emulators (Layer 3).
