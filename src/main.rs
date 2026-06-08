@@ -458,12 +458,21 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     out
 }
 
+/// Columns Claude Code keeps for itself around the statusline: it indents the
+/// content from the left edge and reserves room on the right for its own
+/// notifications/alerts (undocumented width). Right-aligned content or a
+/// background fill that reaches the true terminal edge is clipped or wraps —
+/// "v2.1.168" truncating to "v2." — so we lay the surface out to `cols - this`.
+/// Empirically ~2 columns on each side.
+const CLAUDE_EDGE_RESERVE: u16 = 4;
+
 /// Compose the lines printed to Claude's own statusline. Claude-routed
 /// elements are grouped by their configured line (ascending); on each line the
 /// inline segments are laid out as a left group and a right group, the right
-/// group padded out to column `cols`, and any full-width row element (heatmap)
-/// follows on its own physical line. When `bg` is set, every physical line is
-/// painted to the full width with that background.
+/// group padded out to the usable right edge (`cols` minus
+/// [`CLAUDE_EDGE_RESERVE`]), and any full-width row element (heatmap) follows on
+/// its own physical line. When `bg` is set, every physical line is painted to
+/// that same usable width with the background.
 fn compose_claude(
     elements: &[(config::Element, String)],
     routing: &config::Routing,
@@ -478,6 +487,9 @@ fn compose_claude(
             .map(|(_, c)| c.as_str())
             .filter(|s| !s.is_empty())
     };
+
+    // The right edge our content can reach without Claude clipping it.
+    let edge = cols.saturating_sub(CLAUDE_EDGE_RESERVE);
 
     let claude = routing.claude_elements();
     let mut line_nums: Vec<u8> = claude.iter().map(|&(_, l, _)| l).collect();
@@ -494,7 +506,7 @@ fn compose_claude(
                     .filter_map(|&(e, _, _)| find(e)),
             )
         };
-        if let Some(line) = compose_claude_line(&group(Align::Left), &group(Align::Right), cols) {
+        if let Some(line) = compose_claude_line(&group(Align::Left), &group(Align::Right), edge) {
             physical.push(line);
         }
         // Full-width row elements (heatmaps) each take their own physical line.
@@ -509,7 +521,7 @@ fn compose_claude(
     }
     if let Some(bg) = bg {
         for line in &mut physical {
-            *line = paint_background(line, cols, bg);
+            *line = paint_background(line, edge, bg);
         }
     }
     physical.join("\n")
@@ -517,31 +529,31 @@ fn compose_claude(
 
 /// Paint a physical line with an explicit background: prefix the colour,
 /// re-assert it after every full reset (`\x1b[0m` would otherwise clear the
-/// background mid-line), pad to the full width so the colour fills the row,
-/// and reset at the end so the terminal background resumes afterwards.
-fn paint_background(line: &str, cols: u16, (r, g, b): (u8, u8, u8)) -> String {
+/// background mid-line), pad to `width` so the colour fills the row, and reset
+/// at the end so the terminal background resumes afterwards.
+fn paint_background(line: &str, width: u16, (r, g, b): (u8, u8, u8)) -> String {
     let prefix = format!("\x1b[48;2;{r};{g};{b}m");
     let body = line.replace(RESET, &format!("{RESET}{prefix}"));
-    let pad = (cols as usize).saturating_sub(render_tmux::visible_width(line));
+    let pad = (width as usize).saturating_sub(render_tmux::visible_width(line));
     format!("{prefix}{body}{}{RESET}", " ".repeat(pad))
 }
 
 /// Lay out one Claude line from its left and right segment groups: pad between
-/// them so the right group ends at column `cols`. Returns `None` when the line
+/// them so the right group ends at column `width`. Returns `None` when the line
 /// is empty.
-fn compose_claude_line(left: &str, right: &str, cols: u16) -> Option<String> {
+fn compose_claude_line(left: &str, right: &str, width: u16) -> Option<String> {
     match (left.is_empty(), right.is_empty()) {
         (true, true) => None,
         (false, true) => Some(left.to_string()),
         (true, false) => {
-            let pad = (cols as usize).saturating_sub(render_tmux::visible_width(right));
+            let pad = (width as usize).saturating_sub(render_tmux::visible_width(right));
             Some(format!("{}{right}", " ".repeat(pad)))
         }
         (false, false) => {
             let used = render_tmux::visible_width(left) + render_tmux::visible_width(right);
             // Keep at least one space so the groups never touch when the line
             // is too narrow to hold both.
-            let pad = (cols as usize).saturating_sub(used).max(1);
+            let pad = (width as usize).saturating_sub(used).max(1);
             Some(format!("{left}{}{right}", " ".repeat(pad)))
         }
     }
@@ -689,11 +701,28 @@ mod tests {
             (Element::Tokens, "T".to_string()),
             (Element::Cwd, "C".to_string()),
         ];
-        let out = compose_claude(&elements, &routing, 10, None);
+        // cols 14 minus the 4-col Claude edge reserve = a usable width of 10.
+        let out = compose_claude(&elements, &routing, 14, None);
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "M        T"); // model left, tokens right at col 10
+        assert_eq!(lines[0], "M        T"); // model left, tokens right at the usable edge (col 10)
         assert_eq!(lines[1], "C"); // line 1, left
+    }
+
+    #[test]
+    fn claude_surface_reserves_the_edge_so_right_content_isnt_clipped() {
+        let routing = Routing::from_pairs(&[(
+            Element::Version,
+            Dest::Claude {
+                line: 0,
+                align: Align::Right,
+            },
+        )]);
+        let elements = vec![(Element::Version, "v2.1.168".to_string())];
+        // At 80 cols the right group must end at col 80-4=76, not 80.
+        let out = compose_claude(&elements, &routing, 80, None);
+        assert_eq!(render_tmux::visible_width(&out), 76);
+        assert!(out.ends_with("v2.1.168"));
     }
 
     #[test]
