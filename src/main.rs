@@ -97,13 +97,11 @@ fn main() -> ExitCode {
 
     let mut elements = render_elements(&input, &cfg);
 
-    // Inside tmux, routing decides where each element goes; outside tmux
-    // there is no tmux surface, so everything falls back to Claude's
-    // statusline.
-    let (routing, pane_id) = match active_tmux_pane() {
-        Some(pane_id) => (config::Routing::load(), Some(pane_id)),
-        None => (config::Routing::outside_tmux(), None),
-    };
+    // The active layout depends on whether Claude Code is running inside tmux:
+    // the `tmux` layout (Claude statusline + the daemon-driven bar) or the
+    // `default` layout (Claude statusline only).
+    let pane_id = active_tmux_pane();
+    let routing = config::Routing::for_context(pane_id.is_some());
 
     // Store the rendered elements for the daemon and ping it, but only when
     // at least one element is routed to a tmux surface.
@@ -136,7 +134,7 @@ fn main() -> ExitCode {
         &elements,
         &routing,
         term::columns(120),
-        config::background(),
+        routing.claude_background(),
     );
     if !claude.is_empty() {
         let stdout = io::stdout();
@@ -491,31 +489,30 @@ fn compose_claude(
     // The right edge our content can reach without Claude clipping it.
     let edge = cols.saturating_sub(CLAUDE_EDGE_RESERVE);
 
-    let claude = routing.claude_elements();
-    let mut line_nums: Vec<u8> = claude.iter().map(|&(_, l, _)| l).collect();
-    line_nums.sort_unstable();
-    line_nums.dedup();
-
     let mut physical: Vec<String> = Vec::new();
-    for n in line_nums {
+    for n in routing.claude_lines() {
+        // Inline segments, split into left and right groups (render order from
+        // the config list).
         let group = |align: Align| {
             render_tmux::join_segments(
-                claude
-                    .iter()
-                    .filter(|&&(e, l, a)| l == n && a == align && e.kind() == Kind::Segment)
-                    .filter_map(|&(e, _, _)| find(e)),
+                routing
+                    .claude_at(n, align)
+                    .into_iter()
+                    .filter(|e| e.kind() == Kind::Segment)
+                    .filter_map(find),
             )
         };
         if let Some(line) = compose_claude_line(&group(Align::Left), &group(Align::Right), edge) {
             physical.push(line);
         }
         // Full-width row elements (heatmaps) each take their own physical line.
-        for &(e, l, _) in &claude {
-            if l == n
-                && e.kind() == Kind::Row
-                && let Some(c) = find(e)
-            {
-                physical.push(c.to_string());
+        for align in [Align::Left, Align::Right] {
+            for e in routing.claude_at(n, align) {
+                if e.kind() == Kind::Row
+                    && let Some(c) = find(e)
+                {
+                    physical.push(c.to_string());
+                }
             }
         }
     }
@@ -680,7 +677,13 @@ mod tests {
     #[test]
     fn compose_groups_by_line_and_aligns() {
         let routing = Routing::from_pairs(&[
-            (Element::Model, Dest::CLAUDE),
+            (
+                Element::Model,
+                Dest::Claude {
+                    line: 0,
+                    align: Align::Left,
+                },
+            ),
             (
                 Element::Tokens,
                 Dest::Claude {

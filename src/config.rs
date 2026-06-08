@@ -1,44 +1,46 @@
-//! Shared routing configuration: where each status **element** is sent.
+//! Routing configuration: which **surface** and position each status
+//! **element** occupies, per **layout**.
 //!
-//! Read by both the registrar (which composes Claude's own statusline and
-//! stores element content in pane state) and the daemon (which composes the
-//! tmux surfaces), so the two must agree. A single JSON file keeps them in
-//! sync:
+//! The layout is chosen at runtime: inside tmux the `"tmux"` layout is used,
+//! otherwise `"default"`. Each layout holds one or more surfaces; each surface
+//! maps a region (`<side>[.<line>]`) to an ordered, comma-separated element
+//! list, plus an optional `background`.
 //!
 //! ```json
 //! {
-//!   "route": {
-//!     "model": "row2", "cwd": "row2", "tokens": "row2",
-//!     "warmth": "row2", "heatmap_main": "row1", "heatmap_sub": "row0"
+//!   "tmux": {
+//!     "claude": { "left": "cwd, effort", "right": "version" },
+//!     "tmux":   { "left": "model", "right": "warmth",
+//!                 "left.1": "heatmap_main", "left.2": "tokens, limits" }
+//!   },
+//!   "default": {
+//!     "claude": { "left": "model, cwd, effort", "right": "version",
+//!                 "left.1": "tokens, limits", "left.2": "heatmap_main" }
 //!   }
 //! }
 //! ```
 //!
-//! Destinations:
+//! Surfaces:
+//! - `claude` — Claude's own statusline (stdout), available in every layout. A
+//!   region places its elements on printed line `<line>` (0 = first), aligned
+//!   left or right.
+//! - `tmux` — the daemon-driven tmux status bar (only in the `tmux` layout).
+//!   Line 0 is the base status row, where `left`/`right` are its
+//!   `status-left`/`status-right` edges; lines >= 1 are dedicated rows, with
+//!   `left`/`right` aligned via tmux `#[align]`.
 //!
-//! - `"off"` — not shown;
-//! - `"claude"` — Claude's own statusline via stdout (updates only when
-//!   Claude re-renders — unsuitable for the live `warmth` element). A line and
-//!   alignment may be appended: `"claude.right"` right-aligns on the first
-//!   line; `"claude.1"` is the second printed line; `"claude.1.right"` is the
-//!   second line, right-aligned. Bare `"claude"` means line 0, left.
-//! - `"row0"`, `"row1"`, … — a dedicated tmux status row (`row0` nearest the
-//!   panes), driven live by the daemon. Multiple elements on one row join
-//!   inline.
-//! - `"left"` / `"right"` — the user's base status row's `status-left` /
-//!   `status-right` edge (zero added height).
-//!
-//! Missing keys fall back to per-element defaults that reproduce the Phase 1
-//! look. Outside tmux the caller forces every element to `"claude"`.
-//!
-//! The daemon reads this once at startup (Phase 2a); live hot-reload is 2c.
+//! Both surfaces share the `<side>[.<line>]` grammar (`left`, `right`,
+//! `left.1`, `right.2`, …; bare side = line 0). A region's value is a
+//! comma-separated element list, and list order is render order. An element
+//! listed on no surface is hidden. If an element appears on both surfaces of a
+//! layout, the `claude` surface wins. `background` is a reserved per-surface
+//! key (`#rrggbb`).
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 
-/// A routable status element. The discriminant order is the canonical order
-/// elements are composed in (left to right within a surface).
+/// A routable status element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Element {
     Model,
@@ -48,8 +50,9 @@ pub enum Element {
     Limits,
     Version,
     Updates,
-    /// Cache-warmth / expiry indicator. Computed live by the daemon, not the
-    /// registrar — it only ticks on a daemon-driven surface.
+    /// Cache-warmth / expiry indicator. Computed live (by the daemon on a tmux
+    /// surface, or by the registrar on Claude's statusline) rather than by the
+    /// element renderer.
     Warmth,
     HeatmapMain,
     HeatmapSub,
@@ -58,9 +61,9 @@ pub enum Element {
 /// How an element occupies a surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// Inline; joins with ` | ` alongside other segments on the surface.
+    /// Inline; joins with ` | ` alongside other segments in its region.
     Segment,
-    /// A standalone full-width row.
+    /// A standalone full-width row (alignment ignored; takes the whole line).
     Row,
 }
 
@@ -93,6 +96,10 @@ impl Element {
         }
     }
 
+    pub fn from_key(k: &str) -> Option<Element> {
+        Element::ALL.into_iter().find(|e| e.key() == k)
+    }
+
     pub fn kind(self) -> Kind {
         match self {
             Element::HeatmapMain | Element::HeatmapSub => Kind::Row,
@@ -100,156 +107,179 @@ impl Element {
         }
     }
 
-    /// Computed live by the daemon rather than rendered by the registrar.
+    /// Computed live rather than produced by the element renderer.
     pub fn is_live(self) -> bool {
         matches!(self, Element::Warmth)
     }
-
-    fn default_dest(self) -> Dest {
-        // Reproduce the Phase 1 layout: rich segments + warmth on row2,
-        // heatmaps on rows 1 and 0, the user's base row below.
-        match self {
-            Element::HeatmapMain => Dest::Row(1),
-            Element::HeatmapSub => Dest::Row(0),
-            Element::Updates => Dest::Off,
-            _ => Dest::Row(2),
-        }
-    }
 }
 
-/// Horizontal alignment of a segment within a Claude statusline line. (Named
-/// `Align` to avoid colliding with the daemon's edge-revert `Side`.)
+/// Horizontal alignment of an element within its region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
     Left,
     Right,
 }
 
+/// Where an element is rendered. Both surface variants carry the same
+/// `{ line, align }` shape; the surface (Claude statusline vs tmux bar) decides
+/// what "line" means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dest {
     Off,
-    /// Claude's own statusline, on the given printed line (0 = first) with the
-    /// given horizontal alignment.
+    /// Claude's statusline: `line` is the printed line (0 = first).
     Claude {
         line: u8,
         align: Align,
     },
-    Row(u8),
-    /// The base status row's `status-left` edge (zero added height).
-    Left,
-    /// The base status row's `status-right` edge (zero added height).
-    Right,
+    /// The tmux bar: `line` is the status-format line. Line 0 is the base row
+    /// (align → `status-left`/`status-right` edge); lines >= 1 are dedicated
+    /// rows (align → `#[align]` within the row).
+    Tmux {
+        line: u8,
+        align: Align,
+    },
 }
 
 impl Dest {
-    /// Bare `claude`: first line, left-aligned.
-    pub const CLAUDE: Dest = Dest::Claude {
-        line: 0,
-        align: Align::Left,
-    };
-
-    fn parse(s: &str) -> Option<Dest> {
-        match s {
-            "off" => Some(Dest::Off),
-            "left" => Some(Dest::Left),
-            "right" => Some(Dest::Right),
-            _ if s == "claude" || s.starts_with("claude.") => {
-                Dest::parse_claude(s.strip_prefix("claude.").unwrap_or(""))
-            }
-            _ => s
-                .strip_prefix("row")
-                .and_then(|n| n.parse::<u8>().ok())
-                .map(Dest::Row),
-        }
-    }
-
-    /// Parse the part after `claude.` — dot-separated tokens, each either a
-    /// line number or an alignment keyword, in any order. Empty means defaults.
-    fn parse_claude(rest: &str) -> Option<Dest> {
-        let mut line = 0u8;
-        let mut align = Align::Left;
-        if !rest.is_empty() {
-            for tok in rest.split('.') {
-                match tok {
-                    "left" => align = Align::Left,
-                    "right" => align = Align::Right,
-                    n => line = n.parse().ok()?,
-                }
-            }
-        }
-        Some(Dest::Claude { line, align })
-    }
-
-    /// A daemon-driven tmux surface (a dedicated row or a base-row edge).
+    /// A daemon-driven tmux surface.
     pub fn is_tmux(self) -> bool {
-        matches!(self, Dest::Row(_) | Dest::Left | Dest::Right)
+        matches!(self, Dest::Tmux { .. })
     }
 }
 
+/// Parse a region key (`left`, `right`, `left.1`, `right.2`, …) into an
+/// alignment and a line number (bare side = line 0).
+fn parse_region(key: &str) -> Option<(Align, u8)> {
+    let mut it = key.split('.');
+    let align = match it.next()? {
+        "left" => Align::Left,
+        "right" => Align::Right,
+        _ => return None,
+    };
+    let line = match it.next() {
+        Some(n) => n.parse().ok()?,
+        None => 0,
+    };
+    if it.next().is_some() {
+        return None; // more than one dot
+    }
+    Some((align, line))
+}
+
+/// The resolved routing for one runtime context (in tmux, or not). Maps each
+/// element to a destination and a render order, and carries the per-surface
+/// background colours.
 pub struct Routing {
     dests: [Dest; 10],
+    /// Render order within a region (lower = earlier), from the config list
+    /// order. Elements not placed sort last but are filtered out anyway.
+    order: [u32; 10],
+    claude_bg: Option<(u8, u8, u8)>,
+    tmux_bg: Option<(u8, u8, u8)>,
 }
 
 impl Default for Routing {
     fn default() -> Self {
-        let mut dests = [Dest::Off; 10];
-        for e in Element::ALL {
-            dests[e as usize] = e.default_dest();
-        }
-        Self { dests }
+        Routing::builtin(true)
     }
 }
 
 impl Routing {
-    /// Every element to Claude's statusline. Used outside tmux, where there
-    /// is no tmux surface to route to. Segments land on the first line; the
-    /// two heatmap rows take the lines below it (reproducing the stdout
-    /// layout). `warmth` defaults to `off` — it only ticks if the user opts in
-    /// by routing it to `claude` *and* `statusLine.refreshInterval` re-runs the
-    /// command (see [`outside_tmux`]).
-    pub fn all_claude() -> Self {
-        let mut dests = [Dest::CLAUDE; 10];
-        dests[Element::Warmth as usize] = Dest::Off;
-        dests[Element::HeatmapMain as usize] = Dest::Claude {
-            line: 1,
-            align: Align::Left,
-        };
-        dests[Element::HeatmapSub as usize] = Dest::Claude {
-            line: 2,
-            align: Align::Left,
-        };
-        Self { dests }
+    fn empty() -> Self {
+        Routing {
+            dests: [Dest::Off; 10],
+            order: [u32::MAX; 10],
+            claude_bg: None,
+            tmux_bg: None,
+        }
     }
 
-    /// Routing for the no-tmux case. Starts from [`all_claude`] (everything on
-    /// Claude's statusline) and overlays the user's explicit *Claude-surface*
-    /// choices from the config — a line, a right alignment, or `off`. The
-    /// tmux-only destinations (`row*`/`left`/`right`) have no surface here, so
-    /// they keep the [`all_claude`] fallback rather than vanishing; route an
-    /// element to `claude.right` to right-align it outside tmux.
-    ///
-    /// `warmth` defaults to `off`, but — unlike on a tmux surface — it *can* be
-    /// opted in here by routing it to `claude`: the registrar computes it from
-    /// session state on each run, so with `statusLine.refreshInterval` set it
-    /// flips warm→cold on the timer rather than only on Claude's own renders.
-    pub fn outside_tmux() -> Self {
-        Self::outside_tmux_from(read_config())
-    }
-
-    fn outside_tmux_from(v: Option<Value>) -> Self {
-        let mut r = Routing::all_claude();
-        if let Some(route) = v.as_ref().and_then(|v| v.get("route")) {
+    /// The built-in layout used when the config file has no entry for the
+    /// active layout. In tmux: a dedicated row of segments above two heatmap
+    /// rows, the base row below. Outside tmux: segments on Claude's first line,
+    /// the heatmaps on the lines beneath, `warmth` off (it has no live surface
+    /// unless explicitly placed on Claude with `refreshInterval`).
+    fn builtin(in_tmux: bool) -> Self {
+        let mut r = Routing::empty();
+        let place = |r: &mut Routing, e: Element, d: Dest| {
+            r.dests[e as usize] = d;
+            r.order[e as usize] = e as u32;
+        };
+        if in_tmux {
             for e in Element::ALL {
-                // Honor only Claude-surface and off choices; tmux-only
-                // surfaces keep the all_claude fallback.
-                if let Some(d @ (Dest::Claude { .. } | Dest::Off)) = route
-                    .get(e.key())
-                    .and_then(|x| x.as_str())
-                    .and_then(Dest::parse)
-                {
-                    r.dests[e as usize] = d;
-                }
+                let d = match e {
+                    Element::Updates => Dest::Off,
+                    Element::HeatmapSub => Dest::Tmux {
+                        line: 1,
+                        align: Align::Left,
+                    },
+                    Element::HeatmapMain => Dest::Tmux {
+                        line: 2,
+                        align: Align::Left,
+                    },
+                    _ => Dest::Tmux {
+                        line: 3,
+                        align: Align::Left,
+                    },
+                };
+                place(&mut r, e, d);
             }
+        } else {
+            for e in Element::ALL {
+                let d = match e {
+                    Element::Warmth => Dest::Off,
+                    Element::HeatmapMain => Dest::Claude {
+                        line: 1,
+                        align: Align::Left,
+                    },
+                    Element::HeatmapSub => Dest::Claude {
+                        line: 2,
+                        align: Align::Left,
+                    },
+                    _ => Dest::Claude {
+                        line: 0,
+                        align: Align::Left,
+                    },
+                };
+                place(&mut r, e, d);
+            }
+        }
+        r
+    }
+
+    /// Resolve the routing for the active context from the config file.
+    pub fn for_context(in_tmux: bool) -> Self {
+        Self::from_value(read_config(), in_tmux)
+    }
+
+    fn from_value(v: Option<Value>, in_tmux: bool) -> Self {
+        let layout_name = if in_tmux { "tmux" } else { "default" };
+        let Some(layout) = v.as_ref().and_then(|v| v.get(layout_name)) else {
+            return Routing::builtin(in_tmux);
+        };
+        Self::build(layout, in_tmux)
+    }
+
+    /// Build the routing from a single layout object. The `tmux` surface is
+    /// applied first and the `claude` surface second, so on a conflicting
+    /// element the Claude placement wins.
+    fn build(layout: &Value, in_tmux: bool) -> Self {
+        let mut r = Routing::empty();
+        let mut order: u32 = 0;
+
+        if in_tmux && let Some(surf) = layout.get("tmux") {
+            r.tmux_bg = surface_background(surf);
+            apply_surface(surf, &mut r, &mut order, |line, align| Dest::Tmux {
+                line,
+                align,
+            });
+        }
+        if let Some(surf) = layout.get("claude") {
+            r.claude_bg = surface_background(surf);
+            apply_surface(surf, &mut r, &mut order, |line, align| Dest::Claude {
+                line,
+                align,
+            });
         }
         r
     }
@@ -258,79 +288,106 @@ impl Routing {
         self.dests[e as usize]
     }
 
-    /// Any element routed to a daemon-driven tmux surface (a row or a
-    /// base-row edge). Determines whether the registrar registers/spawns
-    /// the daemon at all.
+    pub fn claude_background(&self) -> Option<(u8, u8, u8)> {
+        self.claude_bg
+    }
+
+    pub fn tmux_background(&self) -> Option<(u8, u8, u8)> {
+        self.tmux_bg
+    }
+
+    /// Any element on a tmux surface — whether the registrar should register
+    /// the pane and spawn/ping the daemon.
     pub fn any_tmux(&self) -> bool {
         Element::ALL.iter().any(|&e| self.dest(e).is_tmux())
     }
 
-    /// Distinct row numbers used, ascending (row0 nearest the panes).
-    pub fn rows_used(&self) -> Vec<u8> {
-        let mut rows: Vec<u8> = Element::ALL
+    /// Distinct Claude lines used, ascending.
+    pub fn claude_lines(&self) -> Vec<u8> {
+        self.lines(|d| matches!(d, Dest::Claude { .. }).then(|| line_of(d)))
+    }
+
+    /// Distinct tmux lines used, ascending (0 = base row).
+    pub fn tmux_lines(&self) -> Vec<u8> {
+        self.lines(|d| matches!(d, Dest::Tmux { .. }).then(|| line_of(d)))
+    }
+
+    fn lines(&self, pick: impl Fn(Dest) -> Option<u8>) -> Vec<u8> {
+        let mut v: Vec<u8> = Element::ALL
             .iter()
-            .filter_map(|&e| match self.dest(e) {
-                Dest::Row(n) => Some(n),
-                _ => None,
-            })
+            .filter_map(|&e| pick(self.dest(e)))
             .collect();
-        rows.sort_unstable();
-        rows.dedup();
-        rows
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
-    /// Elements routed to a given destination, in canonical order.
-    pub fn elements_for(&self, dest: Dest) -> Vec<Element> {
-        Element::ALL
+    /// Elements on Claude's statusline at `line`/`align`, in render order.
+    pub fn claude_at(&self, line: u8, align: Align) -> Vec<Element> {
+        self.at(Dest::Claude { line, align })
+    }
+
+    /// Elements on the tmux bar at `line`/`align`, in render order.
+    pub fn tmux_at(&self, line: u8, align: Align) -> Vec<Element> {
+        self.at(Dest::Tmux { line, align })
+    }
+
+    fn at(&self, want: Dest) -> Vec<Element> {
+        let mut v: Vec<Element> = Element::ALL
             .iter()
             .copied()
-            .filter(|&e| self.dest(e) == dest)
-            .collect()
+            .filter(|&e| self.dest(e) == want)
+            .collect();
+        v.sort_by_key(|&e| self.order[e as usize]);
+        v
     }
 
-    /// Claude-routed elements with their line and alignment, in canonical
-    /// order. Used to compose Claude's own (multi-line) statusline.
-    pub fn claude_elements(&self) -> Vec<(Element, u8, Align)> {
-        Element::ALL
-            .iter()
-            .copied()
-            .filter_map(|e| match self.dest(e) {
-                Dest::Claude { line, align } => Some((e, line, align)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn load() -> Self {
-        Self::from_value(read_config())
-    }
-
-    /// Test-only: a routing starting from the defaults with the given
-    /// element→dest overrides applied.
+    /// Test-only: a routing from explicit (element, dest) pairs, ordered by
+    /// pair position. No backgrounds.
     #[cfg(test)]
     pub fn from_pairs(pairs: &[(Element, Dest)]) -> Self {
-        let mut r = Routing::default();
-        for &(e, d) in pairs {
+        let mut r = Routing::empty();
+        for (i, &(e, d)) in pairs.iter().enumerate() {
             r.dests[e as usize] = d;
+            r.order[e as usize] = i as u32;
         }
         r
     }
+}
 
-    fn from_value(v: Option<Value>) -> Self {
-        let mut r = Routing::default();
-        let Some(route) = v.as_ref().and_then(|v| v.get("route")) else {
-            return r;
+/// The line number carried by a `Claude`/`Tmux` dest (0 for `Off`).
+fn line_of(d: Dest) -> u8 {
+    match d {
+        Dest::Claude { line, .. } | Dest::Tmux { line, .. } => line,
+        Dest::Off => 0,
+    }
+}
+
+fn surface_background(surf: &Value) -> Option<(u8, u8, u8)> {
+    parse_hex_rgb(surf.get("background")?.as_str()?)
+}
+
+/// Apply one surface's regions to the routing, mapping each `(line, align)` to
+/// a dest via `mk`. Elements are assigned increasing order values so list
+/// order becomes render order.
+fn apply_surface(surf: &Value, r: &mut Routing, order: &mut u32, mk: impl Fn(u8, Align) -> Dest) {
+    let Some(obj) = surf.as_object() else {
+        return;
+    };
+    for (key, val) in obj {
+        if key == "background" {
+            continue;
+        }
+        let (Some((align, line)), Some(list)) = (parse_region(key), val.as_str()) else {
+            continue;
         };
-        for e in Element::ALL {
-            if let Some(d) = route
-                .get(e.key())
-                .and_then(|x| x.as_str())
-                .and_then(Dest::parse)
-            {
-                r.dests[e as usize] = d;
+        for name in list.split(',') {
+            if let Some(e) = Element::from_key(name.trim()) {
+                r.dests[e as usize] = mk(line, align);
+                r.order[e as usize] = *order;
+                *order += 1;
             }
         }
-        r
     }
 }
 
@@ -353,19 +410,6 @@ fn jump_command_from(v: Option<&Value>) -> Option<String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-/// An explicit status background colour (`"background": "#rrggbb"` in the
-/// config file), applied to the surfaces this tool owns — the Claude
-/// statusline lines outside tmux, and the daemon-driven rows inside it — so
-/// the bar reads consistently regardless of the terminal or tmux theme.
-/// `None` leaves the inherited background untouched.
-pub fn background() -> Option<(u8, u8, u8)> {
-    background_from(read_config().as_ref())
-}
-
-fn background_from(v: Option<&Value>) -> Option<(u8, u8, u8)> {
-    parse_hex_rgb(v?.get("background")?.as_str()?)
 }
 
 /// Parse `#rrggbb` (case-insensitive) into an RGB triple.
@@ -410,178 +454,199 @@ pub fn mtime() -> Option<std::time::SystemTime> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_reproduces_phase1_layout() {
-        let r = Routing::default();
-        assert_eq!(r.dest(Element::Model), Dest::Row(2));
-        assert_eq!(r.dest(Element::Warmth), Dest::Row(2));
-        assert_eq!(r.dest(Element::HeatmapMain), Dest::Row(1));
-        assert_eq!(r.dest(Element::HeatmapSub), Dest::Row(0));
-        assert_eq!(r.dest(Element::Updates), Dest::Off);
-        assert_eq!(r.rows_used(), vec![0, 1, 2]);
-        assert!(r.any_tmux());
+    fn cfg(json: &str) -> Value {
+        serde_json::from_str(json).unwrap()
     }
 
     #[test]
-    fn parses_dests_including_rows() {
-        assert_eq!(Dest::parse("off"), Some(Dest::Off));
-        assert_eq!(Dest::parse("claude"), Some(Dest::CLAUDE));
-        assert_eq!(Dest::parse("row0"), Some(Dest::Row(0)));
-        assert_eq!(Dest::parse("row12"), Some(Dest::Row(12)));
-        assert_eq!(Dest::parse("nonsense"), None);
+    fn parse_region_grammar() {
+        assert_eq!(parse_region("left"), Some((Align::Left, 0)));
+        assert_eq!(parse_region("right"), Some((Align::Right, 0)));
+        assert_eq!(parse_region("left.1"), Some((Align::Left, 1)));
+        assert_eq!(parse_region("right.12"), Some((Align::Right, 12)));
+        assert_eq!(parse_region("centre"), None);
+        assert_eq!(parse_region("left.1.2"), None);
+        assert_eq!(parse_region("left.x"), None);
     }
 
     #[test]
-    fn parses_claude_line_and_alignment() {
+    fn builtin_tmux_layout() {
+        let r = Routing::builtin(true);
         assert_eq!(
-            Dest::parse("claude.right"),
-            Some(Dest::Claude {
-                line: 0,
-                align: Align::Right
-            })
-        );
-        assert_eq!(
-            Dest::parse("claude.1"),
-            Some(Dest::Claude {
-                line: 1,
+            r.dest(Element::Model),
+            Dest::Tmux {
+                line: 3,
                 align: Align::Left
-            })
+            }
         );
-        assert_eq!(
-            Dest::parse("claude.1.right"),
-            Some(Dest::Claude {
-                line: 1,
-                align: Align::Right
-            })
-        );
-        // tokens may appear in either order.
-        assert_eq!(Dest::parse("claude.right.2"), Dest::parse("claude.2.right"));
-        // a non-numeric, non-alignment token is rejected.
-        assert_eq!(Dest::parse("claude.bogus"), None);
-    }
-
-    #[test]
-    fn from_value_overrides_only_named_keys() {
-        let v: Value =
-            serde_json::from_str(r#"{ "route": { "tokens": "claude", "heatmap_sub": "off" } }"#)
-                .unwrap();
-        let r = Routing::from_value(Some(v));
-        assert_eq!(r.dest(Element::Tokens), Dest::CLAUDE);
-        assert_eq!(r.dest(Element::HeatmapSub), Dest::Off);
-        assert_eq!(r.dest(Element::Model), Dest::Row(2)); // untouched default
-    }
-
-    #[test]
-    fn all_claude_drops_warmth_and_uses_no_rows() {
-        let r = Routing::all_claude();
-        assert_eq!(r.dest(Element::Model), Dest::CLAUDE);
-        assert_eq!(r.dest(Element::Warmth), Dest::Off);
         assert_eq!(
             r.dest(Element::HeatmapMain),
-            Dest::Claude {
+            Dest::Tmux {
+                line: 2,
+                align: Align::Left
+            }
+        );
+        assert_eq!(
+            r.dest(Element::HeatmapSub),
+            Dest::Tmux {
                 line: 1,
                 align: Align::Left
             }
         );
+        assert_eq!(r.dest(Element::Updates), Dest::Off);
+        assert_eq!(r.tmux_lines(), vec![1, 2, 3]);
+        assert!(r.any_tmux());
+    }
+
+    #[test]
+    fn builtin_default_layout_is_all_claude() {
+        let r = Routing::builtin(false);
+        assert_eq!(
+            r.dest(Element::Model),
+            Dest::Claude {
+                line: 0,
+                align: Align::Left
+            }
+        );
+        assert_eq!(r.dest(Element::Updates), line0()); // shown outside tmux
+        assert_eq!(r.dest(Element::Warmth), Dest::Off); // no live surface
+        assert!(!r.any_tmux());
+    }
+
+    fn line0() -> Dest {
+        Dest::Claude {
+            line: 0,
+            align: Align::Left,
+        }
+    }
+
+    #[test]
+    fn builds_both_surfaces_with_alignment_and_order() {
+        let v = cfg(r#"{ "tmux": {
+                "claude": { "left": "cwd, effort", "right": "version" },
+                "tmux":   { "left": "model", "right": "warmth",
+                            "left.1": "heatmap_main", "left.2": "tokens, limits" }
+            } }"#);
+        let r = Routing::from_value(Some(v), true);
+        // claude surface
+        assert_eq!(r.dest(Element::Cwd), line0());
+        assert_eq!(
+            r.dest(Element::Version),
+            Dest::Claude {
+                line: 0,
+                align: Align::Right
+            }
+        );
+        // tmux surface: line 0 edges
+        assert_eq!(
+            r.dest(Element::Model),
+            Dest::Tmux {
+                line: 0,
+                align: Align::Left
+            }
+        );
+        assert_eq!(
+            r.dest(Element::Warmth),
+            Dest::Tmux {
+                line: 0,
+                align: Align::Right
+            }
+        );
+        // tmux dedicated rows
+        assert_eq!(
+            r.dest(Element::HeatmapMain),
+            Dest::Tmux {
+                line: 1,
+                align: Align::Left
+            }
+        );
+        // list order within a region is preserved
+        assert_eq!(
+            r.tmux_at(2, Align::Left),
+            vec![Element::Tokens, Element::Limits]
+        );
+        assert_eq!(
+            r.claude_at(0, Align::Left),
+            vec![Element::Cwd, Element::Effort]
+        );
+    }
+
+    #[test]
+    fn list_order_overrides_canonical_order() {
+        let v = cfg(r#"{ "default": { "claude": { "left": "version, model, cwd" } } }"#);
+        let r = Routing::from_value(Some(v), false);
+        assert_eq!(
+            r.claude_at(0, Align::Left),
+            vec![Element::Version, Element::Model, Element::Cwd]
+        );
+    }
+
+    #[test]
+    fn claude_surface_wins_on_conflict() {
+        let v = cfg(r#"{ "tmux": {
+                "tmux":   { "left": "version" },
+                "claude": { "right": "version" }
+            } }"#);
+        let r = Routing::from_value(Some(v), true);
+        assert_eq!(
+            r.dest(Element::Version),
+            Dest::Claude {
+                line: 0,
+                align: Align::Right
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_surface_ignored_outside_tmux() {
+        let v = cfg(r#"{ "default": { "tmux": { "left": "model" } } }"#);
+        let r = Routing::from_value(Some(v), false);
+        // the default layout has no claude surface and the tmux one is ignored
+        assert_eq!(r.dest(Element::Model), Dest::Off);
         assert!(!r.any_tmux());
     }
 
     #[test]
+    fn unlisted_element_is_off() {
+        let v = cfg(r#"{ "default": { "claude": { "left": "model" } } }"#);
+        let r = Routing::from_value(Some(v), false);
+        assert_eq!(r.dest(Element::Cwd), Dest::Off);
+    }
+
+    #[test]
+    fn missing_layout_falls_back_to_builtin() {
+        // config present but only configures tmux; the default context uses the
+        // built-in.
+        let v = cfg(r#"{ "tmux": { "claude": { "left": "model" } } }"#);
+        let r = Routing::from_value(Some(v), false);
+        assert_eq!(r.dest(Element::Model), line0());
+    }
+
+    #[test]
+    fn per_surface_background() {
+        let v = cfg(r##"{ "tmux": {
+                "claude": { "background": "#1a1b26", "left": "model" },
+                "tmux":   { "background": "#222436", "left": "cwd" }
+            } }"##);
+        let r = Routing::from_value(Some(v), true);
+        assert_eq!(r.claude_background(), Some((0x1a, 0x1b, 0x26)));
+        assert_eq!(r.tmux_background(), Some((0x22, 0x24, 0x36)));
+    }
+
+    #[test]
     fn jump_command_reads_linux_key() {
-        let v: Value = serde_json::from_str(r#"{ "jump": { "linux": "myjump $1" } }"#).unwrap();
+        let v = cfg(r#"{ "jump": { "linux": "myjump $1" } }"#);
         assert_eq!(jump_command_from(Some(&v)).as_deref(), Some("myjump $1"));
-        // Absent section, empty string, and no config all fall back.
-        let empty: Value = serde_json::from_str(r#"{ "route": {} }"#).unwrap();
-        assert_eq!(jump_command_from(Some(&empty)), None);
-        let blank: Value = serde_json::from_str(r#"{ "jump": { "linux": "" } }"#).unwrap();
+        let blank = cfg(r#"{ "jump": { "linux": "" } }"#);
         assert_eq!(jump_command_from(Some(&blank)), None);
         assert_eq!(jump_command_from(None), None);
     }
 
     #[test]
-    fn outside_tmux_honors_claude_layout_but_ignores_tmux_dests() {
-        let v: Value = serde_json::from_str(
-            r#"{ "route": {
-                "tokens": "claude.right",
-                "cwd": "off",
-                "model": "left",
-                "limits": "row1"
-            } }"#,
-        )
-        .unwrap();
-        let r = Routing::outside_tmux_from(Some(v));
-        // explicit Claude alignment and off are honored
-        assert_eq!(
-            r.dest(Element::Tokens),
-            Dest::Claude {
-                line: 0,
-                align: Align::Right
-            }
-        );
-        assert_eq!(r.dest(Element::Cwd), Dest::Off);
-        // tmux-only surfaces fall back to the all_claude default (line 0 left)
-        assert_eq!(r.dest(Element::Model), Dest::CLAUDE);
-        assert_eq!(r.dest(Element::Limits), Dest::CLAUDE);
-        // warmth left unrouted keeps the all_claude default (off)
-        assert_eq!(r.dest(Element::Warmth), Dest::Off);
-        assert!(!r.any_tmux());
-    }
-
-    #[test]
-    fn outside_tmux_can_opt_warmth_onto_claude() {
-        let v: Value =
-            serde_json::from_str(r#"{ "route": { "warmth": "claude.right" } }"#).unwrap();
-        let r = Routing::outside_tmux_from(Some(v));
-        assert_eq!(
-            r.dest(Element::Warmth),
-            Dest::Claude {
-                line: 0,
-                align: Align::Right
-            }
-        );
-    }
-
-    #[test]
-    fn outside_tmux_with_no_config_matches_all_claude() {
-        let r = Routing::outside_tmux_from(None);
-        assert_eq!(r.dest(Element::Model), Dest::CLAUDE);
-        assert_eq!(r.dest(Element::Updates), Dest::CLAUDE); // shown outside tmux
-        assert_eq!(
-            r.dest(Element::HeatmapMain),
-            Dest::Claude {
-                line: 1,
-                align: Align::Left
-            }
-        );
-    }
-
-    #[test]
-    fn background_parses_hex_and_rejects_junk() {
-        let v: Value = serde_json::from_str(r##"{ "background": "#1a1b26" }"##).unwrap();
-        assert_eq!(background_from(Some(&v)), Some((0x1a, 0x1b, 0x26)));
-        // missing key, bad length, non-hex, and no config all yield None.
-        let none: Value = serde_json::from_str(r#"{ "route": {} }"#).unwrap();
-        assert_eq!(background_from(Some(&none)), None);
+    fn hex_parse_rejects_junk() {
+        assert_eq!(parse_hex_rgb("#1a1b26"), Some((0x1a, 0x1b, 0x26)));
         assert_eq!(parse_hex_rgb("#1a1b2"), None);
         assert_eq!(parse_hex_rgb("1a1b26"), None);
         assert_eq!(parse_hex_rgb("#xxyyzz"), None);
-        assert_eq!(background_from(None), None);
-    }
-
-    #[test]
-    fn elements_for_row_is_ordered() {
-        let r = Routing::default();
-        assert_eq!(
-            r.elements_for(Dest::Row(2)),
-            vec![
-                Element::Model,
-                Element::Cwd,
-                Element::Tokens,
-                Element::Effort,
-                Element::Limits,
-                Element::Version,
-                Element::Warmth,
-            ]
-        );
     }
 }

@@ -36,7 +36,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{self, Dest, Element};
+use crate::config::{self, Align, Element};
 use crate::control::{self, Connection, EventStream, Writer};
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
@@ -120,7 +120,7 @@ pub fn run(session: String) -> ExitCode {
     let mut handler = Handler {
         session,
         server_id,
-        routing: config::Routing::load(),
+        routing: config::Routing::for_context(true),
         config_mtime: config::mtime(),
         force_rerender: false,
         panes: HashSet::new(),
@@ -257,7 +257,7 @@ impl Handler {
         let m = config::mtime();
         if m != self.config_mtime {
             self.config_mtime = m;
-            self.routing = config::Routing::load();
+            self.routing = config::Routing::for_context(true);
             self.force_rerender = true;
             self.log.write("config reloaded");
         }
@@ -360,7 +360,7 @@ impl Handler {
             &tmux::base_row(self.tmux.as_ref()),
             &self.tmux.global("status-left"),
             &self.tmux.global("status-right"),
-            config::background(),
+            self.routing.tmux_background(),
             &self.tmux.global("status-style"),
         );
         apply(self.tmux.as_ref(), &self.session, &plan);
@@ -417,6 +417,11 @@ pub enum Side {
 /// `base_row` is the resolved user base status row (`status-format[0]`);
 /// `user_left` / `user_right` are the user's global `status-left` /
 /// `status-right`, composed onto the correct edge.
+///
+/// tmux line 0 is the base row: its `left`/`right` elements become the
+/// `status-left`/`status-right` edges. Lines >= 1 are dedicated rows, mapped to
+/// `status-format[line-1]`; each row composes its left and right groups with a
+/// `#[align=right]` break between them.
 pub fn plan_bar(
     routing: &config::Routing,
     content: &dyn Fn(Element) -> Option<String>,
@@ -427,19 +432,10 @@ pub fn plan_bar(
     user_status_style: &str,
 ) -> BarPlan {
     let mut formats: Vec<String> = routing
-        .rows_used()
+        .tmux_lines()
         .into_iter()
-        .map(|row| {
-            let parts: Vec<String> = routing
-                .elements_for(Dest::Row(row))
-                .into_iter()
-                .filter_map(content)
-                .filter(|s| !s.is_empty())
-                .collect();
-            render_tmux::ansi_to_tmux(&render_tmux::join_segments(
-                parts.iter().map(String::as_str),
-            ))
-        })
+        .filter(|&line| line >= 1)
+        .map(|line| row_format(routing, content, line))
         .collect();
     formats.push(base_row.to_string());
     let status = tmux::status_value(formats.len());
@@ -456,20 +452,59 @@ pub fn plan_bar(
     BarPlan {
         formats,
         status,
-        left: plan_side(routing, content, Dest::Left, user_left),
-        right: plan_side(routing, content, Dest::Right, user_right),
+        left: plan_edge(
+            routing.tmux_at(0, Align::Left),
+            content,
+            user_left,
+            Align::Left,
+        ),
+        right: plan_edge(
+            routing.tmux_at(0, Align::Right),
+            content,
+            user_right,
+            Align::Right,
+        ),
         style,
     }
 }
 
-fn plan_side(
+/// Compose one dedicated tmux row (`status-format[line-1]`): the left group,
+/// then `#[align=right]` and the right group when present.
+fn row_format(
     routing: &config::Routing,
     content: &dyn Fn(Element) -> Option<String>,
-    dest: Dest,
+    line: u8,
+) -> String {
+    let group = |align| {
+        let parts: Vec<String> = routing
+            .tmux_at(line, align)
+            .into_iter()
+            .filter_map(content)
+            .filter(|s| !s.is_empty())
+            .collect();
+        render_tmux::ansi_to_tmux(&render_tmux::join_segments(
+            parts.iter().map(String::as_str),
+        ))
+    };
+    let mut row = group(Align::Left);
+    let right = group(Align::Right);
+    if !right.is_empty() {
+        row.push_str("#[align=right]");
+        row.push_str(&right);
+    }
+    row
+}
+
+/// Compose a base-row edge (`status-left`/`status-right`) from its line-0
+/// elements, merged with the user's existing edge value (ours nearest the
+/// centre). Empty → revert to inheriting the global.
+fn plan_edge(
+    elements: Vec<Element>,
+    content: &dyn Fn(Element) -> Option<String>,
     user: &str,
+    align: Align,
 ) -> Side {
-    let parts: Vec<String> = routing
-        .elements_for(dest)
+    let parts: Vec<String> = elements
         .into_iter()
         .filter_map(content)
         .filter(|s| !s.is_empty())
@@ -482,10 +517,10 @@ fn plan_side(
     let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(
         parts.iter().map(String::as_str),
     ));
-    let combined = match (user.is_empty(), dest) {
+    let combined = match (user.is_empty(), align) {
         (true, _) => mine,
-        (false, Dest::Left) => format!("{mine} {user}"),
-        (false, _) => format!("{user} {mine}"),
+        (false, Align::Left) => format!("{mine} {user}"),
+        (false, Align::Right) => format!("{user} {mine}"),
     };
     Side::Set(combined)
 }
@@ -597,7 +632,7 @@ fn sanitize_session(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Routing;
+    use crate::config::{Dest, Routing};
     use crate::tmux::{FakeTmux, Write};
 
     #[test]
@@ -630,7 +665,7 @@ mod tests {
         let routing = Routing::default();
         let content = |e: Element| (e == Element::Model).then(|| "M".to_string());
         let plan = plan_bar(&routing, &content, "BASE", "", "", None, "");
-        assert_eq!(plan.formats.len(), 4); // rows 0/1/2 + base row
+        assert_eq!(plan.formats.len(), 4); // dedicated lines 1/2/3 + base row
         assert_eq!(plan.formats[3], "BASE");
         assert_eq!(plan.status, "4");
         assert!(matches!(plan.left, Side::Inherit));
@@ -659,8 +694,11 @@ mod tests {
 
     #[test]
     fn plan_bar_joins_row_segments_with_separator() {
-        let routing =
-            Routing::from_pairs(&[(Element::Model, Dest::Row(0)), (Element::Cwd, Dest::Row(0))]);
+        let left = Dest::Tmux {
+            line: 1,
+            align: Align::Left,
+        };
+        let routing = Routing::from_pairs(&[(Element::Model, left), (Element::Cwd, left)]);
         let content = |e: Element| match e {
             Element::Model => Some("M".to_string()),
             Element::Cwd => Some("C".to_string()),
@@ -673,17 +711,61 @@ mod tests {
     }
 
     #[test]
-    fn plan_bar_composes_user_side_on_correct_edge() {
-        let routing = Routing::from_pairs(&[(Element::Tokens, Dest::Right)]);
+    fn plan_bar_row_right_group_uses_align_directive() {
+        // line 1, left = model; line 1, right = tokens. The row breaks to the
+        // right with tmux's #[align=right].
+        let routing = Routing::from_pairs(&[
+            (
+                Element::Model,
+                Dest::Tmux {
+                    line: 1,
+                    align: Align::Left,
+                },
+            ),
+            (
+                Element::Tokens,
+                Dest::Tmux {
+                    line: 1,
+                    align: Align::Right,
+                },
+            ),
+        ]);
+        let content = |e: Element| match e {
+            Element::Model => Some("M".to_string()),
+            Element::Tokens => Some("T".to_string()),
+            _ => None,
+        };
+        let plan = plan_bar(&routing, &content, "BASE", "", "", None, "");
+        assert_eq!(
+            plan.formats[0],
+            format!(
+                "{}#[align=right]{}",
+                render_tmux::ansi_to_tmux("M"),
+                render_tmux::ansi_to_tmux("T")
+            )
+        );
+    }
+
+    #[test]
+    fn plan_bar_line0_becomes_base_edges() {
+        // tmux line 0 right = tokens -> status-right, merged with the user's.
+        let routing = Routing::from_pairs(&[(
+            Element::Tokens,
+            Dest::Tmux {
+                line: 0,
+                align: Align::Right,
+            },
+        )]);
         let content = |e: Element| (e == Element::Tokens).then(|| "T".to_string());
         let plan = plan_bar(&routing, &content, "BASE", "UL", "UR", None, "");
         let mine = render_tmux::ansi_to_tmux("T");
         match plan.right {
-            Side::Set(s) => assert_eq!(s, format!("UR {mine}")), // user value on the left edge
+            Side::Set(s) => assert_eq!(s, format!("UR {mine}")), // user value toward the edge
             Side::Inherit => panic!("expected Set"),
         }
-        // Nothing routed left -> inherit the global.
+        // Nothing on the left edge -> inherit the global. And no dedicated rows.
         assert!(matches!(plan.left, Side::Inherit));
+        assert_eq!(plan.formats.len(), 1); // base row only
     }
 
     #[test]
