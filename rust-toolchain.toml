@@ -1,0 +1,7 @@
+# Pin the toolchain so the `-D warnings` clippy gate is reproducible: a new
+# stable (with new lints) can't turn CI red on untouched code. cargo honors
+# this file over whatever `stable` resolves to, so local and CI agree. Bump
+# deliberately — and fix any new lints in the same commit.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
