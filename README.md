@@ -111,9 +111,6 @@ inheriting the terminal or tmux theme. The file hot-reloads on save. See
 [`examples/README.md`](examples/README.md) for the full grammar. With no
 matching layout, ccstatus uses a sensible built-in.
 
-If a crashed helper ever leaves the bar in a bad state, `ccstatus --tmux-reset`
-restores the tmux defaults.
-
 ## Build from source
 
 ```sh
@@ -122,6 +119,23 @@ cd ccstatus-rs
 cargo build --release
 # binary at target/release/ccstatus
 ```
+
+### Picking up a rebuild
+
+The statusline command is re-executed by Claude Code on every render, so it
+runs the freshly built binary immediately. The per-session **tmux daemon**,
+however, is long-lived: it hot-reloads `config.json` (by mtime) but keeps its
+own executable until restarted, so a code change won't show on the tmux bar
+until the running daemon is replaced. After a rebuild, kill it — it respawns
+from the new binary on the next render:
+
+```sh
+pkill -f 'ccstatus --session'
+```
+
+`ccstatus --tmux-reset` restores the tmux defaults if a crashed daemon ever
+leaves the bar in a bad state (it resets bar options; it does not kill the
+daemon).
 
 ## License
 
