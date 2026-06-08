@@ -117,7 +117,7 @@ fn main() -> ExitCode {
     }
 
     // Print the elements routed to Claude's own statusline.
-    let claude = compose_claude(&elements, &routing);
+    let claude = compose_claude(&elements, &routing, term::columns(120));
     if !claude.is_empty() {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
@@ -438,36 +438,75 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     out
 }
 
-/// Compose the lines printed to Claude's own statusline: the claude-routed
-/// segment elements joined on one line, followed by any claude-routed row
-/// element (heatmaps) on their own lines.
-fn compose_claude(elements: &[(config::Element, String)], routing: &config::Routing) -> String {
-    use config::{Dest, Element, Kind};
-    let find = |e: Element| {
+/// Compose the lines printed to Claude's own statusline. Claude-routed
+/// elements are grouped by their configured line (ascending); on each line the
+/// inline segments are laid out as a left group and a right group, the right
+/// group padded out to column `cols`, and any full-width row element (heatmap)
+/// follows on its own physical line.
+fn compose_claude(
+    elements: &[(config::Element, String)],
+    routing: &config::Routing,
+    cols: u16,
+) -> String {
+    use config::{Align, Kind};
+    let find = |e: config::Element| {
         elements
             .iter()
             .find(|(el, _)| *el == e)
             .map(|(_, c)| c.as_str())
             .filter(|s| !s.is_empty())
     };
-    let segs = Element::ALL
-        .iter()
-        .copied()
-        .filter(|&e| e.kind() == Kind::Segment && routing.dest(e) == Dest::Claude)
-        .filter_map(find);
-    let mut lines: Vec<String> = Vec::new();
-    let seg_line = render_tmux::join_segments(segs);
-    if !seg_line.is_empty() {
-        lines.push(seg_line);
-    }
-    for e in [Element::HeatmapMain, Element::HeatmapSub] {
-        if routing.dest(e) == Dest::Claude
-            && let Some(c) = find(e)
-        {
-            lines.push(c.to_string());
+
+    let claude = routing.claude_elements();
+    let mut line_nums: Vec<u8> = claude.iter().map(|&(_, l, _)| l).collect();
+    line_nums.sort_unstable();
+    line_nums.dedup();
+
+    let mut physical: Vec<String> = Vec::new();
+    for n in line_nums {
+        let group = |align: Align| {
+            render_tmux::join_segments(
+                claude
+                    .iter()
+                    .filter(|&&(e, l, a)| l == n && a == align && e.kind() == Kind::Segment)
+                    .filter_map(|&(e, _, _)| find(e)),
+            )
+        };
+        if let Some(line) = compose_claude_line(&group(Align::Left), &group(Align::Right), cols) {
+            physical.push(line);
+        }
+        // Full-width row elements (heatmaps) each take their own physical line.
+        for &(e, l, _) in &claude {
+            if l == n
+                && e.kind() == Kind::Row
+                && let Some(c) = find(e)
+            {
+                physical.push(c.to_string());
+            }
         }
     }
-    lines.join("\n")
+    physical.join("\n")
+}
+
+/// Lay out one Claude line from its left and right segment groups: pad between
+/// them so the right group ends at column `cols`. Returns `None` when the line
+/// is empty.
+fn compose_claude_line(left: &str, right: &str, cols: u16) -> Option<String> {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(left.to_string()),
+        (true, false) => {
+            let pad = (cols as usize).saturating_sub(render_tmux::visible_width(right));
+            Some(format!("{}{right}", " ".repeat(pad)))
+        }
+        (false, false) => {
+            let used = render_tmux::visible_width(left) + render_tmux::visible_width(right);
+            // Keep at least one space so the groups never touch when the line
+            // is too narrow to hold both.
+            let pad = (cols as usize).saturating_sub(used).max(1);
+            Some(format!("{left}{}{right}", " ".repeat(pad)))
+        }
+    }
 }
 
 fn u64_at(v: Option<&Value>, key: &str) -> u64 {
@@ -550,4 +589,72 @@ fn version_gt(a: &str, b: &str) -> bool {
         )
     };
     parse(a) > parse(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::{Align, Dest, Element, Routing};
+
+    #[test]
+    fn line_left_only_is_unpadded() {
+        assert_eq!(compose_claude_line("abc", "", 80).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn line_empty_is_none() {
+        assert_eq!(compose_claude_line("", "", 80), None);
+    }
+
+    #[test]
+    fn line_right_group_padded_to_cols() {
+        // "L" + pad + "RIGHT" must end exactly at column 10.
+        let line = compose_claude_line("L", "RIGHT", 10).unwrap();
+        assert_eq!(render_tmux::visible_width(&line), 10);
+        assert_eq!(line, "L    RIGHT");
+    }
+
+    #[test]
+    fn line_right_only_padded_to_cols() {
+        let line = compose_claude_line("", "RIGHT", 10).unwrap();
+        assert_eq!(line, "     RIGHT");
+    }
+
+    #[test]
+    fn line_too_narrow_keeps_one_space() {
+        // left+right already exceed cols: still separated by one space.
+        let line = compose_claude_line("aaaa", "bbbb", 4).unwrap();
+        assert_eq!(line, "aaaa bbbb");
+    }
+
+    #[test]
+    fn compose_groups_by_line_and_aligns() {
+        let routing = Routing::from_pairs(&[
+            (Element::Model, Dest::CLAUDE),
+            (
+                Element::Tokens,
+                Dest::Claude {
+                    line: 0,
+                    align: Align::Right,
+                },
+            ),
+            (
+                Element::Cwd,
+                Dest::Claude {
+                    line: 1,
+                    align: Align::Left,
+                },
+            ),
+        ]);
+        let elements = vec![
+            (Element::Model, "M".to_string()),
+            (Element::Tokens, "T".to_string()),
+            (Element::Cwd, "C".to_string()),
+        ];
+        let out = compose_claude(&elements, &routing, 10);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "M        T"); // model left, tokens right at col 10
+        assert_eq!(lines[1], "C"); // line 1, left
+    }
 }

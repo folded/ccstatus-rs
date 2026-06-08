@@ -18,7 +18,10 @@
 //!
 //! - `"off"` — not shown;
 //! - `"claude"` — Claude's own statusline via stdout (updates only when
-//!   Claude re-renders — unsuitable for the live `warmth` element);
+//!   Claude re-renders — unsuitable for the live `warmth` element). A line and
+//!   alignment may be appended: `"claude.right"` right-aligns on the first
+//!   line; `"claude.1"` is the second printed line; `"claude.1.right"` is the
+//!   second line, right-aligned. Bare `"claude"` means line 0, left.
 //! - `"row0"`, `"row1"`, … — a dedicated tmux status row (`row0` nearest the
 //!   panes), driven live by the daemon. Multiple elements on one row join
 //!   inline.
@@ -114,10 +117,23 @@ impl Element {
     }
 }
 
+/// Horizontal alignment of a segment within a Claude statusline line. (Named
+/// `Align` to avoid colliding with the daemon's edge-revert `Side`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dest {
     Off,
-    Claude,
+    /// Claude's own statusline, on the given printed line (0 = first) with the
+    /// given horizontal alignment.
+    Claude {
+        line: u8,
+        align: Align,
+    },
     Row(u8),
     /// The base status row's `status-left` edge (zero added height).
     Left,
@@ -126,17 +142,42 @@ pub enum Dest {
 }
 
 impl Dest {
+    /// Bare `claude`: first line, left-aligned.
+    pub const CLAUDE: Dest = Dest::Claude {
+        line: 0,
+        align: Align::Left,
+    };
+
     fn parse(s: &str) -> Option<Dest> {
         match s {
             "off" => Some(Dest::Off),
-            "claude" => Some(Dest::Claude),
             "left" => Some(Dest::Left),
             "right" => Some(Dest::Right),
+            _ if s == "claude" || s.starts_with("claude.") => {
+                Dest::parse_claude(s.strip_prefix("claude.").unwrap_or(""))
+            }
             _ => s
                 .strip_prefix("row")
                 .and_then(|n| n.parse::<u8>().ok())
                 .map(Dest::Row),
         }
+    }
+
+    /// Parse the part after `claude.` — dot-separated tokens, each either a
+    /// line number or an alignment keyword, in any order. Empty means defaults.
+    fn parse_claude(rest: &str) -> Option<Dest> {
+        let mut line = 0u8;
+        let mut align = Align::Left;
+        if !rest.is_empty() {
+            for tok in rest.split('.') {
+                match tok {
+                    "left" => align = Align::Left,
+                    "right" => align = Align::Right,
+                    n => line = n.parse().ok()?,
+                }
+            }
+        }
+        Some(Dest::Claude { line, align })
     }
 
     /// A daemon-driven tmux surface (a dedicated row or a base-row edge).
@@ -161,11 +202,21 @@ impl Default for Routing {
 
 impl Routing {
     /// Every element to Claude's statusline. Used outside tmux, where there
-    /// is no tmux surface to route to. The live `warmth` element is dropped
-    /// (it can't tick on Claude's statusline).
+    /// is no tmux surface to route to. Segments land on the first line; the
+    /// two heatmap rows take the lines below it (reproducing the stdout
+    /// layout). The live `warmth` element is dropped (it can't tick on
+    /// Claude's statusline).
     pub fn all_claude() -> Self {
-        let mut dests = [Dest::Claude; 10];
+        let mut dests = [Dest::CLAUDE; 10];
         dests[Element::Warmth as usize] = Dest::Off;
+        dests[Element::HeatmapMain as usize] = Dest::Claude {
+            line: 1,
+            align: Align::Left,
+        };
+        dests[Element::HeatmapSub as usize] = Dest::Claude {
+            line: 2,
+            align: Align::Left,
+        };
         Self { dests }
     }
 
@@ -200,6 +251,19 @@ impl Routing {
             .iter()
             .copied()
             .filter(|&e| self.dest(e) == dest)
+            .collect()
+    }
+
+    /// Claude-routed elements with their line and alignment, in canonical
+    /// order. Used to compose Claude's own (multi-line) statusline.
+    pub fn claude_elements(&self) -> Vec<(Element, u8, Align)> {
+        Element::ALL
+            .iter()
+            .copied()
+            .filter_map(|e| match self.dest(e) {
+                Dest::Claude { line, align } => Some((e, line, align)),
+                _ => None,
+            })
             .collect()
     }
 
@@ -301,10 +365,39 @@ mod tests {
     #[test]
     fn parses_dests_including_rows() {
         assert_eq!(Dest::parse("off"), Some(Dest::Off));
-        assert_eq!(Dest::parse("claude"), Some(Dest::Claude));
+        assert_eq!(Dest::parse("claude"), Some(Dest::CLAUDE));
         assert_eq!(Dest::parse("row0"), Some(Dest::Row(0)));
         assert_eq!(Dest::parse("row12"), Some(Dest::Row(12)));
         assert_eq!(Dest::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn parses_claude_line_and_alignment() {
+        assert_eq!(
+            Dest::parse("claude.right"),
+            Some(Dest::Claude {
+                line: 0,
+                align: Align::Right
+            })
+        );
+        assert_eq!(
+            Dest::parse("claude.1"),
+            Some(Dest::Claude {
+                line: 1,
+                align: Align::Left
+            })
+        );
+        assert_eq!(
+            Dest::parse("claude.1.right"),
+            Some(Dest::Claude {
+                line: 1,
+                align: Align::Right
+            })
+        );
+        // tokens may appear in either order.
+        assert_eq!(Dest::parse("claude.right.2"), Dest::parse("claude.2.right"));
+        // a non-numeric, non-alignment token is rejected.
+        assert_eq!(Dest::parse("claude.bogus"), None);
     }
 
     #[test]
@@ -313,7 +406,7 @@ mod tests {
             serde_json::from_str(r#"{ "route": { "tokens": "claude", "heatmap_sub": "off" } }"#)
                 .unwrap();
         let r = Routing::from_value(Some(v));
-        assert_eq!(r.dest(Element::Tokens), Dest::Claude);
+        assert_eq!(r.dest(Element::Tokens), Dest::CLAUDE);
         assert_eq!(r.dest(Element::HeatmapSub), Dest::Off);
         assert_eq!(r.dest(Element::Model), Dest::Row(2)); // untouched default
     }
@@ -321,8 +414,15 @@ mod tests {
     #[test]
     fn all_claude_drops_warmth_and_uses_no_rows() {
         let r = Routing::all_claude();
-        assert_eq!(r.dest(Element::Model), Dest::Claude);
+        assert_eq!(r.dest(Element::Model), Dest::CLAUDE);
         assert_eq!(r.dest(Element::Warmth), Dest::Off);
+        assert_eq!(
+            r.dest(Element::HeatmapMain),
+            Dest::Claude {
+                line: 1,
+                align: Align::Left
+            }
+        );
         assert!(!r.any_tmux());
     }
 
