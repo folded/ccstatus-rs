@@ -80,14 +80,18 @@ a session sits idle — something Claude's pull-only statusline can't do. This i
 automatic: while a Claude pane is focused, a per-session helper composes
 ccstatus content onto session-local bar overrides and reverts cleanly when you
 switch away or Claude exits. **Your tmux config is never modified** and the bar
-behaves normally when Claude isn't active. Outside tmux, behaviour is unchanged
-(the one-line render on stdout).
+behaves normally when Claude isn't active. Outside tmux ccstatus renders to
+Claude's own statusline, which can span multiple lines and right-align segments
+(see below).
 
 Which elements land where is controlled by an optional
 `~/.config/ccstatus/config.json` — each element (`model`, `cwd`, `tokens`,
 `effort`, `limits`, `version`, `updates`, `warmth`, `heatmap_main`,
 `heatmap_sub`) routes to a dedicated tmux row, the base row's
-`status-left`/`status-right`, Claude's statusline, or `off`. The file
+`status-left`/`status-right`, Claude's statusline (optionally a specific line
+and left/right alignment, e.g. `claude.1.right`), or `off`. An optional
+`"background"` hex colour (e.g. `"#1a1b26"`) paints ccstatus's surfaces a
+consistent colour instead of inheriting the terminal or tmux theme. The file
 hot-reloads on save. See [`examples/README.md`](examples/README.md) for a
 worked config and the destination table. With no config file, ccstatus uses a
 sensible default layout.

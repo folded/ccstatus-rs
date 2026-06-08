@@ -220,6 +220,36 @@ impl Routing {
         Self { dests }
     }
 
+    /// Routing for the no-tmux case. Starts from [`all_claude`] (everything on
+    /// Claude's statusline) and overlays the user's explicit *Claude-surface*
+    /// choices from the config — a line, a right alignment, or `off`. The
+    /// tmux-only destinations (`row*`/`left`/`right`) have no surface here, so
+    /// they keep the [`all_claude`] fallback rather than vanishing; route an
+    /// element to `claude.right` to right-align it outside tmux.
+    pub fn outside_tmux() -> Self {
+        Self::outside_tmux_from(read_config())
+    }
+
+    fn outside_tmux_from(v: Option<Value>) -> Self {
+        let mut r = Routing::all_claude();
+        if let Some(route) = v.as_ref().and_then(|v| v.get("route")) {
+            for e in Element::ALL {
+                // Honor only Claude-surface and off choices; tmux-only
+                // surfaces keep the all_claude fallback.
+                if let Some(d @ (Dest::Claude { .. } | Dest::Off)) = route
+                    .get(e.key())
+                    .and_then(|x| x.as_str())
+                    .and_then(Dest::parse)
+                {
+                    r.dests[e as usize] = d;
+                }
+            }
+        }
+        // warmth can't tick on Claude's statusline regardless of config.
+        r.dests[Element::Warmth as usize] = Dest::Off;
+        r
+    }
+
     pub fn dest(&self, e: Element) -> Dest {
         self.dests[e as usize]
     }
@@ -462,6 +492,49 @@ mod tests {
         let blank: Value = serde_json::from_str(r#"{ "jump": { "linux": "" } }"#).unwrap();
         assert_eq!(jump_command_from(Some(&blank)), None);
         assert_eq!(jump_command_from(None), None);
+    }
+
+    #[test]
+    fn outside_tmux_honors_claude_layout_but_ignores_tmux_dests() {
+        let v: Value = serde_json::from_str(
+            r#"{ "route": {
+                "tokens": "claude.right",
+                "cwd": "off",
+                "model": "left",
+                "limits": "row1"
+            } }"#,
+        )
+        .unwrap();
+        let r = Routing::outside_tmux_from(Some(v));
+        // explicit Claude alignment and off are honored
+        assert_eq!(
+            r.dest(Element::Tokens),
+            Dest::Claude {
+                line: 0,
+                align: Align::Right
+            }
+        );
+        assert_eq!(r.dest(Element::Cwd), Dest::Off);
+        // tmux-only surfaces fall back to the all_claude default (line 0 left)
+        assert_eq!(r.dest(Element::Model), Dest::CLAUDE);
+        assert_eq!(r.dest(Element::Limits), Dest::CLAUDE);
+        // warmth is always off outside tmux; nothing routes to a tmux surface
+        assert_eq!(r.dest(Element::Warmth), Dest::Off);
+        assert!(!r.any_tmux());
+    }
+
+    #[test]
+    fn outside_tmux_with_no_config_matches_all_claude() {
+        let r = Routing::outside_tmux_from(None);
+        assert_eq!(r.dest(Element::Model), Dest::CLAUDE);
+        assert_eq!(r.dest(Element::Updates), Dest::CLAUDE); // shown outside tmux
+        assert_eq!(
+            r.dest(Element::HeatmapMain),
+            Dest::Claude {
+                line: 1,
+                align: Align::Left
+            }
+        );
     }
 
     #[test]

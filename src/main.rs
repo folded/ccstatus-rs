@@ -102,7 +102,7 @@ fn main() -> ExitCode {
     // statusline.
     let (routing, pane_id) = match active_tmux_pane() {
         Some(pane_id) => (config::Routing::load(), Some(pane_id)),
-        None => (config::Routing::all_claude(), None),
+        None => (config::Routing::outside_tmux(), None),
     };
 
     // Store the rendered elements for the daemon and ping it, but only when

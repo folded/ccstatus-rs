@@ -53,6 +53,37 @@ Elements on the same row/side join with ` | ` in this fixed order:
 `model, cwd, tokens, effort, limits, version, updates, warmth`. The
 heatmap elements are full-width rows.
 
+### Claude statusline layout (`claude.<line>.<align>`)
+
+`claude` accepts an optional printed line and horizontal alignment, so the
+statusline Claude renders above its prompt can be more than one left-packed
+line:
+
+- `claude` — first line, left (the default).
+- `claude.right` — first line, right-aligned (padded out to the terminal width).
+- `claude.1` — second printed line, left.
+- `claude.1.right` — second line, right-aligned.
+
+Tokens and line may appear in either order (`claude.1.right` == `claude.right.1`).
+Left- and right-aligned groups on the same line are padded apart; heatmap
+elements always take their own full-width line. This layout applies both inside
+and outside tmux.
+
+### Background (`background`)
+
+A top-level `"background"` hex colour paints the surfaces ccstatus owns so the
+bar reads consistently regardless of the terminal or tmux theme:
+
+```json
+{ "background": "#1a1b26", "route": { "model": "row2" } }
+```
+
+Inside tmux it is applied via the session's `status-style` (preserving your
+foreground/attributes) and reverts when Claude exits; outside tmux each printed
+line is filled to the full width with the colour. The base-row *edges*
+(`left`/`right`) share your own status bar, so they can't be repainted —
+dedicated rows and Claude's lines can.
+
 ## Notes
 
 - **The bar shows only while the focused pane is running Claude.** Switching
@@ -65,8 +96,10 @@ heatmap elements are full-width rows.
   a row.
 - **No config file** = the default layout (rich line + heatmap rows on
   dedicated rows, the base row below).
-- **Outside tmux**, every element falls back to Claude's statusline
-  regardless of this file.
+- **Outside tmux**, the tmux-only destinations (`row*`/`left`/`right`) have no
+  surface, so those elements fall back to Claude's first line; explicit
+  `claude.<line>.<align>` and `off` choices are still honored. Route to
+  `claude.right` for right alignment without tmux.
 - Your base status row (the window list) and your `status-left`/`status-right`
   theme are never overwritten — ccstatus composes alongside them per session
   and reverts cleanly when Claude exits.
