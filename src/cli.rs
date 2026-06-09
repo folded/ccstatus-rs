@@ -82,6 +82,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 let kind = match iter.next().as_deref() {
                     Some("stop") => HookKind::Stop,
                     Some("user-prompt-submit") => HookKind::UserPromptSubmit,
+                    Some("notification") => HookKind::Notification,
+                    Some("post-tool-use") => HookKind::PostToolUse,
                     Some(other) => {
                         return ParseOutcome::Error(format!("unknown hook kind: {other}"));
                     }
@@ -121,9 +123,9 @@ Options:
   top               Interactive table of every live Claude session, with
                     jump-to-session (Enter). Quit with q.
   --install         Wire this binary into ~/.claude/settings.json
-                    (statusLine + Stop/UserPromptSubmit hooks) and exit
+                    (statusLine + activity hooks) and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop,
-                    user-prompt-submit)
+                    user-prompt-submit, notification, post-tool-use)
   --session <id>    Run the per-session control-mode handler for tmux
                     session <id>. Spawned automatically by the registrar;
                     not meant to be run by hand.

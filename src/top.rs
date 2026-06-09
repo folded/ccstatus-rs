@@ -209,23 +209,33 @@ fn sep() -> Span<'static> {
 }
 
 fn header_line(views: &[SessionView]) -> Line<'static> {
-    let working = views
-        .iter()
-        .filter(|v| v.activity == Activity::Working)
-        .count();
-    let waiting = views
-        .iter()
-        .filter(|v| v.activity == Activity::Waiting)
-        .count();
+    let count = |a: Activity| views.iter().filter(|v| v.activity == a).count();
+    let needs_input = count(Activity::NeedsInput);
+    let working = count(Activity::Working);
+    let waiting = count(Activity::Waiting);
     let mut spans = vec![
         Span::styled("ccstatus", Style::default().fg(C_BLUE)),
         sep(),
         Span::raw(format!("{} session(s)", views.len())),
-        sep(),
-        Span::styled(format!("{working} working"), Style::default().fg(C_GREEN)),
-        sep(),
-        Span::styled(format!("{waiting} waiting"), Style::default().fg(C_ORANGE)),
     ];
+    // Lead with the attention-grabber only when something is actually blocked.
+    if needs_input > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("⚑ {needs_input} need input"),
+            Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(sep());
+    spans.push(Span::styled(
+        format!("{working} working"),
+        Style::default().fg(C_GREEN),
+    ));
+    spans.push(sep());
+    spans.push(Span::styled(
+        format!("{waiting} waiting"),
+        Style::default().fg(C_ORANGE),
+    ));
     spans.extend(usage_spans());
     Line::from(spans)
 }
@@ -323,6 +333,10 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>, dir_w: usize) ->
         Style::default().fg(C_CYAN),
     );
     let activity = match v.activity {
+        Activity::NeedsInput => Span::styled(
+            "⚑ input",
+            Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+        ),
         Activity::Working => Span::styled("working", Style::default().fg(C_GREEN)),
         Activity::Waiting => Span::styled("waiting", Style::default().fg(C_ORANGE)),
         Activity::Idle => Span::styled("idle", dim()),

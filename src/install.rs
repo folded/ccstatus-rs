@@ -55,8 +55,10 @@ pub fn run() -> Result<(), String> {
         "refreshInterval": 60,
     });
 
-    // Wire the hooks that feed per-session state: Stop (turn finished) and
-    // UserPromptSubmit (turn started → "working" in `ccstatus top`).
+    // Wire the hooks that feed per-session activity in `ccstatus top`: Stop
+    // (turn finished → waiting), UserPromptSubmit (turn started → working),
+    // Notification (blocking prompt → needs input), and PostToolUse (forward
+    // progress → clears the needs-input latch).
     ensure_hook(&mut settings, "Stop", "stop", exe_str);
     ensure_hook(
         &mut settings,
@@ -64,6 +66,8 @@ pub fn run() -> Result<(), String> {
         "user-prompt-submit",
         exe_str,
     );
+    ensure_hook(&mut settings, "Notification", "notification", exe_str);
+    ensure_hook(&mut settings, "PostToolUse", "post-tool-use", exe_str);
 
     let pretty = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("serializing settings: {e}"))?;
@@ -71,7 +75,7 @@ pub fn run() -> Result<(), String> {
         .map_err(|e| format!("writing {}: {e}", settings_path.display()))?;
 
     println!(
-        "ccstatus: wired statusLine.command + Stop/UserPromptSubmit hooks -> {exe_str} in {}",
+        "ccstatus: wired statusLine.command + activity hooks -> {exe_str} in {}",
         settings_path.display()
     );
 

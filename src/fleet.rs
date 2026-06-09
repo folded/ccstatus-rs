@@ -33,6 +33,9 @@ const ACTIVITY_IDLE_AFTER: i64 = 600;
 /// What a session is doing — the "which one needs me?" axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
+    /// Blocked mid-turn on the user (a permission prompt or a question). The
+    /// most attention-worthy state — Claude can't proceed without you.
+    NeedsInput,
     /// A turn is in progress (last prompt is newer than the last completion).
     Working,
     /// Finished a turn recently and waiting for input.
@@ -44,8 +47,18 @@ pub enum Activity {
 }
 
 /// Pure: derive activity from the prompt/turn timestamps. `idle_secs` is
-/// seconds since the last completed turn.
-fn activity(last_prompt: Option<i64>, last_turn: Option<i64>, idle_secs: Option<i64>) -> Activity {
+/// seconds since the last completed turn. `needs_input` (the `last_notify_ts`
+/// latch being set) wins over everything: Claude is blocked on the user and the
+/// turn is, by definition, mid-flight.
+fn activity(
+    last_prompt: Option<i64>,
+    last_turn: Option<i64>,
+    needs_input: bool,
+    idle_secs: Option<i64>,
+) -> Activity {
+    if needs_input {
+        return Activity::NeedsInput;
+    }
     match (last_prompt, last_turn) {
         // A prompt newer than the last completion (or with no completion yet)
         // means a turn is running.
@@ -125,7 +138,12 @@ pub fn build_views(
                 model: s.model.clone(),
                 cwd: s.cwd.clone(),
                 context_pct: s.context_pct_used,
-                activity: activity(s.last_prompt_ts, s.last_turn_ts, idle_secs),
+                activity: activity(
+                    s.last_prompt_ts,
+                    s.last_turn_ts,
+                    s.last_notify_ts.is_some(),
+                    idle_secs,
+                ),
                 idle_secs,
                 address,
                 window,
@@ -134,10 +152,17 @@ pub fn build_views(
         })
         .collect();
     // Most recently active first; sessions with no turn yet sink to the bottom.
+    // Sessions blocked on you float to the top (they need action now);
+    // everything else follows by most-recent activity, ties broken by id.
+    let rank = |v: &SessionView| u8::from(v.activity != Activity::NeedsInput);
     views.sort_by(|a, b| {
-        a.idle_secs
-            .unwrap_or(i64::MAX)
-            .cmp(&b.idle_secs.unwrap_or(i64::MAX))
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| {
+                a.idle_secs
+                    .unwrap_or(i64::MAX)
+                    .cmp(&b.idle_secs.unwrap_or(i64::MAX))
+            })
             .then_with(|| a.claude_session.cmp(&b.claude_session))
     });
     views
@@ -283,6 +308,7 @@ mod tests {
         SessionState {
             last_turn_ts: last_turn,
             last_prompt_ts: None,
+            last_notify_ts: None,
             model: model.map(str::to_string),
             turn_count: 0,
             context_pct_used: ctx,
@@ -307,6 +333,7 @@ mod tests {
         SessionState {
             last_turn_ts: turn,
             last_prompt_ts: prompt,
+            last_notify_ts: None,
             model: None,
             turn_count: 0,
             context_pct_used: None,
@@ -378,25 +405,54 @@ mod tests {
         let now = 10_000;
         // Prompt newer than last turn -> working.
         assert_eq!(
-            activity(Some(now), Some(now - 50), Some(50)),
+            activity(Some(now), Some(now - 50), false, Some(50)),
             Activity::Working
         );
         // Prompt, never completed -> working.
-        assert_eq!(activity(Some(now), None, None), Activity::Working);
+        assert_eq!(activity(Some(now), None, false, None), Activity::Working);
         // Completed after the prompt, recently -> waiting.
         assert_eq!(
-            activity(Some(now - 100), Some(now - 10), Some(10)),
+            activity(Some(now - 100), Some(now - 10), false, Some(10)),
             Activity::Waiting
         );
         // Completed long ago -> idle.
         assert_eq!(
-            activity(Some(now - 5000), Some(now - 4000), Some(4000)),
+            activity(Some(now - 5000), Some(now - 4000), false, Some(4000)),
             Activity::Idle
         );
         // Turn but no recorded prompt, recent -> waiting.
-        assert_eq!(activity(None, Some(now - 5), Some(5)), Activity::Waiting);
+        assert_eq!(
+            activity(None, Some(now - 5), false, Some(5)),
+            Activity::Waiting
+        );
         // Nothing -> unknown.
-        assert_eq!(activity(None, None, None), Activity::Unknown);
+        assert_eq!(activity(None, None, false, None), Activity::Unknown);
+        // A pending blocking notification wins over any turn state, even a
+        // mid-turn "working" or a long-idle completion.
+        assert_eq!(
+            activity(Some(now), Some(now - 50), true, Some(50)),
+            Activity::NeedsInput
+        );
+        assert_eq!(
+            activity(Some(now - 5000), Some(now - 4000), true, Some(4000)),
+            Activity::NeedsInput
+        );
+    }
+
+    #[test]
+    fn needs_input_sessions_sort_to_the_top() {
+        let now = 10_000;
+        let mut sessions = HashMap::new();
+        // "blocked" was active long ago (large idle) but is waiting on the user;
+        // "fresh" is the most recently active otherwise.
+        let mut blocked = session(Some(now - 5000), None, None);
+        blocked.last_notify_ts = Some(now - 4000);
+        sessions.insert("blocked".to_string(), blocked);
+        sessions.insert("fresh".to_string(), session(Some(now - 5), None, None));
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        assert_eq!(views[0].claude_session, "blocked");
+        assert_eq!(views[0].activity, Activity::NeedsInput);
+        assert_eq!(views[1].claude_session, "fresh");
     }
 
     #[test]

@@ -57,6 +57,12 @@ pub struct SessionState {
     /// turn is in progress — Claude is *working* — when this is newer than
     /// `last_turn_ts`.
     pub last_prompt_ts: Option<i64>,
+    /// Set when Claude raised a *blocking* notification mid-turn (a permission
+    /// prompt or an elicitation) and is waiting on the user — see the
+    /// `Notification` hook. A latch: it's `Some` only while the wait is pending,
+    /// cleared by the next sign of forward progress (`PostToolUse`,
+    /// `UserPromptSubmit`, `Stop`). Drives [`crate::fleet::Activity::NeedsInput`].
+    pub last_notify_ts: Option<i64>,
     pub model: Option<String>,
     pub turn_count: u64,
     pub context_pct_used: Option<u32>,
@@ -141,6 +147,7 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
     Some(SessionState {
         last_turn_ts: v.get("last_turn_ts").and_then(|x| x.as_i64()),
         last_prompt_ts: v.get("last_prompt_ts").and_then(|x| x.as_i64()),
+        last_notify_ts: v.get("last_notify_ts").and_then(|x| x.as_i64()),
         model: v.get("model").and_then(|x| x.as_str()).map(str::to_string),
         turn_count: v.get("turn_count").and_then(|x| x.as_u64()).unwrap_or(0),
         context_pct_used: v
@@ -175,6 +182,7 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
     let v = json!({
         "last_turn_ts": s.last_turn_ts,
         "last_prompt_ts": s.last_prompt_ts,
+        "last_notify_ts": s.last_notify_ts,
         "model": s.model,
         "turn_count": s.turn_count,
         "context_pct_used": s.context_pct_used,
