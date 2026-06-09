@@ -60,6 +60,29 @@ impl CliTmux {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if s.is_empty() { None } else { Some(s) }
     }
+
+    /// The tty of a client attached to `pane`'s session — the pty the terminal
+    /// emulator allocated for the tmux client, which iTerm2/Terminal report as
+    /// their session/tab `tty`. Used (macOS only) to raise the GUI window after
+    /// a jump. Picks the first attached client; ambiguous only when several
+    /// clients share the session, in which case any of their windows is a
+    /// reasonable thing to surface.
+    #[cfg(target_os = "macos")]
+    fn client_tty(&self, pane: &str) -> Option<String> {
+        let session = self.session_of(pane)?;
+        let out = Command::new("tmux")
+            .args(["list-clients", "-t", &session, "-F", "#{client_tty}"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    }
 }
 
 impl Tmux for CliTmux {
@@ -128,6 +151,16 @@ impl Tmux for CliTmux {
         let _ = Command::new("tmux")
             .args(["switch-client", "-t", pane])
             .status();
+        // The tmux switch above moves the *client* to the pane, but doesn't
+        // raise the macOS emulator window hosting that client — so a jump made
+        // from a separate window (e.g. an iTerm2 hotkey window running `top`)
+        // changes the tab without surfacing it. Raise that window via its
+        // client tty. Best-effort and idempotent: if we're already in the
+        // target window it re-activates the front window, a no-op visually.
+        #[cfg(target_os = "macos")]
+        if let Some(tty) = self.client_tty(pane) {
+            crate::window::focus_tty(&tty);
+        }
     }
 }
 

@@ -112,7 +112,7 @@ fn iterm_session_guid(iterm_session_id: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::focus;
+pub use macos::{focus, focus_tty};
 
 #[cfg(target_os = "linux")]
 pub use linux::focus;
@@ -144,6 +144,21 @@ mod macos {
         }
     }
 
+    /// Raise the emulator window whose session/tab is on `tty`, trying iTerm2
+    /// then Terminal.app. This is the GUI half of a *tmux* jump: `focus_pane`
+    /// switches the client at the tmux layer but never raises the emulator
+    /// window hosting it (the jump assumed you were already looking at it). The
+    /// caller passes a tmux `#{client_tty}` — the pty the emulator allocated for
+    /// the tmux client, which both iTerm2 (`tty of session`) and Terminal
+    /// (`tty of tab`) report. Best-effort: `false` if the tty is unsafe or no
+    /// local emulator owns it (e.g. an SSH/nested client).
+    pub fn focus_tty(tty: &str) -> bool {
+        let Some(tty) = sanitize_tty(tty) else {
+            return false;
+        };
+        focus_iterm2_tty(&tty) || focus_terminal_app(&tty)
+    }
+
     /// Select the iTerm2 session with this GUID and bring iTerm2 forward.
     fn focus_iterm2(session_id: &str) -> bool {
         let script = format!(
@@ -152,6 +167,31 @@ mod macos {
     repeat with t in tabs of w
       repeat with s in sessions of t
         if id of s is "{session_id}" then
+          select w
+          select t
+          select s
+          activate
+          return "1"
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell
+return "0""#
+        );
+        run_osascript(&script)
+    }
+
+    /// Select the iTerm2 session on this tty and bring iTerm2 forward. The
+    /// tty-keyed counterpart of [`focus_iterm2`], used for tmux jumps where we
+    /// have the client's tty rather than a per-session GUID.
+    fn focus_iterm2_tty(tty: &str) -> bool {
+        let script = format!(
+            r#"tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if tty of s is "{tty}" then
           select w
           select t
           select s
@@ -213,10 +253,18 @@ return "0""#
         if t.is_empty() || t == "??" || t == "?" {
             return None;
         }
-        let path = if t.starts_with("/dev/") {
-            t
+        sanitize_tty(&t)
+    }
+
+    /// Normalise a tty to a `/dev/ttysNNN` path, rejecting any value carrying
+    /// characters that aren't safe to splice into an AppleScript literal.
+    /// Accepts the short form (`ttys001`) or a full `/dev/` path. Shared by the
+    /// pid-derived ([`pid_tty`]) and tmux-client-derived ([`focus_tty`]) paths.
+    pub(super) fn sanitize_tty(tty: &str) -> Option<String> {
+        let path = if tty.starts_with("/dev/") {
+            tty.to_string()
         } else {
-            format!("/dev/{t}")
+            format!("/dev/{tty}")
         };
         let body = path.strip_prefix("/dev/").unwrap_or("");
         let ok = !body.is_empty()
@@ -306,6 +354,23 @@ mod tests {
         // A value carrying AppleScript-breaking characters is refused.
         assert_eq!(iterm_session_guid("w0t0p0:bad\"quote"), None);
         assert_eq!(iterm_session_guid("w0t0p0:"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sanitize_tty_normalises_and_rejects() {
+        use super::macos::sanitize_tty;
+        // Short form gets the /dev/ prefix.
+        assert_eq!(sanitize_tty("ttys003").as_deref(), Some("/dev/ttys003"));
+        // Full path passes through.
+        assert_eq!(
+            sanitize_tty("/dev/ttys003").as_deref(),
+            Some("/dev/ttys003")
+        );
+        // AppleScript-breaking characters are refused.
+        assert_eq!(sanitize_tty("ttys003\" then activate"), None);
+        assert_eq!(sanitize_tty(""), None);
+        assert_eq!(sanitize_tty("/dev/"), None);
     }
 
     #[test]
