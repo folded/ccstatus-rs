@@ -192,7 +192,7 @@ fn ui(f: &mut Frame, views: &[SessionView], state: &mut TableState, my_server: O
             body,
         );
     } else {
-        f.render_stateful_widget(table(views, my_server), body, state);
+        f.render_stateful_widget(table(views, my_server, body.width), body, state);
     }
 
     f.render_widget(
@@ -284,23 +284,44 @@ fn divider_line(area: Rect) -> Paragraph<'static> {
     Paragraph::new(Span::styled("─".repeat(area.width as usize), dim()))
 }
 
-fn table<'a>(views: &'a [SessionView], my_server: Option<&str>) -> Table<'a> {
-    let rows = views.iter().map(|v| session_row(v, my_server));
+fn table<'a>(views: &'a [SessionView], my_server: Option<&str>, width: u16) -> Table<'a> {
+    let dir_w = dir_width(width);
+    let rows = views.iter().map(|v| session_row(v, my_server, dir_w));
     let widths = [
-        Constraint::Length(8),  // activity
+        // Directory first: it's the most useful "which session is this" cue, so
+        // it leads and gets the slack. The cell is pre-elided to `dir_w` keeping
+        // the tail (last path component), so it never clips the useful end.
+        Constraint::Length(dir_w as u16),
+        Constraint::Length(8),  // activity (working/waiting)
         Constraint::Length(22), // model (longest is "Opus 4.8 (1M context)")
         Constraint::Length(8),  // ctx N%
         Constraint::Length(10), // idle <age>
-        Constraint::Min(10),    // cwd; ratatui clips the tail
-        Constraint::Length(13), // note (jumpability) — own column so a long cwd
-                                // can't clip it off ("(not in tmux)" = 13)
+        Constraint::Length(13), // note (jumpability) — "(not in tmux)" = 13
     ];
     Table::new(rows, widths)
         .column_spacing(1)
         .highlight_symbol(Span::styled("▶ ", Style::default().fg(C_BLUE)))
 }
 
-fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>) -> Row<'a> {
+/// Columns to the left of the fixed ones, i.e. the directory column's width:
+/// the table width minus the fixed columns, the inter-column spacing, the
+/// selection gutter, and a 1-col margin so the elided path can't spill into the
+/// activity column. Floored so a narrow terminal still shows a usable stub.
+fn dir_width(total: u16) -> usize {
+    const FIXED: u16 = 8 + 22 + 8 + 10 + 13;
+    const SPACING: u16 = 5; // 6 columns at column_spacing(1)
+    const GUTTER: u16 = 2; // the "▶ " highlight symbol
+    const MARGIN: u16 = 1;
+    total
+        .saturating_sub(FIXED + SPACING + GUTTER + MARGIN)
+        .max(10) as usize
+}
+
+fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>, dir_w: usize) -> Row<'a> {
+    let dir = Span::styled(
+        elide_left(v.cwd.as_deref().unwrap_or(""), dir_w),
+        Style::default().fg(C_CYAN),
+    );
     let activity = match v.activity {
         Activity::Working => Span::styled("working", Style::default().fg(C_GREEN)),
         Activity::Waiting => Span::styled("waiting", Style::default().fg(C_ORANGE)),
@@ -321,7 +342,6 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>) -> Row<'a> {
         Some(a) if my_server != Some(a.server_id.as_str()) => "*",
         _ => "",
     };
-    let cwd = Span::styled(v.cwd.as_deref().unwrap_or(""), Style::default().fg(C_CYAN));
     let note = match (&v.address, &v.window) {
         (Some(_), _) if !v.jumpable => "(no handler)",
         (Some(_), _) => "",
@@ -331,6 +351,7 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>) -> Row<'a> {
     };
 
     Row::new(vec![
+        Line::from(dir),
         Line::from(activity),
         Line::from(model),
         Line::from(vec![Span::styled("ctx ", dim()), Span::raw(ctx)]),
@@ -338,9 +359,23 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>) -> Row<'a> {
             Span::styled("idle ", dim()),
             Span::raw(format!("{age}{here}")),
         ]),
-        Line::from(cwd),
         Line::styled(note, dim()),
     ])
+}
+
+/// Truncate `s` to `width` columns keeping its *right* end — for a path that's
+/// the last component, which identifies a session far better than its shared
+/// prefix — eliding the head with `…`. Char-based, which is fine for paths.
+fn elide_left(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - (width - 1)).collect();
+    format!("…{tail}")
 }
 
 fn human_age(secs: i64) -> String {
@@ -399,10 +434,10 @@ mod tests {
 
     /// Render one frame to ratatui's test backend and read the cells back as
     /// text: confirms the header, the row, and the not-in-tmux note all land,
-    /// and (the bug that started this) that the long cwd is clipped to the
-    /// table width rather than overrunning it.
+    /// and that a long cwd is elided from the *head* (keeping the useful tail)
+    /// rather than clipped from the tail or overrunning the table width.
     #[test]
-    fn renders_header_row_and_clips_cwd() {
+    fn renders_header_row_and_elides_cwd_head() {
         use ratatui::backend::TestBackend;
 
         let long = "/Users/tjs/populationgenomics/metamist/.claude/worktrees/some-very-long-branch";
@@ -428,9 +463,23 @@ mod tests {
         assert!(text.contains("▶"), "selection marker missing:\n{text}");
         assert!(text.contains("waiting"), "activity missing:\n{text}");
         assert!(text.contains("(not in tmux)"), "note missing:\n{text}");
+        // The head is elided and the tail (last component) is preserved; the
+        // shared prefix is gone.
+        assert!(text.contains('…'), "cwd not elided:\n{text}");
+        assert!(text.contains("branch"), "cwd tail missing:\n{text}");
+        assert!(!text.contains("Users"), "cwd prefix should be elided:\n{text}");
         // No physical line exceeds the 80-col terminal.
         for l in &lines {
             assert!(l.chars().count() <= 80, "line over width: {l:?}");
         }
+    }
+
+    #[test]
+    fn elide_left_keeps_the_tail() {
+        assert_eq!(elide_left("/a/b/short", 20), "/a/b/short");
+        assert_eq!(elide_left("/very/long/path/to/proj", 10), "…h/to/proj");
+        assert_eq!(elide_left("anything", 0), "");
+        // The result never exceeds the requested width.
+        assert!(elide_left("/very/long/path/to/proj", 10).chars().count() <= 10);
     }
 }
