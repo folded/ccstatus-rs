@@ -69,20 +69,31 @@ fn handle_prompt(input: &Value) {
 }
 
 /// Latch the "waiting on you" state when Claude raises a *blocking*
-/// notification. Non-blocking kinds (idle nudge, auth, elicitation
-/// acknowledgements) carry no pending decision, so they're ignored entirely —
-/// idle is already covered by `Stop` + elapsed time.
+/// notification mid-turn. Non-blocking kinds (auth, elicitation
+/// acknowledgements) carry no pending decision and are dropped by type; the
+/// idle nudge is dropped by timing — it fires ~60s *after* a turn completes, so
+/// the turn isn't running and `should_latch` is false. That's plain "waiting",
+/// already covered by `Stop` + elapsed time, not "needs input".
 fn handle_notification(input: &Value) {
     let kind = input.get("type").and_then(|v| v.as_str());
-    if !is_blocking_notification(kind) {
-        return;
-    }
     let Some(session_id) = resolve_session_id(input) else {
         return;
     };
     let mut s = state::read_session(&session_id).unwrap_or_default();
+    if !should_latch(kind, s.last_prompt_ts, s.last_turn_ts) {
+        return;
+    }
     s.last_notify_ts = Some(now_unix());
     let _ = state::write_session(&session_id, &s);
+}
+
+/// Whether a notification should latch `NeedsInput`: a blocking kind, raised
+/// while a turn is in progress (`last_prompt` newer than `last_turn` — the same
+/// condition as [`crate::fleet::Activity::Working`]). The mid-turn requirement
+/// is what distinguishes "Claude is blocked asking you" from the idle nudge
+/// that fires after a turn has already finished.
+fn should_latch(kind: Option<&str>, last_prompt: Option<i64>, last_turn: Option<i64>) -> bool {
+    is_blocking_notification(kind) && last_prompt > last_turn
 }
 
 /// Clear a pending "waiting on you" latch once a tool completes — Claude has
@@ -136,9 +147,27 @@ mod tests {
         assert!(is_blocking_notification(Some("some_future_kind")));
         assert!(is_blocking_notification(None));
         // Known non-blocking kinds carry no pending decision.
-        assert!(!is_blocking_notification(Some("idle_prompt")));
         assert!(!is_blocking_notification(Some("auth_success")));
         assert!(!is_blocking_notification(Some("elicitation_complete")));
         assert!(!is_blocking_notification(Some("elicitation_response")));
+    }
+
+    #[test]
+    fn latches_only_mid_turn() {
+        // Mid-turn (prompt newer than the last completion): a blocking prompt
+        // means Claude is blocked on you -> latch.
+        assert!(should_latch(None, Some(200), Some(100)));
+        assert!(should_latch(Some("permission_prompt"), Some(200), Some(100)));
+        // First turn, no completion yet -> still mid-turn.
+        assert!(should_latch(None, Some(200), None));
+        // The idle nudge: fires after the turn completed (turn newer than
+        // prompt) -> not blocked, don't latch. This is the false-positive the
+        // mid-turn guard exists to kill, regardless of how it's typed.
+        assert!(!should_latch(None, Some(100), Some(200)));
+        assert!(!should_latch(Some("idle_prompt"), Some(100), Some(200)));
+        // No turn data at all -> nothing to block on.
+        assert!(!should_latch(None, None, None));
+        // A non-blocking ack mid-turn still doesn't latch.
+        assert!(!should_latch(Some("elicitation_complete"), Some(200), Some(100)));
     }
 }
