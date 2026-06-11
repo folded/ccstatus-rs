@@ -38,6 +38,9 @@ pub enum Activity {
     NeedsInput,
     /// A turn is in progress (last prompt is newer than the last completion).
     Working,
+    /// The turn has ended, but a background task it launched is still running —
+    /// so the session is doing work, not idly waiting on you.
+    BgRunning,
     /// Finished a turn recently and waiting for input.
     Waiting,
     /// Finished a while ago — you've likely moved on.
@@ -54,6 +57,7 @@ fn activity(
     last_prompt: Option<i64>,
     last_turn: Option<i64>,
     needs_input: bool,
+    bg_running: bool,
     idle_secs: Option<i64>,
 ) -> Activity {
     if needs_input {
@@ -61,10 +65,12 @@ fn activity(
     }
     match (last_prompt, last_turn) {
         // A prompt newer than the last completion (or with no completion yet)
-        // means a turn is running.
+        // means a turn is running — that subsumes any background work.
         (Some(p), Some(t)) if p > t => Activity::Working,
         (Some(_), None) => Activity::Working,
-        // Otherwise the last turn has completed: waiting, or idle once stale.
+        // Turn ended (or no turn data): a live background task means the session
+        // is still working; otherwise it's waiting, then idle once stale.
+        _ if bg_running => Activity::BgRunning,
         (_, Some(_)) => match idle_secs {
             Some(i) if i > ACTIVITY_IDLE_AFTER => Activity::Idle,
             _ => Activity::Waiting,
@@ -104,11 +110,13 @@ pub struct SessionView {
 
 /// Pure: fold session presence + pane addressing into sorted views.
 /// `pane_index` maps a session id to its tmux address; `live_servers` is the
-/// set of server ids with a listening handler; `now` is injected for tests.
+/// set of server ids with a listening handler; `bg_sessions` is the set of
+/// session ids with a live background task; `now` is injected for tests.
 pub fn build_views(
     sessions: &HashMap<String, SessionState>,
     pane_index: &HashMap<String, PaneAddr>,
     live_servers: &HashSet<String>,
+    bg_sessions: &HashSet<String>,
     now: i64,
 ) -> Vec<SessionView> {
     let mut views: Vec<SessionView> = sessions
@@ -142,6 +150,7 @@ pub fn build_views(
                     s.last_prompt_ts,
                     s.last_turn_ts,
                     s.last_notify_ts.is_some(),
+                    bg_sessions.contains(id),
                     idle_secs,
                 ),
                 idle_secs,
@@ -151,10 +160,14 @@ pub fn build_views(
             }
         })
         .collect();
-    // Most recently active first; sessions with no turn yet sink to the bottom.
-    // Sessions blocked on you float to the top (they need action now);
-    // everything else follows by most-recent activity, ties broken by id.
-    let rank = |v: &SessionView| u8::from(v.activity != Activity::NeedsInput);
+    // Sessions blocked on you float to the very top (they need action now),
+    // then ones still working in the background (live but unattended); the rest
+    // follow by most-recent activity, ties broken by id.
+    let rank = |v: &SessionView| match v.activity {
+        Activity::NeedsInput => 0u8,
+        Activity::BgRunning => 1,
+        _ => 2,
+    };
     views.sort_by(|a, b| {
         rank(a)
             .cmp(&rank(b))
@@ -186,7 +199,16 @@ pub fn collect() -> Vec<SessionView> {
     let sessions = dedup_to_current(sessions);
     let pane_index = read_pane_index();
     let live_servers = live_servers();
-    build_views(&sessions, &pane_index, &live_servers, now_unix())
+    // One `ps` snapshot → the session ids whose Claude process has a live
+    // background task running (so a finished turn still reads as "working").
+    let claude_pids: HashSet<u32> = sessions.values().filter_map(|s| s.claude_pid).collect();
+    let bg_pids = crate::util::pids_with_background_tasks(&claude_pids);
+    let bg_sessions: HashSet<String> = sessions
+        .iter()
+        .filter(|(_, s)| s.claude_pid.is_some_and(|p| bg_pids.contains(&p)))
+        .map(|(id, _)| id.clone())
+        .collect();
+    build_views(&sessions, &pane_index, &live_servers, &bg_sessions, now_unix())
 }
 
 /// Pure: collapse sessions that share a `claude_pid` down to the most
@@ -382,7 +404,7 @@ mod tests {
         sessions.insert("idle".to_string(), session(Some(now - 200), None, None));
         sessions.insert("active".to_string(), session(Some(now - 5), None, None));
         sessions.insert("never".to_string(), session(None, None, None));
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), now);
         let order: Vec<&str> = views.iter().map(|v| v.claude_session.as_str()).collect();
         assert_eq!(order, vec!["active", "idle", "never"]);
     }
@@ -394,7 +416,7 @@ mod tests {
         let mut s = session(Some(now), Some("Opus"), Some(42));
         s.cwd = Some("~/demo".into());
         sessions.insert("s".to_string(), s);
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), now);
         assert_eq!(views[0].model.as_deref(), Some("Opus"));
         assert_eq!(views[0].cwd.as_deref(), Some("~/demo"));
         assert_eq!(views[0].context_pct, Some(42));
@@ -405,38 +427,72 @@ mod tests {
         let now = 10_000;
         // Prompt newer than last turn -> working.
         assert_eq!(
-            activity(Some(now), Some(now - 50), false, Some(50)),
+            activity(Some(now), Some(now - 50), false, false, Some(50)),
             Activity::Working
         );
         // Prompt, never completed -> working.
-        assert_eq!(activity(Some(now), None, false, None), Activity::Working);
+        assert_eq!(activity(Some(now), None, false, false, None), Activity::Working);
         // Completed after the prompt, recently -> waiting.
         assert_eq!(
-            activity(Some(now - 100), Some(now - 10), false, Some(10)),
+            activity(Some(now - 100), Some(now - 10), false, false, Some(10)),
             Activity::Waiting
         );
         // Completed long ago -> idle.
         assert_eq!(
-            activity(Some(now - 5000), Some(now - 4000), false, Some(4000)),
+            activity(Some(now - 5000), Some(now - 4000), false, false, Some(4000)),
             Activity::Idle
         );
         // Turn but no recorded prompt, recent -> waiting.
         assert_eq!(
-            activity(None, Some(now - 5), false, Some(5)),
+            activity(None, Some(now - 5), false, false, Some(5)),
             Activity::Waiting
         );
         // Nothing -> unknown.
-        assert_eq!(activity(None, None, false, None), Activity::Unknown);
+        assert_eq!(activity(None, None, false, false, None), Activity::Unknown);
         // A pending blocking notification wins over any turn state, even a
         // mid-turn "working" or a long-idle completion.
         assert_eq!(
-            activity(Some(now), Some(now - 50), true, Some(50)),
+            activity(Some(now), Some(now - 50), true, false, Some(50)),
             Activity::NeedsInput
         );
         assert_eq!(
-            activity(Some(now - 5000), Some(now - 4000), true, Some(4000)),
+            activity(Some(now - 5000), Some(now - 4000), true, false, Some(4000)),
             Activity::NeedsInput
         );
+        // A live background task: a completed/stale turn reads as still working,
+        // but a turn actually in progress stays "working", and a blocking
+        // notification still wins.
+        assert_eq!(
+            activity(Some(now - 100), Some(now - 10), false, true, Some(10)),
+            Activity::BgRunning
+        );
+        assert_eq!(
+            activity(Some(now - 5000), Some(now - 4000), false, true, Some(4000)),
+            Activity::BgRunning
+        );
+        assert_eq!(
+            activity(Some(now), Some(now - 50), false, true, Some(50)),
+            Activity::Working
+        );
+        assert_eq!(
+            activity(Some(now), Some(now - 50), true, true, Some(50)),
+            Activity::NeedsInput
+        );
+    }
+
+    #[test]
+    fn bg_running_sorts_above_waiting_and_idle() {
+        let now = 10_000;
+        let mut sessions = HashMap::new();
+        // "bg" completed its turn long ago (would be Idle) but has a live task;
+        // "waiting" just finished and is genuinely idle-waiting.
+        sessions.insert("bg".to_string(), session(Some(now - 5000), None, None));
+        sessions.insert("waiting".to_string(), session(Some(now - 5), None, None));
+        let bg: HashSet<String> = ["bg".to_string()].into_iter().collect();
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &bg, now);
+        assert_eq!(views[0].claude_session, "bg");
+        assert_eq!(views[0].activity, Activity::BgRunning);
+        assert_eq!(views[1].claude_session, "waiting");
     }
 
     #[test]
@@ -449,7 +505,7 @@ mod tests {
         blocked.last_notify_ts = Some(now - 4000);
         sessions.insert("blocked".to_string(), blocked);
         sessions.insert("fresh".to_string(), session(Some(now - 5), None, None));
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), now);
         assert_eq!(views[0].claude_session, "blocked");
         assert_eq!(views[0].activity, Activity::NeedsInput);
         assert_eq!(views[1].claude_session, "fresh");
@@ -462,7 +518,7 @@ mod tests {
         let mut s = session(Some(now - 100), None, None); // completed at now-100
         s.last_prompt_ts = Some(now - 5); // new prompt since -> working
         sessions.insert("s".to_string(), s);
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), now);
         assert_eq!(views[0].activity, Activity::Working);
     }
 
@@ -472,7 +528,7 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert("s".to_string(), session(Some(now), None, None));
         // No pane file, no addressable terminal -> not jumpable.
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), now);
         assert!(views[0].address.is_none());
         assert!(views[0].window.is_none());
         assert!(!views[0].jumpable);
@@ -488,7 +544,7 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert("s".to_string(), s);
         // No pane file -> not in tmux, but the iTerm2 window is addressable.
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), now);
         assert!(views[0].address.is_none());
         assert!(matches!(views[0].window, Some(WindowTarget::ITerm2 { .. })));
         assert!(views[0].jumpable);
@@ -503,7 +559,7 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert("s".to_string(), s);
         // No pane file -> not in tmux; the graphical display makes it jumpable.
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), now);
+        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), now);
         assert!(views[0].address.is_none());
         assert!(matches!(
             views[0].window,
@@ -525,7 +581,7 @@ mod tests {
         let mut live = HashSet::new();
         live.insert("L".to_string());
 
-        let views = build_views(&sessions, &panes, &live, now);
+        let views = build_views(&sessions, &panes, &live, &HashSet::new(), now);
         let by = |s: &str| {
             views
                 .iter()

@@ -212,6 +212,7 @@ fn header_line(views: &[SessionView]) -> Line<'static> {
     let count = |a: Activity| views.iter().filter(|v| v.activity == a).count();
     let needs_input = count(Activity::NeedsInput);
     let working = count(Activity::Working);
+    let bg = count(Activity::BgRunning);
     let waiting = count(Activity::Waiting);
     let mut spans = vec![
         Span::styled("ccstatus", Style::default().fg(C_BLUE)),
@@ -231,6 +232,11 @@ fn header_line(views: &[SessionView]) -> Line<'static> {
         format!("{working} working"),
         Style::default().fg(C_GREEN),
     ));
+    // Background runners only when present, so the common case stays uncluttered.
+    if bg > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(format!("⚙ {bg} bg"), Style::default().fg(C_CYAN)));
+    }
     spans.push(sep());
     spans.push(Span::styled(
         format!("{waiting} waiting"),
@@ -338,6 +344,7 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>, dir_w: usize) ->
             Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
         ),
         Activity::Working => Span::styled("working", Style::default().fg(C_GREEN)),
+        Activity::BgRunning => Span::styled("⚙ bg", Style::default().fg(C_CYAN)),
         Activity::Waiting => Span::styled("waiting", Style::default().fg(C_ORANGE)),
         Activity::Idle => Span::styled("idle", dim()),
         Activity::Unknown => Span::styled("-", dim()),

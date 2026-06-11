@@ -1,5 +1,6 @@
 //! Small helpers shared across modes.
 
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,6 +69,85 @@ fn ps_command(pid: u32) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Substring identifying a Claude Code Bash-tool shell: every tool command
+/// (foreground or background) is run as `<shell> -c 'source …/shell-snapshots/
+/// snapshot-<shell>-….sh … && eval <command>'`, so this marker appears in the
+/// wrapper's argv and in nothing else Claude spawns (MCP servers, `caffeinate`,
+/// the statusline/hook `ccstatus` invocations). A *background* task is one of
+/// these wrappers still alive as a descendant of the session after its turn
+/// ended — a foreground command only lives while the turn is in progress.
+const BG_WRAPPER_MARKER: &str = "shell-snapshots/snapshot";
+
+/// IO: which of `claude_pids` currently host a live background Bash task. One
+/// `ps` snapshot of the whole process table, then a pure tree walk. Empty input
+/// → empty output without spawning `ps`.
+pub fn pids_with_background_tasks(claude_pids: &HashSet<u32>) -> HashSet<u32> {
+    if claude_pids.is_empty() {
+        return HashSet::new();
+    }
+    roots_with_descendant_matching(&ps_snapshot(), claude_pids, BG_WRAPPER_MARKER)
+}
+
+/// `(pid, ppid, command)` for every process, via one `ps`. The flags are the
+/// portable intersection of BSD (macOS) and procps (Linux) `ps`; `=` suffixes
+/// suppress headers. Empty on failure (background detection degrades to off).
+fn ps_snapshot() -> Vec<(u32, u32, String)> {
+    let Ok(out) = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid = it.next()?.parse().ok()?;
+            let ppid = it.next()?.parse().ok()?;
+            let cmd = it.collect::<Vec<_>>().join(" ");
+            Some((pid, ppid, cmd))
+        })
+        .collect()
+}
+
+/// Pure: the subset of `roots` that have a descendant whose command contains
+/// `marker`. Builds a ppid→children map and DFS-walks each root's subtree (the
+/// root's own command is not matched — a session process never carries the
+/// marker). Cycle-guarded.
+fn roots_with_descendant_matching(
+    procs: &[(u32, u32, String)],
+    roots: &HashSet<u32>,
+    marker: &str,
+) -> HashSet<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut cmd: HashMap<u32, &str> = HashMap::new();
+    for (pid, ppid, c) in procs {
+        children.entry(*ppid).or_default().push(*pid);
+        cmd.insert(*pid, c.as_str());
+    }
+    let mut out = HashSet::new();
+    for &root in roots {
+        let mut stack: Vec<u32> = children.get(&root).cloned().unwrap_or_default();
+        let mut seen = HashSet::new();
+        while let Some(p) = stack.pop() {
+            if !seen.insert(p) {
+                continue;
+            }
+            if cmd.get(&p).is_some_and(|c| c.contains(marker)) {
+                out.insert(root);
+                break;
+            }
+            if let Some(cs) = children.get(&p) {
+                stack.extend(cs);
+            }
+        }
+    }
+    out
+}
+
 /// Extract the Claude session id from a stdin payload. Prefers an explicit
 /// `session_id` top-level field; falls back to the basename (without
 /// extension) of `transcript_path` so older / leaner payloads still work.
@@ -123,5 +203,27 @@ mod tests {
         assert!(!ic("/bin/zsh"));
         assert!(!ic("node /some/server.js"));
         assert!(!ic(""));
+    }
+
+    #[test]
+    fn background_task_detection_walks_the_tree() {
+        use super::{roots_with_descendant_matching, BG_WRAPPER_MARKER as M};
+        use std::collections::HashSet;
+        // pid 100 = a claude session with a live bg-task wrapper (102) whose
+        //           leaf is `sleep 600` (103); also an MCP server (104).
+        // pid 200 = a claude session with only an MCP server (201) — no task.
+        let procs = vec![
+            (100, 1, "claude --resume".into()),
+            (102, 100, "/bin/zsh -c source /home/u/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'sleep 600'".into()),
+            (103, 102, "sleep 600".into()),
+            (104, 100, "/usr/bin/python3 mcp_server.py".into()),
+            (200, 1, "claude".into()),
+            (201, 200, "node mcp.js".into()),
+            (300, 1, "caffeinate -i -t 300".into()),
+        ];
+        let roots: HashSet<u32> = [100, 200].into_iter().collect();
+        let hit = roots_with_descendant_matching(&procs, &roots, M);
+        assert!(hit.contains(&100), "session with a bg wrapper should match");
+        assert!(!hit.contains(&200), "session with only an MCP server should not");
     }
 }
