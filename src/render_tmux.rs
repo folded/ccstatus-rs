@@ -11,10 +11,19 @@ use crate::color::{DIM, GREEN, RED, RESET};
 use crate::state::SessionState;
 use crate::util::now_unix;
 
-/// Threshold at which the warmth indicator flips warm->cold. Sits a little
-/// under Claude's documented ~5-minute prompt-cache TTL. The single owner;
-/// `daemon` reads it from here too.
-pub const WARM_THRESHOLD_SECS: i64 = 270;
+/// Default prompt-cache TTL when a session's tier is still unknown: the
+/// conservative 5-minute cache (also correct for API keys).
+pub const CACHE_TTL_DEFAULT_SECS: i64 = 300;
+
+/// Seconds of idle after which the warmth indicator flips warm->cold, for a
+/// session whose granted cache TTL is `ttl` (see [`SessionState::cache_ttl_secs`]
+/// — 300 for the 5-minute cache, 3600 for the 1-hour cache on subscriptions).
+/// 90% of the TTL: a margin for clock skew and for the idle clock starting at
+/// turn-end rather than request-send. 5m→270s (the historical value); 1h→3240s.
+/// The single owner; `daemon` calls it too.
+pub fn warm_threshold_secs(ttl: Option<i64>) -> i64 {
+    ttl.unwrap_or(CACHE_TTL_DEFAULT_SECS) * 9 / 10
+}
 
 /// The inline separator between segments on one surface: ` | ` dimmed.
 pub fn sep() -> String {
@@ -46,7 +55,7 @@ where
 pub fn warmth_segment(session: &SessionState) -> Option<String> {
     let ts = session.last_turn_ts?;
     let idle = (now_unix() - ts).max(0);
-    let (label, color) = if idle < WARM_THRESHOLD_SECS {
+    let (label, color) = if idle < warm_threshold_secs(session.cache_ttl_secs) {
         ("warm", GREEN)
     } else {
         ("cold", RED)

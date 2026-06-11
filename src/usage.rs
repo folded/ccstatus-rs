@@ -392,10 +392,92 @@ fn format_local(epoch: i64, fmt: &str) -> Option<String> {
     Some(dt.format(fmt).to_string())
 }
 
+/// The prompt-cache TTL (seconds) Anthropic granted this session, inferred from
+/// the most recent turn that wrote cache in the transcript: `3600` for the
+/// 1-hour ephemeral tier (subscription plans), `300` for the 5-minute tier (API
+/// keys). `None` if no cache-writing turn is found. Reads only the transcript
+/// tail — the latest turn is at the end. Subagent requests use the 5m tier, but
+/// they live in their own transcripts, so the main session's tier is unaffected.
+pub fn detect_cache_ttl_secs(transcript_path: &str) -> Option<i64> {
+    let tail = read_tail(transcript_path, 256 * 1024)?;
+    // Scan complete lines newest-first; a truncated leading line just fails to
+    // parse and is skipped.
+    for line in tail.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|x| x.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(cc) = v.pointer("/message/usage/cache_creation")
+            && let Some(ttl) = ttl_from_cache_creation(cc)
+        {
+            return Some(ttl);
+        }
+    }
+    None
+}
+
+/// Pure: map a turn's `cache_creation` ephemeral breakdown to a TTL — `3600` if
+/// it wrote to the 1-hour tier, `300` if only the 5-minute tier, `None` if it
+/// wrote no cache this turn (so the scan continues to an earlier turn).
+fn ttl_from_cache_creation(cc: &Value) -> Option<i64> {
+    let field = |k| cc.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    if field("ephemeral_1h_input_tokens") > 0 {
+        Some(3600)
+    } else if field("ephemeral_5m_input_tokens") > 0 {
+        Some(300)
+    } else {
+        None
+    }
+}
+
+/// Read the last `max` bytes of a file as (lossy) UTF-8, or `None` if it can't
+/// be opened. Lossy decoding tolerates a multibyte char split at the seek point.
+fn read_tail(path: &str, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max))).ok()?;
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cache_ttl_from_tier() {
+        // 1h tier present -> subscription, 3600.
+        assert_eq!(
+            ttl_from_cache_creation(
+                &json!({"ephemeral_1h_input_tokens": 26014, "ephemeral_5m_input_tokens": 0})
+            ),
+            Some(3600)
+        );
+        // Only the 5m tier -> API-key, 300.
+        assert_eq!(
+            ttl_from_cache_creation(
+                &json!({"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 26014})
+            ),
+            Some(300)
+        );
+        // 1h wins if both are non-zero.
+        assert_eq!(
+            ttl_from_cache_creation(
+                &json!({"ephemeral_1h_input_tokens": 10, "ephemeral_5m_input_tokens": 10})
+            ),
+            Some(3600)
+        );
+        // No cache written this turn -> keep scanning.
+        assert_eq!(
+            ttl_from_cache_creation(&json!({"ephemeral_1h_input_tokens": 0})),
+            None
+        );
+    }
 
     fn contains_pct(s: &str) -> bool {
         s.contains('%')

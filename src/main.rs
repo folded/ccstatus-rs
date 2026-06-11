@@ -305,6 +305,15 @@ fn write_session_presence(input: &Value) {
     let denom = input_tokens + cache_create + cache_read;
     s.cache_read_pct = Some((cache_read * 100).checked_div(denom).unwrap_or(0) as u32);
 
+    // The granted cache TTL (5m API key vs 1h subscription) drives how long the
+    // warmth indicator stays warm. It's stable for a session, so detect it once
+    // from the transcript — a tail read — and never again.
+    if s.cache_ttl_secs.is_none()
+        && let Some(path) = input.get("transcript_path").and_then(|v| v.as_str())
+    {
+        s.cache_ttl_secs = usage::detect_cache_ttl_secs(path);
+    }
+
     if s == before {
         return;
     }

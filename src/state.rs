@@ -63,6 +63,11 @@ pub struct SessionState {
     /// cleared by the next sign of forward progress (`PostToolUse`,
     /// `UserPromptSubmit`, `Stop`). Drives [`crate::fleet::Activity::NeedsInput`].
     pub last_notify_ts: Option<i64>,
+    /// The prompt-cache TTL Anthropic granted this session, in seconds, inferred
+    /// from the most recent turn's cache-creation tier (3600 = the 1-hour cache
+    /// on subscription plans; 300 = the 5-minute cache for API keys). `None`
+    /// until a turn writes cache; the warmth indicator then defaults to 300.
+    pub cache_ttl_secs: Option<i64>,
     pub model: Option<String>,
     pub turn_count: u64,
     pub context_pct_used: Option<u32>,
@@ -148,6 +153,7 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
         last_turn_ts: v.get("last_turn_ts").and_then(|x| x.as_i64()),
         last_prompt_ts: v.get("last_prompt_ts").and_then(|x| x.as_i64()),
         last_notify_ts: v.get("last_notify_ts").and_then(|x| x.as_i64()),
+        cache_ttl_secs: v.get("cache_ttl_secs").and_then(|x| x.as_i64()),
         model: v.get("model").and_then(|x| x.as_str()).map(str::to_string),
         turn_count: v.get("turn_count").and_then(|x| x.as_u64()).unwrap_or(0),
         context_pct_used: v
@@ -183,6 +189,7 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
         "last_turn_ts": s.last_turn_ts,
         "last_prompt_ts": s.last_prompt_ts,
         "last_notify_ts": s.last_notify_ts,
+        "cache_ttl_secs": s.cache_ttl_secs,
         "model": s.model,
         "turn_count": s.turn_count,
         "context_pct_used": s.context_pct_used,
