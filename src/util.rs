@@ -78,22 +78,24 @@ fn ps_command(pid: u32) -> Option<String> {
 /// ended — a foreground command only lives while the turn is in progress.
 const BG_WRAPPER_MARKER: &str = "shell-snapshots/snapshot";
 
-/// IO: which of `claude_pids` currently host a live background Bash task. One
-/// `ps` snapshot of the whole process table, then a pure tree walk. Empty input
-/// → empty output without spawning `ps`.
-pub fn pids_with_background_tasks(claude_pids: &HashSet<u32>) -> HashSet<u32> {
-    if claude_pids.is_empty() {
-        return HashSet::new();
-    }
-    roots_with_descendant_matching(&ps_snapshot(), claude_pids, BG_WRAPPER_MARKER)
+/// One row of a [`ps_snapshot`]: a process's id, parent, kernel state code, and
+/// full command line.
+pub struct ProcInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    /// The `ps` state field; its first character is the primary code (`T` =
+    /// stopped/suspended, `S` sleeping, `R` running, `Z` zombie, …).
+    pub state: String,
+    pub command: String,
 }
 
-/// `(pid, ppid, command)` for every process, via one `ps`. The flags are the
-/// portable intersection of BSD (macOS) and procps (Linux) `ps`; `=` suffixes
-/// suppress headers. Empty on failure (background detection degrades to off).
-fn ps_snapshot() -> Vec<(u32, u32, String)> {
+/// IO: `(pid, ppid, state, command)` for every process, via one `ps`. The flags
+/// are the portable intersection of BSD (macOS) and procps (Linux) `ps`; `=`
+/// suffixes suppress headers. `command` is last (it has spaces); the first three
+/// fields are single tokens. Empty on failure (detectors degrade to off).
+pub fn ps_snapshot() -> Vec<ProcInfo> {
     let Ok(out) = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,command="])
+        .args(["-axo", "pid=,ppid=,state=,command="])
         .output()
     else {
         return Vec::new();
@@ -107,9 +109,32 @@ fn ps_snapshot() -> Vec<(u32, u32, String)> {
             let mut it = l.split_whitespace();
             let pid = it.next()?.parse().ok()?;
             let ppid = it.next()?.parse().ok()?;
-            let cmd = it.collect::<Vec<_>>().join(" ");
-            Some((pid, ppid, cmd))
+            let state = it.next()?.to_string();
+            let command = it.collect::<Vec<_>>().join(" ");
+            Some(ProcInfo {
+                pid,
+                ppid,
+                state,
+                command,
+            })
         })
+        .collect()
+}
+
+/// Pure: which of `claude_pids` host a live background Bash task — a session
+/// process with a descendant carrying the [`BG_WRAPPER_MARKER`].
+pub fn background_task_pids(procs: &[ProcInfo], claude_pids: &HashSet<u32>) -> HashSet<u32> {
+    roots_with_descendant_matching(procs, claude_pids, BG_WRAPPER_MARKER)
+}
+
+/// Pure: which of `claude_pids` are suspended (Ctrl-Z'd or `SIGSTOP`'d) — `ps`
+/// state code `T`. A stopped process can't make progress, so the fleet flags it
+/// rather than showing a stale working/waiting state.
+pub fn suspended_pids(procs: &[ProcInfo], claude_pids: &HashSet<u32>) -> HashSet<u32> {
+    procs
+        .iter()
+        .filter(|p| claude_pids.contains(&p.pid) && p.state.starts_with('T'))
+        .map(|p| p.pid)
         .collect()
 }
 
@@ -118,15 +143,15 @@ fn ps_snapshot() -> Vec<(u32, u32, String)> {
 /// root's own command is not matched — a session process never carries the
 /// marker). Cycle-guarded.
 fn roots_with_descendant_matching(
-    procs: &[(u32, u32, String)],
+    procs: &[ProcInfo],
     roots: &HashSet<u32>,
     marker: &str,
 ) -> HashSet<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut cmd: HashMap<u32, &str> = HashMap::new();
-    for (pid, ppid, c) in procs {
-        children.entry(*ppid).or_default().push(*pid);
-        cmd.insert(*pid, c.as_str());
+    for p in procs {
+        children.entry(p.ppid).or_default().push(p.pid);
+        cmd.insert(p.pid, p.command.as_str());
     }
     let mut out = HashSet::new();
     for &root in roots {
@@ -205,25 +230,49 @@ mod tests {
         assert!(!ic(""));
     }
 
+    fn proc(pid: u32, ppid: u32, state: &str, command: &str) -> super::ProcInfo {
+        super::ProcInfo {
+            pid,
+            ppid,
+            state: state.into(),
+            command: command.into(),
+        }
+    }
+
     #[test]
     fn background_task_detection_walks_the_tree() {
-        use super::{roots_with_descendant_matching, BG_WRAPPER_MARKER as M};
+        use super::background_task_pids;
         use std::collections::HashSet;
         // pid 100 = a claude session with a live bg-task wrapper (102) whose
         //           leaf is `sleep 600` (103); also an MCP server (104).
         // pid 200 = a claude session with only an MCP server (201) — no task.
         let procs = vec![
-            (100, 1, "claude --resume".into()),
-            (102, 100, "/bin/zsh -c source /home/u/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'sleep 600'".into()),
-            (103, 102, "sleep 600".into()),
-            (104, 100, "/usr/bin/python3 mcp_server.py".into()),
-            (200, 1, "claude".into()),
-            (201, 200, "node mcp.js".into()),
-            (300, 1, "caffeinate -i -t 300".into()),
+            proc(100, 1, "S", "claude --resume"),
+            proc(102, 100, "S", "/bin/zsh -c source /home/u/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'sleep 600'"),
+            proc(103, 102, "S", "sleep 600"),
+            proc(104, 100, "S", "/usr/bin/python3 mcp_server.py"),
+            proc(200, 1, "S", "claude"),
+            proc(201, 200, "S", "node mcp.js"),
+            proc(300, 1, "S", "caffeinate -i -t 300"),
         ];
         let roots: HashSet<u32> = [100, 200].into_iter().collect();
-        let hit = roots_with_descendant_matching(&procs, &roots, M);
+        let hit = background_task_pids(&procs, &roots);
         assert!(hit.contains(&100), "session with a bg wrapper should match");
         assert!(!hit.contains(&200), "session with only an MCP server should not");
+    }
+
+    #[test]
+    fn suspended_detection_reads_state_code() {
+        use super::suspended_pids;
+        use std::collections::HashSet;
+        let procs = vec![
+            proc(100, 1, "T", "claude --resume"), // stopped (Ctrl-Z)
+            proc(200, 1, "S", "claude"),          // sleeping
+            proc(300, 1, "R+", "claude"),         // running, foreground
+            proc(400, 1, "T", "vim"),             // stopped but not a tracked pid
+        ];
+        let roots: HashSet<u32> = [100, 200, 300].into_iter().collect();
+        let susp = suspended_pids(&procs, &roots);
+        assert_eq!(susp, [100].into_iter().collect::<HashSet<u32>>());
     }
 }

@@ -211,6 +211,7 @@ fn sep() -> Span<'static> {
 fn header_line(views: &[SessionView]) -> Line<'static> {
     let count = |a: Activity| views.iter().filter(|v| v.activity == a).count();
     let needs_input = count(Activity::NeedsInput);
+    let suspended = count(Activity::Suspended);
     let working = count(Activity::Working);
     let bg = count(Activity::BgRunning);
     let waiting = count(Activity::Waiting);
@@ -219,12 +220,19 @@ fn header_line(views: &[SessionView]) -> Line<'static> {
         sep(),
         Span::raw(format!("{} session(s)", views.len())),
     ];
-    // Lead with the attention-grabber only when something is actually blocked.
+    // Lead with the attention-grabbers only when present.
     if needs_input > 0 {
         spans.push(sep());
         spans.push(Span::styled(
             format!("⚑ {needs_input} need input"),
             Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if suspended > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("{suspended} stopped"),
+            Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(sep());
@@ -339,6 +347,10 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>, dir_w: usize) ->
         Style::default().fg(C_CYAN),
     );
     let activity = match v.activity {
+        Activity::Suspended => Span::styled(
+            "stopped",
+            Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+        ),
         Activity::NeedsInput => Span::styled(
             "⚑ input",
             Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
