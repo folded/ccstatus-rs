@@ -243,7 +243,10 @@ fn header_line(views: &[SessionView]) -> Line<'static> {
     // Background runners only when present, so the common case stays uncluttered.
     if bg > 0 {
         spans.push(sep());
-        spans.push(Span::styled(format!("⚙ {bg} bg"), Style::default().fg(C_CYAN)));
+        spans.push(Span::styled(
+            format!("⚙ {bg} bg"),
+            Style::default().fg(C_CYAN),
+        ));
     }
     spans.push(sep());
     spans.push(Span::styled(
@@ -500,7 +503,10 @@ mod tests {
         // shared prefix is gone.
         assert!(text.contains('…'), "cwd not elided:\n{text}");
         assert!(text.contains("branch"), "cwd tail missing:\n{text}");
-        assert!(!text.contains("Users"), "cwd prefix should be elided:\n{text}");
+        assert!(
+            !text.contains("Users"),
+            "cwd prefix should be elided:\n{text}"
+        );
         // No physical line exceeds the 80-col terminal.
         for l in &lines {
             assert!(l.chars().count() <= 80, "line over width: {l:?}");

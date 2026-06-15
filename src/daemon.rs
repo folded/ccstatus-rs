@@ -336,11 +336,13 @@ impl Handler {
         let session = state::read_session(&pane.session_id)?;
         let last_turn = session.last_turn_ts?;
         let idle = crate::util::now_unix().saturating_sub(last_turn);
-        Some(if idle < render_tmux::warm_threshold_secs(session.cache_ttl_secs) {
-            "warm"
-        } else {
-            "cold"
-        })
+        Some(
+            if idle < render_tmux::warm_threshold_secs(session.cache_ttl_secs) {
+                "warm"
+            } else {
+                "cold"
+            },
+        )
     }
 
     /// Read the (focused, Claude) pane's content, build the bar plan from the

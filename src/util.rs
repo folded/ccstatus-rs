@@ -248,7 +248,12 @@ mod tests {
         // pid 200 = a claude session with only an MCP server (201) — no task.
         let procs = vec![
             proc(100, 1, "S", "claude --resume"),
-            proc(102, 100, "S", "/bin/zsh -c source /home/u/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'sleep 600'"),
+            proc(
+                102,
+                100,
+                "S",
+                "/bin/zsh -c source /home/u/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'sleep 600'",
+            ),
             proc(103, 102, "S", "sleep 600"),
             proc(104, 100, "S", "/usr/bin/python3 mcp_server.py"),
             proc(200, 1, "S", "claude"),
@@ -258,7 +263,10 @@ mod tests {
         let roots: HashSet<u32> = [100, 200].into_iter().collect();
         let hit = background_task_pids(&procs, &roots);
         assert!(hit.contains(&100), "session with a bg wrapper should match");
-        assert!(!hit.contains(&200), "session with only an MCP server should not");
+        assert!(
+            !hit.contains(&200),
+            "session with only an MCP server should not"
+        );
     }
 
     #[test]

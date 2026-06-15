@@ -436,7 +436,14 @@ mod tests {
         sessions.insert("idle".to_string(), session(Some(now - 200), None, None));
         sessions.insert("active".to_string(), session(Some(now - 5), None, None));
         sessions.insert("never".to_string(), session(None, None, None));
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         let order: Vec<&str> = views.iter().map(|v| v.claude_session.as_str()).collect();
         assert_eq!(order, vec!["active", "idle", "never"]);
     }
@@ -448,7 +455,14 @@ mod tests {
         let mut s = session(Some(now), Some("Opus"), Some(42));
         s.cwd = Some("~/demo".into());
         sessions.insert("s".to_string(), s);
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         assert_eq!(views[0].model.as_deref(), Some("Opus"));
         assert_eq!(views[0].cwd.as_deref(), Some("~/demo"));
         assert_eq!(views[0].context_pct, Some(42));
@@ -463,15 +477,32 @@ mod tests {
             Activity::Working
         );
         // Prompt, never completed -> working.
-        assert_eq!(activity(Some(now), None, false, false, false, None), Activity::Working);
+        assert_eq!(
+            activity(Some(now), None, false, false, false, None),
+            Activity::Working
+        );
         // Completed after the prompt, recently -> waiting.
         assert_eq!(
-            activity(Some(now - 100), Some(now - 10), false, false, false, Some(10)),
+            activity(
+                Some(now - 100),
+                Some(now - 10),
+                false,
+                false,
+                false,
+                Some(10)
+            ),
             Activity::Waiting
         );
         // Completed long ago -> idle.
         assert_eq!(
-            activity(Some(now - 5000), Some(now - 4000), false, false, false, Some(4000)),
+            activity(
+                Some(now - 5000),
+                Some(now - 4000),
+                false,
+                false,
+                false,
+                Some(4000)
+            ),
             Activity::Idle
         );
         // Turn but no recorded prompt, recent -> waiting.
@@ -480,7 +511,10 @@ mod tests {
             Activity::Waiting
         );
         // Nothing -> unknown.
-        assert_eq!(activity(None, None, false, false, false, None), Activity::Unknown);
+        assert_eq!(
+            activity(None, None, false, false, false, None),
+            Activity::Unknown
+        );
         // A pending blocking notification wins over any turn state, even a
         // mid-turn "working" or a long-idle completion.
         assert_eq!(
@@ -488,18 +522,39 @@ mod tests {
             Activity::NeedsInput
         );
         assert_eq!(
-            activity(Some(now - 5000), Some(now - 4000), false, true, false, Some(4000)),
+            activity(
+                Some(now - 5000),
+                Some(now - 4000),
+                false,
+                true,
+                false,
+                Some(4000)
+            ),
             Activity::NeedsInput
         );
         // A live background task: a completed/stale turn reads as still working,
         // but a turn actually in progress stays "working", and a blocking
         // notification still wins.
         assert_eq!(
-            activity(Some(now - 100), Some(now - 10), false, false, true, Some(10)),
+            activity(
+                Some(now - 100),
+                Some(now - 10),
+                false,
+                false,
+                true,
+                Some(10)
+            ),
             Activity::BgRunning
         );
         assert_eq!(
-            activity(Some(now - 5000), Some(now - 4000), false, false, true, Some(4000)),
+            activity(
+                Some(now - 5000),
+                Some(now - 4000),
+                false,
+                false,
+                true,
+                Some(4000)
+            ),
             Activity::BgRunning
         );
         assert_eq!(
@@ -527,8 +582,14 @@ mod tests {
         sessions.insert("stopped".to_string(), session(Some(now - 5), None, None));
         sessions.insert("fresh".to_string(), session(Some(now - 1), None, None));
         let susp: HashSet<String> = ["stopped".to_string()].into_iter().collect();
-        let views =
-            build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &susp, now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &susp,
+            now,
+        );
         assert_eq!(views[0].claude_session, "stopped");
         assert_eq!(views[0].activity, Activity::Suspended);
         assert_eq!(views[1].claude_session, "fresh");
@@ -543,7 +604,14 @@ mod tests {
         sessions.insert("bg".to_string(), session(Some(now - 5000), None, None));
         sessions.insert("waiting".to_string(), session(Some(now - 5), None, None));
         let bg: HashSet<String> = ["bg".to_string()].into_iter().collect();
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &bg, &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &bg,
+            &HashSet::new(),
+            now,
+        );
         assert_eq!(views[0].claude_session, "bg");
         assert_eq!(views[0].activity, Activity::BgRunning);
         assert_eq!(views[1].claude_session, "waiting");
@@ -559,7 +627,14 @@ mod tests {
         blocked.last_notify_ts = Some(now - 4000);
         sessions.insert("blocked".to_string(), blocked);
         sessions.insert("fresh".to_string(), session(Some(now - 5), None, None));
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         assert_eq!(views[0].claude_session, "blocked");
         assert_eq!(views[0].activity, Activity::NeedsInput);
         assert_eq!(views[1].claude_session, "fresh");
@@ -572,7 +647,14 @@ mod tests {
         let mut s = session(Some(now - 100), None, None); // completed at now-100
         s.last_prompt_ts = Some(now - 5); // new prompt since -> working
         sessions.insert("s".to_string(), s);
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         assert_eq!(views[0].activity, Activity::Working);
     }
 
@@ -582,7 +664,14 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert("s".to_string(), session(Some(now), None, None));
         // No pane file, no addressable terminal -> not jumpable.
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         assert!(views[0].address.is_none());
         assert!(views[0].window.is_none());
         assert!(!views[0].jumpable);
@@ -598,7 +687,14 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert("s".to_string(), s);
         // No pane file -> not in tmux, but the iTerm2 window is addressable.
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         assert!(views[0].address.is_none());
         assert!(matches!(views[0].window, Some(WindowTarget::ITerm2 { .. })));
         assert!(views[0].jumpable);
@@ -613,7 +709,14 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert("s".to_string(), s);
         // No pane file -> not in tmux; the graphical display makes it jumpable.
-        let views = build_views(&sessions, &HashMap::new(), &HashSet::new(), &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         assert!(views[0].address.is_none());
         assert!(matches!(
             views[0].window,
@@ -635,7 +738,14 @@ mod tests {
         let mut live = HashSet::new();
         live.insert("L".to_string());
 
-        let views = build_views(&sessions, &panes, &live, &HashSet::new(), &HashSet::new(), now);
+        let views = build_views(
+            &sessions,
+            &panes,
+            &live,
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+        );
         let by = |s: &str| {
             views
                 .iter()

@@ -157,7 +157,11 @@ mod tests {
         // Mid-turn (prompt newer than the last completion): a blocking prompt
         // means Claude is blocked on you -> latch.
         assert!(should_latch(None, Some(200), Some(100)));
-        assert!(should_latch(Some("permission_prompt"), Some(200), Some(100)));
+        assert!(should_latch(
+            Some("permission_prompt"),
+            Some(200),
+            Some(100)
+        ));
         // First turn, no completion yet -> still mid-turn.
         assert!(should_latch(None, Some(200), None));
         // The idle nudge: fires after the turn completed (turn newer than
@@ -168,6 +172,10 @@ mod tests {
         // No turn data at all -> nothing to block on.
         assert!(!should_latch(None, None, None));
         // A non-blocking ack mid-turn still doesn't latch.
-        assert!(!should_latch(Some("elicitation_complete"), Some(200), Some(100)));
+        assert!(!should_latch(
+            Some("elicitation_complete"),
+            Some(200),
+            Some(100)
+        ));
     }
 }
