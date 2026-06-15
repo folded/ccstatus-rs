@@ -125,7 +125,7 @@ pub fn run(session: String) -> ExitCode {
         force_rerender: false,
         panes: HashSet::new(),
         focused_pane: initial_focus,
-        active: false,
+        rendered: None,
         last_warmth: None,
         last_activity: Instant::now(),
         tmux: Box::new(tmux::CliTmux),
@@ -148,8 +148,11 @@ struct Handler {
     panes: HashSet<String>,
     /// The session's currently-focused pane (from control events).
     focused_pane: Option<String>,
-    /// Whether the bar is currently showing ccstatus for this session.
-    active: bool,
+    /// The Claude pane whose content the bar is currently showing, or `None`
+    /// when the bar is inactive (focus is not on a Claude pane). Tracking the
+    /// pane id — not just a bool — lets us re-render when focus moves from one
+    /// Claude pane to another within the same session.
+    rendered: Option<String>,
     last_warmth: Option<&'static str>,
     last_activity: Instant,
     /// One-shot tmux command seam (option get/set/unset, focus query). The
@@ -189,7 +192,7 @@ impl Handler {
             self.reconcile();
             if should_exit(
                 self.panes.is_empty(),
-                self.active,
+                self.rendered.is_some(),
                 self.last_activity.elapsed(),
             ) {
                 self.log.write("idle with no Claude panes; exiting");
@@ -298,7 +301,7 @@ impl Handler {
         let warmth_changed = warmth != self.last_warmth;
 
         match decide(
-            self.active,
+            self.rendered.as_deref(),
             focused_claude.as_deref(),
             force,
             warmth_changed,
@@ -306,20 +309,21 @@ impl Handler {
             Action::Activate(pane) => {
                 self.log.write(&format!("activate via focused {pane}"));
                 self.render_and_apply(&pane);
-                self.active = true;
+                self.rendered = Some(pane);
                 self.last_warmth = warmth;
                 self.last_activity = Instant::now();
                 self.refresh();
             }
             Action::Rerender(pane) => {
                 self.render_and_apply(&pane);
+                self.rendered = Some(pane);
                 self.last_warmth = warmth;
                 self.refresh();
             }
             Action::Deactivate => {
                 self.log.write("deactivate (focus left Claude)");
                 tmux::restore_session(self.tmux.as_ref(), &self.session);
-                self.active = false;
+                self.rendered = None;
                 self.last_warmth = None;
                 self.refresh();
             }
@@ -377,18 +381,23 @@ pub enum Action {
     Noop,
 }
 
-/// Pure transition. `focused_claude` is `Some(pane)` iff the focused pane is a
-/// registered Claude pane (the handler computes it once and passes it in).
+/// Pure transition. `rendered` is the Claude pane the bar currently shows (or
+/// `None` when inactive); `focused_claude` is `Some(pane)` iff the focused pane
+/// is a registered Claude pane (the handler computes both and passes them in).
+/// A focus move between two Claude panes (`rendered != focused`) re-renders so
+/// the bar tracks the newly-focused session's data.
 pub fn decide(
-    active: bool,
+    rendered: Option<&str>,
     focused_claude: Option<&str>,
     force: bool,
     warmth_changed: bool,
 ) -> Action {
-    match (active, focused_claude) {
-        (false, Some(p)) => Action::Activate(p.to_string()),
-        (true, None) => Action::Deactivate,
-        (true, Some(p)) if force || warmth_changed => Action::Rerender(p.to_string()),
+    match (rendered, focused_claude) {
+        (None, Some(p)) => Action::Activate(p.to_string()),
+        (Some(_), None) => Action::Deactivate,
+        (Some(prev), Some(p)) if prev != p || force || warmth_changed => {
+            Action::Rerender(p.to_string())
+        }
         _ => Action::Noop,
     }
 }
@@ -639,25 +648,30 @@ mod tests {
     fn decide_covers_the_transition_table() {
         // inactive + Claude focused -> activate
         assert_eq!(
-            decide(false, Some("%1"), false, false),
+            decide(None, Some("%1"), false, false),
             Action::Activate("%1".into())
         );
         // active + focus left Claude -> deactivate
-        assert_eq!(decide(true, None, false, false), Action::Deactivate);
-        // active + Claude focused, nothing changed -> noop
-        assert_eq!(decide(true, Some("%1"), false, false), Action::Noop);
-        // active + Claude focused, forced -> rerender
+        assert_eq!(decide(Some("%1"), None, false, false), Action::Deactivate);
+        // active + same Claude focused, nothing changed -> noop
+        assert_eq!(decide(Some("%1"), Some("%1"), false, false), Action::Noop);
+        // active + focus moved to a different Claude pane -> rerender
         assert_eq!(
-            decide(true, Some("%1"), true, false),
+            decide(Some("%1"), Some("%2"), false, false),
+            Action::Rerender("%2".into())
+        );
+        // active + same Claude focused, forced -> rerender
+        assert_eq!(
+            decide(Some("%1"), Some("%1"), true, false),
             Action::Rerender("%1".into())
         );
-        // active + Claude focused, warmth flipped -> rerender
+        // active + same Claude focused, warmth flipped -> rerender
         assert_eq!(
-            decide(true, Some("%1"), false, true),
+            decide(Some("%1"), Some("%1"), false, true),
             Action::Rerender("%1".into())
         );
         // inactive + nothing focused -> noop
-        assert_eq!(decide(false, None, true, true), Action::Noop);
+        assert_eq!(decide(None, None, true, true), Action::Noop);
     }
 
     #[test]
