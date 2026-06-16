@@ -472,6 +472,13 @@ pub struct WindowFlag {
     waiting: String,
     idle: String,
     unknown: String,
+    // Git-state suffix (right of the dirname). Ahead/behind are vs the last
+    // fetch (local-only, no network); `dirty` takes precedence over them.
+    git_ahead: String,
+    git_behind: String,
+    git_diverged: String,
+    git_dirty: String,
+    git_clean: String,
 }
 
 impl Default for WindowFlag {
@@ -485,6 +492,11 @@ impl Default for WindowFlag {
             waiting: String::new(),
             idle: String::new(),
             unknown: String::new(),
+            git_ahead: "↑".to_string(),
+            git_behind: "↓".to_string(),
+            git_diverged: "↕".to_string(),
+            git_dirty: "⚠".to_string(),
+            git_clean: String::new(),
         }
     }
 }
@@ -508,6 +520,14 @@ impl WindowFlag {
                 .map(str::to_string)
                 .unwrap_or_else(|| default.to_string())
         };
+        let g = |key: &str, default: &str| -> String {
+            block
+                .get("git")
+                .and_then(|m| m.get(key))
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| default.to_string())
+        };
         WindowFlag {
             // Presence of the block opts in; `"enabled": false` disables.
             enabled: block
@@ -521,6 +541,11 @@ impl WindowFlag {
             waiting: m("waiting", &d.waiting),
             idle: m("idle", &d.idle),
             unknown: m("unknown", &d.unknown),
+            git_ahead: g("ahead", &d.git_ahead),
+            git_behind: g("behind", &d.git_behind),
+            git_diverged: g("diverged", &d.git_diverged),
+            git_dirty: g("dirty", &d.git_dirty),
+            git_clean: g("clean", &d.git_clean),
         }
     }
 
@@ -535,6 +560,23 @@ impl WindowFlag {
             Waiting => &self.waiting,
             Idle => &self.idle,
             Unknown => &self.unknown,
+        }
+    }
+
+    /// The git-state suffix (possibly empty) for a working-tree status. A dirty
+    /// tree takes precedence over ahead/behind — you'd commit before pushing,
+    /// and the arrows resurface once the tree is clean.
+    pub fn git_marker(&self, st: crate::git::GitStatus) -> &str {
+        if st.dirty {
+            &self.git_dirty
+        } else if st.ahead > 0 && st.behind > 0 {
+            &self.git_diverged
+        } else if st.ahead > 0 {
+            &self.git_ahead
+        } else if st.behind > 0 {
+            &self.git_behind
+        } else {
+            &self.git_clean
         }
     }
 }
@@ -569,6 +611,27 @@ mod tests {
         let v = cfg(r#"{ "windowFlag": { "enabled": false } }"#);
         let f = WindowFlag::from_value(Some(&v));
         assert!(!f.enabled);
+    }
+
+    #[test]
+    fn git_marker_precedence_and_overrides() {
+        let f = WindowFlag::default();
+        let st = |dirty, ahead, behind| crate::git::GitStatus {
+            dirty,
+            ahead,
+            behind,
+        };
+        assert_eq!(f.git_marker(st(false, 0, 0)), ""); // clean
+        assert_eq!(f.git_marker(st(false, 2, 0)), "↑"); // ahead
+        assert_eq!(f.git_marker(st(false, 0, 3)), "↓"); // behind
+        assert_eq!(f.git_marker(st(false, 2, 3)), "↕"); // diverged
+        assert_eq!(f.git_marker(st(true, 0, 0)), "⚠"); // dirty
+        assert_eq!(f.git_marker(st(true, 5, 0)), "⚠"); // dirty wins over ahead
+
+        let v = cfg(r#"{ "windowFlag": { "git": { "dirty": "*" } } }"#);
+        let f = WindowFlag::from_value(Some(&v));
+        assert_eq!(f.git_marker(st(true, 0, 0)), "*"); // overridden
+        assert_eq!(f.git_marker(st(false, 1, 0)), "↑"); // default kept
     }
 
     #[test]

@@ -29,6 +29,13 @@
       "waiting": "",
       "idle": "",
       "unknown": ""
+    },
+    "git": {
+      "ahead": "↑",
+      "behind": "↓",
+      "diverged": "↕",
+      "dirty": "⚠",
+      "clean": ""
     }
   }
 }

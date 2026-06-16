@@ -439,7 +439,13 @@ impl Handler {
                 bg.contains(&ps.claude_pid),
                 idle_secs,
             );
-            let name = window_name(self.flag.marker(act), sess.cwd.as_deref());
+            let git_glyph = sess
+                .cwd
+                .as_deref()
+                .and_then(crate::git::status)
+                .map(|st| self.flag.git_marker(st))
+                .unwrap_or("");
+            let name = window_name(self.flag.marker(act), sess.cwd.as_deref(), git_glyph);
             if self.flagged.get(&pane) != Some(&name) {
                 self.tmux.rename_window(&pane, &name);
                 self.flagged.insert(pane, name);
@@ -456,16 +462,22 @@ impl Handler {
     }
 }
 
-/// Pure: compose a window name from an activity marker and the session's cwd.
-/// The base is the cwd's last path component (`…/pubmedifier` -> `pubmedifier`),
-/// falling back to `claude` when there's no usable directory.
-fn window_name(marker: &str, cwd: Option<&str>) -> String {
+/// Pure: compose a window name as `<marker><dir>[ <git>]`. The base is the cwd's
+/// last path component (`…/pubmedifier` -> `pubmedifier`), falling back to
+/// `claude` when there's no usable directory; the git suffix (a possibly-empty
+/// state glyph) is appended after a single space when present.
+fn window_name(marker: &str, cwd: Option<&str>, git: &str) -> String {
     let base = cwd
         .map(|p| p.trim_end_matches('/'))
         .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
         .filter(|c| !c.is_empty())
         .unwrap_or("claude");
-    format!("{marker}{base}")
+    let mut name = format!("{marker}{base}");
+    if !git.is_empty() {
+        name.push(' ');
+        name.push_str(git);
+    }
+    name
 }
 
 /// The controller verdict: drive the observed bar to the desired bar, where
@@ -742,18 +754,19 @@ mod tests {
     use crate::tmux::{FakeTmux, Write};
 
     #[test]
-    fn window_name_composes_marker_and_cwd_basename() {
+    fn window_name_composes_marker_dir_and_git_suffix() {
         assert_eq!(
-            window_name("● ", Some("/Users/tjs/populationgenomics/pubmedifier")),
+            window_name("● ", Some("/Users/tjs/populationgenomics/pubmedifier"), ""),
             "● pubmedifier"
         );
-        // Trailing slash tolerated.
-        assert_eq!(window_name("◐ ", Some("/a/b/")), "◐ b");
-        // Empty marker -> bare directory name.
-        assert_eq!(window_name("", Some("/a/b")), "b");
+        // Git glyph appended after a single space.
+        assert_eq!(window_name("◐ ", Some("/a/ccstatus-rs"), "↑"), "◐ ccstatus-rs ↑");
+        // Trailing slash tolerated; dirty glyph with no activity marker.
+        assert_eq!(window_name("", Some("/a/b/"), "⚠"), "b ⚠");
+        // Empty marker and empty git -> bare directory name.
+        assert_eq!(window_name("", Some("/a/b"), ""), "b");
         // No cwd -> fallback base.
-        assert_eq!(window_name("● ", None), "● claude");
-        assert_eq!(window_name("", Some("/")), "claude");
+        assert_eq!(window_name("● ", None, "↕"), "● claude ↕");
     }
 
     #[test]
