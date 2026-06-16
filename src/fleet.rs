@@ -56,7 +56,7 @@ pub enum Activity {
 /// seconds since the last completed turn. `needs_input` (the `last_notify_ts`
 /// latch being set) wins over everything: Claude is blocked on the user and the
 /// turn is, by definition, mid-flight.
-fn activity(
+pub fn activity(
     last_prompt: Option<i64>,
     last_turn: Option<i64>,
     suspended: bool,

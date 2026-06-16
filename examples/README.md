@@ -70,6 +70,33 @@ surface each printed line is filled to the full width with the colour. The
 base-row *edges* (`left`/`right` on line 0) share your own status bar, so they
 can't be repainted — dedicated rows and Claude's lines can.
 
+## Window flag (activity in the tmux window name)
+
+`windowFlag` is an opt-in block (sibling to the layouts) that stamps each Claude
+pane's **tmux window name** with a per-activity marker — the across-tab "which
+one needs me?" cue, visible in the whole window strip even for unfocused panes
+(unlike the status bar, which only shows the focused session):
+
+```json
+{ "windowFlag": { "enabled": true,
+                  "markers": { "needsInput": "● ", "working": "◐ " } } }
+```
+
+- The window name becomes `<marker><dir>`, where `<dir>` is the session's cwd
+  basename (e.g. `● pubmedifier`). The marker reflects the same activity states
+  `ccstatus top` uses: `needsInput`, `working`, `bgRunning`, `suspended`,
+  `waiting`, `idle`, `unknown`. Any key you omit uses the default; the defaults
+  for `waiting`/`idle`/`unknown` are empty (just the directory, no marker).
+- **Presence of the block opts in.** Set `"enabled": false` to keep custom
+  markers configured but dormant.
+- Owned by the per-session daemon and updated on its tick, so a state change
+  (e.g. a turn finishing) shows within a few seconds. The flag is removed —
+  tmux's own command-based naming resumes — when Claude exits or the flag is
+  disabled.
+- **Requires `set -g allow-rename off` in your tmux config**, otherwise Claude
+  Code's own window rename (its version) clobbers the flag. The OSC 2 pane title
+  (`#T`, Claude's task summary) is a separate channel and is unaffected.
+
 ## Notes
 
 - **The bar shows only while the focused pane is running Claude.** Switching to

@@ -27,7 +27,7 @@
 //! mutations are session-local (`set -t X …`) and reverted with
 //! `set -u -t X …`, so the global config is never written.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, Align, Element};
 use crate::control::{self, Connection, EventStream, Writer};
+use crate::fleet;
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
 use crate::state;
@@ -128,6 +129,8 @@ pub fn run(session: String) -> ExitCode {
         rendered: None,
         last_warmth: None,
         last_activity: Instant::now(),
+        flag: config::WindowFlag::load(),
+        flagged: HashMap::new(),
         tmux: Box::new(tmux::CliTmux),
         writer,
         log,
@@ -155,6 +158,14 @@ struct Handler {
     rendered: Option<String>,
     last_warmth: Option<&'static str>,
     last_activity: Instant,
+    /// Opt-in per-pane window-name activity flag (the across-tab "needs me?"
+    /// cue). Unlike the status bar, this stamps *every* registered Claude pane's
+    /// window regardless of focus.
+    flag: config::WindowFlag,
+    /// Pane id -> the window name we last applied, for change detection (skip
+    /// redundant renames) and restore (re-enable `automatic-rename` when a pane
+    /// leaves or the flag is turned off).
+    flagged: HashMap<String, String>,
     /// One-shot tmux command seam (option get/set/unset, focus query). The
     /// control connection (`writer`) is a separate seam for `refresh-client`.
     tmux: Box<dyn Tmux>,
@@ -190,6 +201,7 @@ impl Handler {
             self.requery_focus();
             self.prune_dead_panes();
             self.reconcile();
+            self.update_window_flags();
             if should_exit(
                 self.panes.is_empty(),
                 self.rendered.is_some(),
@@ -200,6 +212,7 @@ impl Handler {
             }
         }
         // Graceful exit (session still alive): revert our overrides.
+        self.restore_all_flags();
         tmux::restore_session(self.tmux.as_ref(), &self.session);
         self.refresh();
     }
@@ -261,6 +274,7 @@ impl Handler {
         if m != self.config_mtime {
             self.config_mtime = m;
             self.routing = config::Routing::for_context(true);
+            self.flag = config::WindowFlag::load();
             self.force_rerender = true;
             self.log.write("config reloaded");
         }
@@ -371,6 +385,87 @@ impl Handler {
         );
         apply(self.tmux.as_ref(), &self.session, &plan);
     }
+
+    /// Stamp each registered Claude pane's window name with its activity marker
+    /// (`<marker><dir>`). Runs every tick, for *all* panes regardless of focus —
+    /// this is the across-tab "which one needs me?" cue, distinct from the
+    /// focus-gated status bar. No-op (and self-restoring) when the flag is off.
+    fn update_window_flags(&mut self) {
+        // Panes we flagged but no longer track (Claude exited): hand the window
+        // name back to tmux's automatic naming.
+        let gone: Vec<String> = self
+            .flagged
+            .keys()
+            .filter(|p| !self.panes.contains(*p))
+            .cloned()
+            .collect();
+        for pane in gone {
+            self.tmux.restore_window_name(&pane);
+            self.flagged.remove(&pane);
+        }
+
+        if !self.flag.enabled {
+            self.restore_all_flags();
+            return;
+        }
+
+        // One `ps` snapshot per tick feeds the bg-task / suspended signals (the
+        // states the turn timestamps alone can't tell us).
+        let pids: HashSet<u32> = self
+            .panes
+            .iter()
+            .filter_map(|p| state::read_pane(&self.server_id, p).map(|ps| ps.claude_pid))
+            .collect();
+        let procs = if pids.is_empty() {
+            Vec::new()
+        } else {
+            crate::util::ps_snapshot()
+        };
+        let bg = crate::util::background_task_pids(&procs, &pids);
+        let susp = crate::util::suspended_pids(&procs, &pids);
+        let now = crate::util::now_unix();
+
+        for pane in self.panes.iter().cloned().collect::<Vec<_>>() {
+            let Some(ps) = state::read_pane(&self.server_id, &pane) else {
+                continue;
+            };
+            let sess = state::read_session(&ps.session_id).unwrap_or_default();
+            let idle_secs = sess.last_turn_ts.map(|t| (now - t).max(0));
+            let act = fleet::activity(
+                sess.last_prompt_ts,
+                sess.last_turn_ts,
+                susp.contains(&ps.claude_pid),
+                sess.last_notify_ts.is_some(),
+                bg.contains(&ps.claude_pid),
+                idle_secs,
+            );
+            let name = window_name(self.flag.marker(act), sess.cwd.as_deref());
+            if self.flagged.get(&pane) != Some(&name) {
+                self.tmux.rename_window(&pane, &name);
+                self.flagged.insert(pane, name);
+            }
+        }
+    }
+
+    /// Re-enable `automatic-rename` on every window we flagged, and forget them.
+    fn restore_all_flags(&mut self) {
+        for pane in self.flagged.keys() {
+            self.tmux.restore_window_name(pane);
+        }
+        self.flagged.clear();
+    }
+}
+
+/// Pure: compose a window name from an activity marker and the session's cwd.
+/// The base is the cwd's last path component (`…/pubmedifier` -> `pubmedifier`),
+/// falling back to `claude` when there's no usable directory.
+fn window_name(marker: &str, cwd: Option<&str>) -> String {
+    let base = cwd
+        .map(|p| p.trim_end_matches('/'))
+        .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
+        .filter(|c| !c.is_empty())
+        .unwrap_or("claude");
+    format!("{marker}{base}")
 }
 
 /// The controller verdict: drive the observed bar to the desired bar, where
@@ -645,6 +740,21 @@ mod tests {
     use super::*;
     use crate::config::{Dest, Routing};
     use crate::tmux::{FakeTmux, Write};
+
+    #[test]
+    fn window_name_composes_marker_and_cwd_basename() {
+        assert_eq!(
+            window_name("● ", Some("/Users/tjs/populationgenomics/pubmedifier")),
+            "● pubmedifier"
+        );
+        // Trailing slash tolerated.
+        assert_eq!(window_name("◐ ", Some("/a/b/")), "◐ b");
+        // Empty marker -> bare directory name.
+        assert_eq!(window_name("", Some("/a/b")), "b");
+        // No cwd -> fallback base.
+        assert_eq!(window_name("● ", None), "● claude");
+        assert_eq!(window_name("", Some("/")), "claude");
+    }
 
     #[test]
     fn decide_covers_the_transition_table() {

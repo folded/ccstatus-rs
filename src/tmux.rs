@@ -43,6 +43,16 @@ pub trait Tmux {
     /// Pane ids are server-unique, so this addresses the right pane as long as
     /// the command runs against the pane's own tmux server.
     fn focus_pane(&self, pane: &str);
+
+    // Window name (the per-pane activity flag)
+    /// `rename-window -t P name` — name the window hosting pane `P`. An explicit
+    /// rename turns off that window's `automatic-rename`, so the name sticks
+    /// until we change it (and `allow-rename off` keeps the program from
+    /// clobbering it).
+    fn rename_window(&self, pane: &str, name: &str);
+    /// `set-window-option -t P automatic-rename on` — undo our explicit rename,
+    /// letting tmux resume command-based naming once a pane is no longer ours.
+    fn restore_window_name(&self, pane: &str);
 }
 
 /// Production adapter: each method builds args and spawns `tmux`.
@@ -161,6 +171,18 @@ impl Tmux for CliTmux {
         if let Some(tty) = self.client_tty(pane) {
             crate::window::focus_tty(&tty);
         }
+    }
+
+    fn rename_window(&self, pane: &str, name: &str) {
+        let _ = Command::new("tmux")
+            .args(["rename-window", "-t", pane, name])
+            .status();
+    }
+
+    fn restore_window_name(&self, pane: &str) {
+        let _ = Command::new("tmux")
+            .args(["set-window-option", "-t", pane, "automatic-rename", "on"])
+            .status();
     }
 }
 
@@ -290,6 +312,8 @@ pub enum Write {
     UnsetGlobal(String),
     Refresh,
     Focus(String),
+    RenameWindow(String, String),
+    RestoreWindowName(String),
 }
 
 /// Test adapter: records writes, serves canned reads.
@@ -363,6 +387,18 @@ impl Tmux for FakeTmux {
         self.writes
             .borrow_mut()
             .push(Write::Focus(pane.to_string()));
+    }
+
+    fn rename_window(&self, pane: &str, name: &str) {
+        self.writes
+            .borrow_mut()
+            .push(Write::RenameWindow(pane.to_string(), name.to_string()));
+    }
+
+    fn restore_window_name(&self, pane: &str) {
+        self.writes
+            .borrow_mut()
+            .push(Write::RestoreWindowName(pane.to_string()));
     }
 }
 

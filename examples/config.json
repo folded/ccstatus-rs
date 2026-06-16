@@ -18,5 +18,17 @@
       "left.1": "tokens, limits",
       "left.2": "heatmap_main"
     }
+  },
+  "windowFlag": {
+    "enabled": true,
+    "markers": {
+      "needsInput": "● ",
+      "working": "◐ ",
+      "bgRunning": "⚙ ",
+      "suspended": "⏸ ",
+      "waiting": "",
+      "idle": "",
+      "unknown": ""
+    }
   }
 }

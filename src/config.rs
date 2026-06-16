@@ -450,12 +450,125 @@ pub fn mtime() -> Option<std::time::SystemTime> {
     std::fs::metadata(config_path()).ok()?.modified().ok()
 }
 
+/// Opt-in: stamp each Claude pane's tmux window name with a per-activity marker
+/// (the "which tab needs me?" cue, visible across the whole window strip). Owned
+/// by the per-session handler, gated by the `windowFlag` config block:
+///
+/// ```json
+/// { "windowFlag": { "enabled": true,
+///                   "markers": { "needsInput": "● ", "working": "◐ " } } }
+/// ```
+///
+/// Presence of the block enables it; set `"enabled": false` to keep custom
+/// markers configured but dormant. Any marker key omitted falls back to the
+/// default below. `Waiting`/`Idle`/`Unknown` default to empty (no marker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFlag {
+    pub enabled: bool,
+    needs_input: String,
+    working: String,
+    bg_running: String,
+    suspended: String,
+    waiting: String,
+    idle: String,
+    unknown: String,
+}
+
+impl Default for WindowFlag {
+    fn default() -> Self {
+        WindowFlag {
+            enabled: false,
+            needs_input: "● ".to_string(),
+            working: "◐ ".to_string(),
+            bg_running: "⚙ ".to_string(),
+            suspended: "⏸ ".to_string(),
+            waiting: String::new(),
+            idle: String::new(),
+            unknown: String::new(),
+        }
+    }
+}
+
+impl WindowFlag {
+    /// Resolve the window-flag config from the config file.
+    pub fn load() -> Self {
+        Self::from_value(read_config().as_ref())
+    }
+
+    fn from_value(v: Option<&Value>) -> Self {
+        let Some(block) = v.and_then(|v| v.get("windowFlag")) else {
+            return WindowFlag::default();
+        };
+        let d = WindowFlag::default();
+        let m = |key: &str, default: &str| -> String {
+            block
+                .get("markers")
+                .and_then(|m| m.get(key))
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| default.to_string())
+        };
+        WindowFlag {
+            // Presence of the block opts in; `"enabled": false` disables.
+            enabled: block
+                .get("enabled")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
+            needs_input: m("needsInput", &d.needs_input),
+            working: m("working", &d.working),
+            bg_running: m("bgRunning", &d.bg_running),
+            suspended: m("suspended", &d.suspended),
+            waiting: m("waiting", &d.waiting),
+            idle: m("idle", &d.idle),
+            unknown: m("unknown", &d.unknown),
+        }
+    }
+
+    /// The marker string (a prefix, possibly empty) for an activity state.
+    pub fn marker(&self, activity: crate::fleet::Activity) -> &str {
+        use crate::fleet::Activity::*;
+        match activity {
+            NeedsInput => &self.needs_input,
+            Working => &self.working,
+            BgRunning => &self.bg_running,
+            Suspended => &self.suspended,
+            Waiting => &self.waiting,
+            Idle => &self.idle,
+            Unknown => &self.unknown,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cfg(json: &str) -> Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn window_flag_absent_is_disabled_with_default_markers() {
+        let f = WindowFlag::from_value(None);
+        assert!(!f.enabled);
+        assert_eq!(f.marker(crate::fleet::Activity::NeedsInput), "● ");
+        assert_eq!(f.marker(crate::fleet::Activity::Idle), "");
+    }
+
+    #[test]
+    fn window_flag_present_opts_in_and_overrides_markers() {
+        let v = cfg(r#"{ "windowFlag": { "markers": { "working": "» " } } }"#);
+        let f = WindowFlag::from_value(Some(&v));
+        assert!(f.enabled); // presence opts in
+        assert_eq!(f.marker(crate::fleet::Activity::Working), "» "); // overridden
+        assert_eq!(f.marker(crate::fleet::Activity::NeedsInput), "● "); // default kept
+    }
+
+    #[test]
+    fn window_flag_enabled_false_keeps_markers_but_disables() {
+        let v = cfg(r#"{ "windowFlag": { "enabled": false } }"#);
+        let f = WindowFlag::from_value(Some(&v));
+        assert!(!f.enabled);
     }
 
     #[test]
