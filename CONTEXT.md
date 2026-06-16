@@ -39,15 +39,16 @@ nouns below are specific to ccstatus.
   session has been idle past the prompt-cache TTL (~270s). Computed live by
   the handler so it ticks while idle.
 - **window flag** — an opt-in cue (config `windowFlag`) the handler stamps onto
-  each registered Claude pane's tmux **window name** as `<marker><dir>[ <git>]`,
-  where the marker reflects the pane's **fleet** `Activity` and the optional git
-  suffix reflects working-tree/upstream state (dirty, or ahead/behind/diverged —
-  local-only, vs the last fetch). Unlike the bar (focus-gated, one session), it
-  covers *all* the session's Claude panes regardless of focus — the across-tab
-  "which one needs me?" signal. Self-restoring: the window reverts to tmux's
-  command-based naming when the pane leaves or the flag is disabled. Needs
-  `allow-rename off` so Claude can't clobber the name. See
-  `daemon::Handler::update_window_flags`, `config::WindowFlag`, `git::status`.
+  each registered Claude pane's tmux **window name** via a `format` template
+  (`{claude}`/`{dir}`/`{git}`/`{branch}`): the `{claude}` marker reflects the
+  pane's **fleet** `Activity`, `{git}` reflects working-tree/upstream state
+  (dirty, or ahead/behind/diverged — local-only, vs the last fetch). Unlike the
+  bar (focus-gated, one session), it covers *all* the session's Claude panes
+  regardless of focus — the across-tab "which one needs me?" signal. Self-
+  restoring: the window reverts to tmux's command-based naming when the pane
+  leaves or the flag is disabled. Needs `allow-rename off` so Claude can't
+  clobber the name. See `config::WindowFlag::render`,
+  `daemon::Handler::update_window_flags`, `git::status`.
 - **state** — the on-disk data contract under `/tmp/ccstatus-<uid>/`:
   `pane/<server>/<pane>.json` (registrar, tmux-only) and `session/<id>.json`.
   The session file carries **presence** (model, cwd, context %, `claude_pid`,

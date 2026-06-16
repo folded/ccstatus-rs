@@ -82,18 +82,21 @@ one needs me?" cue, visible in the whole window strip even for unfocused panes
                   "markers": { "needsInput": "● ", "working": "◐ " } } }
 ```
 
-- The window name becomes `<marker><dir>[ <git>]`, where `<dir>` is the session's
-  cwd basename (e.g. `● pubmedifier`). The marker reflects the same activity
-  states `ccstatus top` uses: `needsInput`, `working`, `bgRunning`, `suspended`,
-  `waiting`, `idle`, `unknown`. Any key you omit uses the default; the defaults
-  for `waiting`/`idle`/`unknown` are empty (just the directory, no marker).
-- An optional `git` sub-block appends a one-char git-state glyph after the
-  directory (e.g. `◐ ccstatus-rs ↑`): `ahead` (`↑`), `behind` (`↓`),
-  `diverged` (`↕`), `dirty` (`⚠`), `clean` (empty). A dirty tree takes
-  precedence over the arrows. **Ahead/behind are local-only** — read from the
-  last-fetched remote-tracking ref, with no network access — so `behind`/
-  `diverged` are only as current as your last `git fetch`. Computed from one
-  `git status` per pane on the daemon tick.
+- A `format` template controls the layout (default `"{claude} {dir} {git}"`).
+  Tokens: `{claude}` (activity marker), `{dir}` (cwd basename), `{git}`
+  (git-state glyph), `{branch}` (git branch). An empty token contributes
+  nothing and the result is trimmed, so absent pieces leave no stray spaces —
+  e.g. an idle, clean repo is just `pubmedifier`, a working one with unpushed
+  commits is `◐ ccstatus-rs ↑`. Reorder or drop tokens freely
+  (`"{git} {dir}@{branch}"`, `"{claude}{dir}"`, …).
+- `markers` set the `{claude}` glyph per activity state — the same states
+  `ccstatus top` uses: `needsInput`, `working`, `bgRunning`, `suspended`,
+  `waiting`, `idle`, `unknown` (the last three default to empty).
+- `git` sets the `{git}` glyph: `ahead` (`↑`), `behind` (`↓`), `diverged` (`↕`),
+  `dirty` (`⚠`), `clean` (empty). A dirty tree takes precedence over the arrows.
+  **Ahead/behind are local-only** — read from the last-fetched remote-tracking
+  ref, with no network access — so `behind`/`diverged` are only as current as
+  your last `git fetch`. Computed from one `git status` per pane on the tick.
 - **Presence of the block opts in.** Set `"enabled": false` to keep custom
   markers configured but dormant.
 - Owned by the per-session daemon and updated on its tick, so a state change

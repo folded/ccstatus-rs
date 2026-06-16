@@ -21,11 +21,12 @@
   },
   "windowFlag": {
     "enabled": true,
+    "format": "{claude} {dir} {git}",
     "markers": {
-      "needsInput": "● ",
-      "working": "◐ ",
-      "bgRunning": "⚙ ",
-      "suspended": "⏸ ",
+      "needsInput": "●",
+      "working": "◐",
+      "bgRunning": "⚙",
+      "suspended": "⏸",
       "waiting": "",
       "idle": "",
       "unknown": ""

@@ -465,6 +465,12 @@ pub fn mtime() -> Option<std::time::SystemTime> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowFlag {
     pub enabled: bool,
+    /// Window-name template. Tokens `{claude}` (activity marker), `{dir}` (cwd
+    /// basename), `{git}` (git-state glyph), `{branch}` (git branch) are
+    /// substituted; an empty token contributes nothing and the result is
+    /// trimmed, so absent pieces leave no stray spaces. Other text is literal.
+    format: String,
+    // Activity markers (bare glyphs; the template owns spacing).
     needs_input: String,
     working: String,
     bg_running: String,
@@ -472,8 +478,8 @@ pub struct WindowFlag {
     waiting: String,
     idle: String,
     unknown: String,
-    // Git-state suffix (right of the dirname). Ahead/behind are vs the last
-    // fetch (local-only, no network); `dirty` takes precedence over them.
+    // Git-state glyph. Ahead/behind are vs the last fetch (local-only, no
+    // network); `dirty` takes precedence over them.
     git_ahead: String,
     git_behind: String,
     git_diverged: String,
@@ -485,10 +491,11 @@ impl Default for WindowFlag {
     fn default() -> Self {
         WindowFlag {
             enabled: false,
-            needs_input: "● ".to_string(),
-            working: "◐ ".to_string(),
-            bg_running: "⚙ ".to_string(),
-            suspended: "⏸ ".to_string(),
+            format: "{claude} {dir} {git}".to_string(),
+            needs_input: "●".to_string(),
+            working: "◐".to_string(),
+            bg_running: "⚙".to_string(),
+            suspended: "⏸".to_string(),
             waiting: String::new(),
             idle: String::new(),
             unknown: String::new(),
@@ -534,6 +541,11 @@ impl WindowFlag {
                 .get("enabled")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(true),
+            format: block
+                .get("format")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .unwrap_or(d.format),
             needs_input: m("needsInput", &d.needs_input),
             working: m("working", &d.working),
             bg_running: m("bgRunning", &d.bg_running),
@@ -563,7 +575,7 @@ impl WindowFlag {
         }
     }
 
-    /// The git-state suffix (possibly empty) for a working-tree status. A dirty
+    /// The git-state glyph (possibly empty) for a working-tree status. A dirty
     /// tree takes precedence over ahead/behind — you'd commit before pushing,
     /// and the arrows resurface once the tree is clean.
     pub fn git_marker(&self, st: crate::git::GitStatus) -> &str {
@@ -579,6 +591,32 @@ impl WindowFlag {
             &self.git_clean
         }
     }
+
+    /// Render a pane's window name from the `format` template: substitute
+    /// `{claude}`/`{dir}`/`{git}`/`{branch}` and trim. `git` is the session's
+    /// git state (`None` outside a repo); `cwd` supplies `{dir}` (basename,
+    /// falling back to `claude`).
+    pub fn render(
+        &self,
+        activity: crate::fleet::Activity,
+        git: Option<&crate::git::GitState>,
+        cwd: Option<&str>,
+    ) -> String {
+        let dir = cwd
+            .map(|p| p.trim_end_matches('/'))
+            .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
+            .filter(|c| !c.is_empty())
+            .unwrap_or("claude");
+        let git_glyph = git.map(|g| self.git_marker(g.status)).unwrap_or("");
+        let branch = git.and_then(|g| g.branch.as_deref()).unwrap_or("");
+        self.format
+            .replace("{claude}", self.marker(activity))
+            .replace("{dir}", dir)
+            .replace("{git}", git_glyph)
+            .replace("{branch}", branch)
+            .trim()
+            .to_string()
+    }
 }
 
 #[cfg(test)]
@@ -593,7 +631,7 @@ mod tests {
     fn window_flag_absent_is_disabled_with_default_markers() {
         let f = WindowFlag::from_value(None);
         assert!(!f.enabled);
-        assert_eq!(f.marker(crate::fleet::Activity::NeedsInput), "● ");
+        assert_eq!(f.marker(crate::fleet::Activity::NeedsInput), "●");
         assert_eq!(f.marker(crate::fleet::Activity::Idle), "");
     }
 
@@ -603,7 +641,7 @@ mod tests {
         let f = WindowFlag::from_value(Some(&v));
         assert!(f.enabled); // presence opts in
         assert_eq!(f.marker(crate::fleet::Activity::Working), "» "); // overridden
-        assert_eq!(f.marker(crate::fleet::Activity::NeedsInput), "● "); // default kept
+        assert_eq!(f.marker(crate::fleet::Activity::NeedsInput), "●"); // default kept
     }
 
     #[test]
@@ -611,6 +649,55 @@ mod tests {
         let v = cfg(r#"{ "windowFlag": { "enabled": false } }"#);
         let f = WindowFlag::from_value(Some(&v));
         assert!(!f.enabled);
+    }
+
+    #[test]
+    fn render_substitutes_tokens_and_trims_empties() {
+        use crate::fleet::Activity;
+        use crate::git::{GitState, GitStatus};
+        let f = WindowFlag::default();
+        let cwd = Some("/Users/tjs/repo/ccstatus-rs");
+        let dirty = GitState {
+            status: GitStatus {
+                dirty: true,
+                ahead: 0,
+                behind: 0,
+            },
+            branch: Some("main".to_string()),
+        };
+        let clean = GitState {
+            status: GitStatus::default(),
+            branch: Some("main".to_string()),
+        };
+        // working + dirty -> all three tokens present.
+        assert_eq!(
+            f.render(Activity::Working, Some(&dirty), cwd),
+            "◐ ccstatus-rs ⚠"
+        );
+        // idle + clean -> empty claude and git tokens trim away, no stray spaces.
+        assert_eq!(f.render(Activity::Idle, Some(&clean), cwd), "ccstatus-rs");
+        // no repo -> {git}/{branch} empty.
+        assert_eq!(f.render(Activity::Working, None, cwd), "◐ ccstatus-rs");
+    }
+
+    #[test]
+    fn render_custom_format_with_branch() {
+        use crate::fleet::Activity;
+        use crate::git::{GitState, GitStatus};
+        let v = cfg(r#"{ "windowFlag": { "format": "{git}{claude} {dir}@{branch}" } }"#);
+        let f = WindowFlag::from_value(Some(&v));
+        let ahead = GitState {
+            status: GitStatus {
+                dirty: false,
+                ahead: 1,
+                behind: 0,
+            },
+            branch: Some("feat".to_string()),
+        };
+        assert_eq!(
+            f.render(Activity::Working, Some(&ahead), Some("/a/proj")),
+            "↑◐ proj@feat"
+        );
     }
 
     #[test]
