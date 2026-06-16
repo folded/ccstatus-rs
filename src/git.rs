@@ -128,7 +128,8 @@ mod tests {
     #[test]
     fn parse_status_dirty_from_changed_and_untracked() {
         // A changed tracked file (1 ...) marks dirty.
-        let changed = parse_status_v2("# branch.ab +0 -0\n1 .M N... 100644 100644 100644 a b file.rs\n");
+        let changed =
+            parse_status_v2("# branch.ab +0 -0\n1 .M N... 100644 100644 100644 a b file.rs\n");
         assert!(changed.dirty);
         // An untracked file (? ...) also marks dirty.
         let untracked = parse_status_v2("# branch.ab +0 -0\n? new.rs\n");

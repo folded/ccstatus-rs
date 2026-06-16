@@ -760,7 +760,10 @@ mod tests {
             "● pubmedifier"
         );
         // Git glyph appended after a single space.
-        assert_eq!(window_name("◐ ", Some("/a/ccstatus-rs"), "↑"), "◐ ccstatus-rs ↑");
+        assert_eq!(
+            window_name("◐ ", Some("/a/ccstatus-rs"), "↑"),
+            "◐ ccstatus-rs ↑"
+        );
         // Trailing slash tolerated; dirty glyph with no activity marker.
         assert_eq!(window_name("", Some("/a/b/"), "⚠"), "b ⚠");
         // Empty marker and empty git -> bare directory name.
