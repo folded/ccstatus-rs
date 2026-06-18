@@ -478,6 +478,9 @@ pub struct WindowFlag {
     waiting: String,
     idle: String,
     unknown: String,
+    /// Shown in the `{claude}` slot when a settled session finished while
+    /// unviewed (the "come look" flag) — overrides the activity marker.
+    done: String,
     // Git-state glyph. Ahead/behind are vs the last fetch (local-only, no
     // network); `dirty` takes precedence over them.
     git_ahead: String,
@@ -499,6 +502,7 @@ impl Default for WindowFlag {
             waiting: String::new(),
             idle: String::new(),
             unknown: String::new(),
+            done: "⚑".to_string(),
             git_ahead: "↑".to_string(),
             git_behind: "↓".to_string(),
             git_diverged: "↕".to_string(),
@@ -553,6 +557,7 @@ impl WindowFlag {
             waiting: m("waiting", &d.waiting),
             idle: m("idle", &d.idle),
             unknown: m("unknown", &d.unknown),
+            done: m("done", &d.done),
             git_ahead: g("ahead", &d.git_ahead),
             git_behind: g("behind", &d.git_behind),
             git_diverged: g("diverged", &d.git_diverged),
@@ -593,12 +598,14 @@ impl WindowFlag {
     }
 
     /// Render a pane's window name from the `format` template: substitute
-    /// `{claude}`/`{dir}`/`{git}`/`{branch}` and trim. `git` is the session's
-    /// git state (`None` outside a repo); `cwd` supplies `{dir}` (basename,
-    /// falling back to `claude`).
+    /// `{claude}`/`{dir}`/`{git}`/`{branch}` and trim. `attention` swaps the
+    /// `{claude}` glyph for the `done` flag (a settled, unviewed completion).
+    /// `git` is the session's git state (`None` outside a repo); `cwd` supplies
+    /// `{dir}` (basename, falling back to `claude`).
     pub fn render(
         &self,
         activity: crate::fleet::Activity,
+        attention: bool,
         git: Option<&crate::git::GitState>,
         cwd: Option<&str>,
     ) -> String {
@@ -607,10 +614,15 @@ impl WindowFlag {
             .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
             .filter(|c| !c.is_empty())
             .unwrap_or("claude");
+        let claude = if attention {
+            &self.done
+        } else {
+            self.marker(activity)
+        };
         let git_glyph = git.map(|g| self.git_marker(g.status)).unwrap_or("");
         let branch = git.and_then(|g| g.branch.as_deref()).unwrap_or("");
         self.format
-            .replace("{claude}", self.marker(activity))
+            .replace("{claude}", claude)
             .replace("{dir}", dir)
             .replace("{git}", git_glyph)
             .replace("{branch}", branch)
@@ -671,13 +683,24 @@ mod tests {
         };
         // working + dirty -> all three tokens present.
         assert_eq!(
-            f.render(Activity::Working, Some(&dirty), cwd),
+            f.render(Activity::Working, false, Some(&dirty), cwd),
             "◐ ccstatus-rs ⚠"
         );
         // idle + clean -> empty claude and git tokens trim away, no stray spaces.
-        assert_eq!(f.render(Activity::Idle, Some(&clean), cwd), "ccstatus-rs");
+        assert_eq!(
+            f.render(Activity::Idle, false, Some(&clean), cwd),
+            "ccstatus-rs"
+        );
+        // attention -> the {claude} slot becomes the done flag.
+        assert_eq!(
+            f.render(Activity::Idle, true, Some(&clean), cwd),
+            "⚑ ccstatus-rs"
+        );
         // no repo -> {git}/{branch} empty.
-        assert_eq!(f.render(Activity::Working, None, cwd), "◐ ccstatus-rs");
+        assert_eq!(
+            f.render(Activity::Working, false, None, cwd),
+            "◐ ccstatus-rs"
+        );
     }
 
     #[test]
@@ -695,7 +718,7 @@ mod tests {
             branch: Some("feat".to_string()),
         };
         assert_eq!(
-            f.render(Activity::Working, Some(&ahead), Some("/a/proj")),
+            f.render(Activity::Working, false, Some(&ahead), Some("/a/proj")),
             "↑◐ proj@feat"
         );
     }

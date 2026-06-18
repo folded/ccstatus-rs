@@ -63,6 +63,13 @@ pub struct SessionState {
     /// cleared by the next sign of forward progress (`PostToolUse`,
     /// `UserPromptSubmit`, `Stop`). Drives [`crate::fleet::Activity::NeedsInput`].
     pub last_notify_ts: Option<i64>,
+    /// When the session's pane was last *viewed* — stamped by the per-session
+    /// handler each tick while its tmux pane is focused. Drives the "finished
+    /// while you weren't looking" attention flag: a turn completing after this
+    /// (`last_turn_ts > last_view_ts`) means an unattended completion. Never
+    /// written for a non-tmux session (no handler), so those clear on the next
+    /// prompt instead. See [`crate::fleet::attention`].
+    pub last_view_ts: Option<i64>,
     /// The prompt-cache TTL Anthropic granted this session, in seconds, inferred
     /// from the most recent turn's cache-creation tier (3600 = the 1-hour cache
     /// on subscription plans; 300 = the 5-minute cache for API keys). `None`
@@ -153,6 +160,7 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
         last_turn_ts: v.get("last_turn_ts").and_then(|x| x.as_i64()),
         last_prompt_ts: v.get("last_prompt_ts").and_then(|x| x.as_i64()),
         last_notify_ts: v.get("last_notify_ts").and_then(|x| x.as_i64()),
+        last_view_ts: v.get("last_view_ts").and_then(|x| x.as_i64()),
         cache_ttl_secs: v.get("cache_ttl_secs").and_then(|x| x.as_i64()),
         model: v.get("model").and_then(|x| x.as_str()).map(str::to_string),
         turn_count: v.get("turn_count").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -189,6 +197,7 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
         "last_turn_ts": s.last_turn_ts,
         "last_prompt_ts": s.last_prompt_ts,
         "last_notify_ts": s.last_notify_ts,
+        "last_view_ts": s.last_view_ts,
         "cache_ttl_secs": s.cache_ttl_secs,
         "model": s.model,
         "turn_count": s.turn_count,

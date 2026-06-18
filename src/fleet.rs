@@ -88,6 +88,18 @@ pub fn activity(
     }
 }
 
+/// Pure: whether a session is awaiting your attention because it finished while
+/// unviewed. True when it's settled (`Waiting`/`Idle`) and its last turn
+/// completed *after* the pane was last viewed (`last_turn > last_view`). A
+/// non-tmux session has no `last_view` writer, so `None` reads as "never
+/// viewed" — it flags on completion and clears on the next prompt (which makes
+/// it `Working`, hence not settled).
+pub fn attention(activity: Activity, last_turn: Option<i64>, last_view: Option<i64>) -> bool {
+    matches!(activity, Activity::Waiting | Activity::Idle)
+        && last_turn.is_some()
+        && last_turn > last_view
+}
+
 /// A tmux jump address: which server, which pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneAddr {
@@ -104,6 +116,8 @@ pub struct SessionView {
     pub cwd: Option<String>,
     pub context_pct: Option<u32>,
     pub activity: Activity,
+    /// Finished while unviewed — the "come look at me" flag. See [`attention`].
+    pub attention: bool,
     /// Seconds since the last recorded turn, or `None` if no turn yet.
     pub idle_secs: Option<i64>,
     /// The tmux pane backing this session, or `None` for a non-tmux Claude.
@@ -152,19 +166,21 @@ pub fn build_views(
                 .map(|a| live_servers.contains(&a.server_id))
                 .unwrap_or(false);
             let jumpable = pane_jumpable || window.is_some();
+            let activity = activity(
+                s.last_prompt_ts,
+                s.last_turn_ts,
+                suspended.contains(id),
+                s.last_notify_ts.is_some(),
+                bg_sessions.contains(id),
+                idle_secs,
+            );
             SessionView {
                 claude_session: id.clone(),
                 model: s.model.clone(),
                 cwd: s.cwd.clone(),
                 context_pct: s.context_pct_used,
-                activity: activity(
-                    s.last_prompt_ts,
-                    s.last_turn_ts,
-                    suspended.contains(id),
-                    s.last_notify_ts.is_some(),
-                    bg_sessions.contains(id),
-                    idle_secs,
-                ),
+                activity,
+                attention: attention(activity, s.last_turn_ts, s.last_view_ts),
                 idle_secs,
                 address,
                 window,
@@ -173,13 +189,21 @@ pub fn build_views(
         })
         .collect();
     // Sessions blocked on you float to the very top (they need action now),
-    // then suspended (frozen, easy to forget), then ones still working in the
+    // then ones that finished while you weren't looking (attention), then
+    // suspended (frozen, easy to forget), then ones still working in the
     // background; the rest follow by most-recent activity, ties broken by id.
-    let rank = |v: &SessionView| match v.activity {
-        Activity::NeedsInput => 0u8,
-        Activity::Suspended => 1,
-        Activity::BgRunning => 2,
-        _ => 3,
+    let rank = |v: &SessionView| {
+        if v.activity == Activity::NeedsInput {
+            0u8
+        } else if v.attention {
+            1
+        } else {
+            match v.activity {
+                Activity::Suspended => 2,
+                Activity::BgRunning => 3,
+                _ => 4,
+            }
+        }
     };
     views.sort_by(|a, b| {
         rank(a)
@@ -361,6 +385,7 @@ mod tests {
             last_turn_ts: last_turn,
             last_prompt_ts: None,
             last_notify_ts: None,
+            last_view_ts: None,
             cache_ttl_secs: None,
             model: model.map(str::to_string),
             turn_count: 0,
@@ -372,6 +397,22 @@ mod tests {
             iterm_session_id: None,
             display: None,
         }
+    }
+
+    #[test]
+    fn attention_flags_unviewed_completion() {
+        use Activity::*;
+        // Settled with a completion newer than the last view -> flagged.
+        assert!(attention(Waiting, Some(200), Some(100)));
+        assert!(attention(Idle, Some(200), None)); // non-tmux: never viewed
+        // Viewed since the turn finished -> cleared.
+        assert!(!attention(Waiting, Some(100), Some(200)));
+        // Not settled -> never flagged, even if unviewed.
+        assert!(!attention(Working, Some(200), Some(100)));
+        assert!(!attention(NeedsInput, Some(200), None));
+        assert!(!attention(BgRunning, Some(200), None));
+        // No turn at all -> nothing to attend to.
+        assert!(!attention(Idle, None, None));
     }
 
     fn addr(server: &str, pane: &str) -> PaneAddr {
@@ -387,6 +428,7 @@ mod tests {
             last_turn_ts: turn,
             last_prompt_ts: prompt,
             last_notify_ts: None,
+            last_view_ts: None,
             cache_ttl_secs: None,
             model: None,
             turn_count: 0,
@@ -580,7 +622,11 @@ mod tests {
         // "stopped" is mid-turn (would be Working) but its process is suspended;
         // "fresh" is the most recently active otherwise.
         sessions.insert("stopped".to_string(), session(Some(now - 5), None, None));
-        sessions.insert("fresh".to_string(), session(Some(now - 1), None, None));
+        // Viewed since it finished, so it isn't an attention row competing for
+        // the top — this test is about the suspended tier.
+        let mut fresh = session(Some(now - 1), None, None);
+        fresh.last_view_ts = Some(now);
+        sessions.insert("fresh".to_string(), fresh);
         let susp: HashSet<String> = ["stopped".to_string()].into_iter().collect();
         let views = build_views(
             &sessions,
@@ -602,7 +648,11 @@ mod tests {
         // "bg" completed its turn long ago (would be Idle) but has a live task;
         // "waiting" just finished and is genuinely idle-waiting.
         sessions.insert("bg".to_string(), session(Some(now - 5000), None, None));
-        sessions.insert("waiting".to_string(), session(Some(now - 5), None, None));
+        // Viewed since it finished, so it isn't an attention row — this test is
+        // about the background-task tier.
+        let mut waiting = session(Some(now - 5), None, None);
+        waiting.last_view_ts = Some(now);
+        sessions.insert("waiting".to_string(), waiting);
         let bg: HashSet<String> = ["bg".to_string()].into_iter().collect();
         let views = build_views(
             &sessions,
@@ -615,6 +665,32 @@ mod tests {
         assert_eq!(views[0].claude_session, "bg");
         assert_eq!(views[0].activity, Activity::BgRunning);
         assert_eq!(views[1].claude_session, "waiting");
+    }
+
+    #[test]
+    fn attention_sorts_under_needs_input_above_suspended() {
+        let now = 10_000;
+        let mut sessions = HashMap::new();
+        // "done" finished recently and was never viewed -> attention.
+        sessions.insert("done".to_string(), session(Some(now - 5), None, None));
+        // "stopped" is suspended; "blocked" needs input (must outrank attention).
+        sessions.insert("stopped".to_string(), session(Some(now - 5), None, None));
+        let mut blocked = session(Some(now - 5), None, None);
+        blocked.last_notify_ts = Some(now - 1);
+        sessions.insert("blocked".to_string(), blocked);
+        let susp: HashSet<String> = ["stopped".to_string()].into_iter().collect();
+        let views = build_views(
+            &sessions,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &susp,
+            now,
+        );
+        assert_eq!(views[0].claude_session, "blocked"); // NeedsInput first
+        assert_eq!(views[1].claude_session, "done"); // attention next
+        assert!(views[1].attention);
+        assert_eq!(views[2].claude_session, "stopped"); // suspended below attention
     }
 
     #[test]

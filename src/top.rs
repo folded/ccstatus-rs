@@ -319,7 +319,7 @@ fn table<'a>(views: &'a [SessionView], my_server: Option<&str>, width: u16) -> T
         // it leads and gets the slack. The cell is pre-elided to `dir_w` keeping
         // the tail (last path component), so it never clips the useful end.
         Constraint::Length(dir_w as u16),
-        Constraint::Length(8),  // activity (working/waiting)
+        Constraint::Length(9),  // activity ("⚑ waiting" is the widest)
         Constraint::Length(22), // model (longest is "Opus 4.8 (1M context)")
         Constraint::Length(8),  // ctx N%
         Constraint::Length(10), // idle <age>
@@ -335,7 +335,7 @@ fn table<'a>(views: &'a [SessionView], my_server: Option<&str>, width: u16) -> T
 /// selection gutter, and a 1-col margin so the elided path can't spill into the
 /// activity column. Floored so a narrow terminal still shows a usable stub.
 fn dir_width(total: u16) -> usize {
-    const FIXED: u16 = 8 + 22 + 8 + 10 + 13;
+    const FIXED: u16 = 9 + 22 + 8 + 10 + 13;
     const SPACING: u16 = 5; // 6 columns at column_spacing(1)
     const GUTTER: u16 = 2; // the "▶ " highlight symbol
     const MARGIN: u16 = 1;
@@ -349,20 +349,32 @@ fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>, dir_w: usize) ->
         elide_left(v.cwd.as_deref().unwrap_or(""), dir_w),
         Style::default().fg(C_CYAN),
     );
-    let activity = match v.activity {
-        Activity::Suspended => Span::styled(
-            "stopped",
-            Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
-        ),
-        Activity::NeedsInput => Span::styled(
-            "⚑ input",
-            Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
-        ),
-        Activity::Working => Span::styled("working", Style::default().fg(C_GREEN)),
-        Activity::BgRunning => Span::styled("⚙ bg", Style::default().fg(C_CYAN)),
-        Activity::Waiting => Span::styled("waiting", Style::default().fg(C_ORANGE)),
-        Activity::Idle => Span::styled("idle", dim()),
-        Activity::Unknown => Span::styled("-", dim()),
+    // Finished while you weren't looking floats up with a flag, the same ⚑ cue
+    // as NeedsInput — the word (waiting/idle) says why it's flagged.
+    let activity = if v.attention {
+        Span::styled(
+            match v.activity {
+                Activity::Idle => "⚑ idle",
+                _ => "⚑ waiting",
+            },
+            Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        match v.activity {
+            Activity::Suspended => Span::styled(
+                "stopped",
+                Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Activity::NeedsInput => Span::styled(
+                "⚑ input",
+                Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+            ),
+            Activity::Working => Span::styled("working", Style::default().fg(C_GREEN)),
+            Activity::BgRunning => Span::styled("⚙ bg", Style::default().fg(C_CYAN)),
+            Activity::Waiting => Span::styled("waiting", Style::default().fg(C_ORANGE)),
+            Activity::Idle => Span::styled("idle", dim()),
+            Activity::Unknown => Span::styled("-", dim()),
+        }
     };
     let model = Span::styled(
         v.model.as_deref().unwrap_or("Claude"),
@@ -461,6 +473,7 @@ mod tests {
             cwd: Some(cwd.into()),
             context_pct: Some(7),
             activity: Activity::Waiting,
+            attention: false,
             idle_secs: Some(42),
             address,
             window: None,

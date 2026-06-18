@@ -199,6 +199,7 @@ impl Handler {
 
             self.maybe_reload_config();
             self.requery_focus();
+            self.stamp_view();
             self.prune_dead_panes();
             self.reconcile();
             self.update_window_flags();
@@ -439,13 +440,37 @@ impl Handler {
                 bg.contains(&ps.claude_pid),
                 idle_secs,
             );
+            let attn = fleet::attention(act, sess.last_turn_ts, sess.last_view_ts);
             let git = sess.cwd.as_deref().and_then(crate::git::status);
-            let name = self.flag.render(act, git.as_ref(), sess.cwd.as_deref());
+            let name = self
+                .flag
+                .render(act, attn, git.as_ref(), sess.cwd.as_deref());
             if self.flagged.get(&pane) != Some(&name) {
                 self.tmux.rename_window(&pane, &name);
                 self.flagged.insert(pane, name);
             }
         }
+    }
+
+    /// Stamp `last_view_ts` on the focused Claude pane's session each tick: a
+    /// completion while you're looking then won't raise the attention flag, and
+    /// `top` and the window label agree on what's been viewed. Runs regardless
+    /// of the window-flag config — it's the shared "viewed" signal.
+    fn stamp_view(&self) {
+        let Some(pane) = self.focused_pane.as_deref() else {
+            return;
+        };
+        if !self.panes.contains(pane) {
+            return;
+        }
+        let Some(ps) = state::read_pane(&self.server_id, pane) else {
+            return;
+        };
+        let Some(mut s) = state::read_session(&ps.session_id) else {
+            return;
+        };
+        s.last_view_ts = Some(crate::util::now_unix());
+        let _ = state::write_session(&ps.session_id, &s);
     }
 
     /// Re-enable `automatic-rename` on every window we flagged, and forget them.

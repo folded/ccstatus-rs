@@ -91,7 +91,12 @@ one needs me?" cue, visible in the whole window strip even for unfocused panes
   (`"{git} {dir}@{branch}"`, `"{claude}{dir}"`, …).
 - `markers` set the `{claude}` glyph per activity state — the same states
   `ccstatus top` uses: `needsInput`, `working`, `bgRunning`, `suspended`,
-  `waiting`, `idle`, `unknown` (the last three default to empty).
+  `waiting`, `idle`, `unknown` (the last three default to empty). Plus `done`
+  (default `⚑`): the **attention flag** shown in the `{claude}` slot when a
+  session finishes a turn (or its background tasks drain) **while you're not
+  looking at it**. It clears when you focus the pane; for a non-tmux Claude
+  (which we can't detect focus for) it clears on your next prompt. `top` floats
+  these rows just under `needsInput` and marks them with the same `⚑`.
 - `git` sets the `{git}` glyph: `ahead` (`↑`), `behind` (`↓`), `diverged` (`↕`),
   `dirty` (`⚠`), `clean` (empty). A dirty tree takes precedence over the arrows.
   **Ahead/behind are local-only** — read from the last-fetched remote-tracking

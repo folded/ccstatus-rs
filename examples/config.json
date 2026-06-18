@@ -29,7 +29,8 @@
       "suspended": "⏸",
       "waiting": "",
       "idle": "",
-      "unknown": ""
+      "unknown": "",
+      "done": "⚑"
     },
     "git": {
       "ahead": "↑",

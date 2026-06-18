@@ -49,6 +49,13 @@ nouns below are specific to ccstatus.
   leaves or the flag is disabled. Needs `allow-rename off` so Claude can't
   clobber the name. See `config::WindowFlag::render`,
   `daemon::Handler::update_window_flags`, `git::status`.
+- **attention** — "finished while you weren't looking": a session that's
+  settled (`Waiting`/`Idle`) whose last turn completed *after* it was last
+  viewed (`last_turn_ts > last_view_ts`). The handler stamps `last_view_ts`
+  each tick while its pane is focused, so focusing clears it; a non-tmux session
+  (no handler) has no view stamp, so it clears on the next prompt instead.
+  Surfaced as the `done` flag in the window name and floated under `NeedsInput`
+  in **top**. Pure `fleet::attention`; field on `SessionView`.
 - **state** — the on-disk data contract under `/tmp/ccstatus-<uid>/`:
   `pane/<server>/<pane>.json` (registrar, tmux-only) and `session/<id>.json`.
   The session file carries **presence** (model, cwd, context %, `claude_pid`,
