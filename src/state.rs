@@ -219,7 +219,9 @@ pub fn remove_pane(server_id: &str, pane_id: &str) {
 /// Strip path separators and other awkward characters so that an externally
 /// supplied id can't escape the state directory or break shell substitution.
 /// tmux pane ids look like `%5`; session ids are UUID-ish; both survive.
-fn sanitize(s: &str) -> String {
+/// (Crate-visible so the ghostty handler can match a fleet-supplied pane id —
+/// a sanitized filename — back to the raw pty path it registered.)
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '/' | '\\' | '\0' | '\n' | '\r' | '\t' => '_',

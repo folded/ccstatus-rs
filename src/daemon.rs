@@ -38,7 +38,6 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, Align, Element};
 use crate::control::{self, Connection, EventStream, Writer};
-use crate::fleet;
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
 use crate::state;
@@ -431,20 +430,13 @@ impl Handler {
                 continue;
             };
             let sess = state::read_session(&ps.session_id).unwrap_or_default();
-            let idle_secs = sess.last_turn_ts.map(|t| (now - t).max(0));
-            let act = fleet::activity(
-                sess.last_prompt_ts,
-                sess.last_turn_ts,
+            let name = crate::flags::window_name(
+                &self.flag,
+                &sess,
                 susp.contains(&ps.claude_pid),
-                sess.last_notify_ts.is_some(),
                 bg.contains(&ps.claude_pid),
-                idle_secs,
+                now,
             );
-            let attn = fleet::attention(act, sess.last_turn_ts, sess.last_view_ts);
-            let git = sess.cwd.as_deref().and_then(crate::git::status);
-            let name = self
-                .flag
-                .render(act, attn, git.as_ref(), sess.cwd.as_deref());
             if self.flagged.get(&pane) != Some(&name) {
                 self.tmux.rename_window(&pane, &name);
                 self.flagged.insert(pane, name);
@@ -713,12 +705,12 @@ fn spawn_socket_reader(socket: std::os::unix::net::UnixListener, tx: mpsc::Sende
     });
 }
 
-struct DaemonLog {
+pub(crate) struct DaemonLog {
     path: PathBuf,
 }
 
 impl DaemonLog {
-    fn for_session(server_id: &str, session: &str) -> Self {
+    pub(crate) fn for_session(server_id: &str, session: &str) -> Self {
         let path = crate::cache::cache_dir()
             .join("server")
             .join(server_id)
@@ -726,7 +718,7 @@ impl DaemonLog {
         Self { path }
     }
 
-    fn write(&self, msg: &str) {
+    pub(crate) fn write(&self, msg: &str) {
         let Ok(mut f) = OpenOptions::new()
             .create(true)
             .append(true)

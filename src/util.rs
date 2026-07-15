@@ -78,24 +78,28 @@ fn ps_command(pid: u32) -> Option<String> {
 /// ended — a foreground command only lives while the turn is in progress.
 const BG_WRAPPER_MARKER: &str = "shell-snapshots/snapshot";
 
-/// One row of a [`ps_snapshot`]: a process's id, parent, kernel state code, and
-/// full command line.
+/// One row of a [`ps_snapshot`]: a process's id, parent, kernel state code,
+/// controlling terminal, and full command line.
 pub struct ProcInfo {
     pub pid: u32,
     pub ppid: u32,
     /// The `ps` state field; its first character is the primary code (`T` =
     /// stopped/suspended, `S` sleeping, `R` running, `Z` zombie, …).
     pub state: String,
+    /// The controlling terminal as `ps` prints it (`ttys007` on macOS,
+    /// `pts/3` on Linux, `??`/`?` for none). Used to confirm a recorded pty
+    /// still belongs to its process before writing escape sequences to it.
+    pub tty: String,
     pub command: String,
 }
 
-/// IO: `(pid, ppid, state, command)` for every process, via one `ps`. The flags
-/// are the portable intersection of BSD (macOS) and procps (Linux) `ps`; `=`
-/// suffixes suppress headers. `command` is last (it has spaces); the first three
+/// IO: `(pid, ppid, state, tty, command)` for every process, via one `ps`. The
+/// flags are the portable intersection of BSD (macOS) and procps (Linux) `ps`;
+/// `=` suffixes suppress headers. `command` is last (it has spaces); the other
 /// fields are single tokens. Empty on failure (detectors degrade to off).
 pub fn ps_snapshot() -> Vec<ProcInfo> {
     let Ok(out) = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,state=,command="])
+        .args(["-axo", "pid=,ppid=,state=,tty=,command="])
         .output()
     else {
         return Vec::new();
@@ -110,15 +114,44 @@ pub fn ps_snapshot() -> Vec<ProcInfo> {
             let pid = it.next()?.parse().ok()?;
             let ppid = it.next()?.parse().ok()?;
             let state = it.next()?.to_string();
+            let tty = it.next()?.to_string();
             let command = it.collect::<Vec<_>>().join(" ");
             Some(ProcInfo {
                 pid,
                 ppid,
                 state,
+                tty,
                 command,
             })
         })
         .collect()
+}
+
+/// Pure: whether a `/dev/...` pty path matches a `ps`-reported tty name
+/// (`/dev/ttys007` vs `ttys007`, `/dev/pts/3` vs `pts/3`). `??`/`?` (no
+/// controlling terminal) never matches.
+pub fn tty_matches(dev_path: &str, ps_tty: &str) -> bool {
+    if ps_tty.is_empty() || ps_tty.starts_with('?') {
+        return false;
+    }
+    dev_path.strip_prefix("/dev/") == Some(ps_tty)
+}
+
+/// The controlling terminal of `pid` as a `/dev/...` path, via `ps -o tty=`.
+/// `None` for a process with no controlling terminal (or gone).
+pub fn pid_tty_path(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "tty="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s.starts_with('?') {
+        return None;
+    }
+    Some(format!("/dev/{s}"))
 }
 
 /// Pure: which of `claude_pids` host a live background Bash task — a session
@@ -235,8 +268,21 @@ mod tests {
             pid,
             ppid,
             state: state.into(),
+            tty: "??".into(),
             command: command.into(),
         }
+    }
+
+    #[test]
+    fn tty_matches_compares_dev_path_to_ps_name() {
+        use super::tty_matches;
+        assert!(tty_matches("/dev/ttys007", "ttys007")); // macOS
+        assert!(tty_matches("/dev/pts/3", "pts/3")); // Linux
+        assert!(!tty_matches("/dev/ttys007", "ttys008"));
+        assert!(!tty_matches("/dev/ttys007", "??")); // no controlling tty
+        assert!(!tty_matches("/dev/ttys007", "?"));
+        assert!(!tty_matches("/dev/ttys007", ""));
+        assert!(!tty_matches("ttys007", "ttys007")); // not a /dev path
     }
 
     #[test]

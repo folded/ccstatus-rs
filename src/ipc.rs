@@ -37,10 +37,31 @@ pub fn notify_register(server_id: &str, tmux_session: &str, pane_id: &str) {
     if try_send(&socket, &msg) {
         return;
     }
-    spawn_handler_detached(tmux_session);
+    spawn_detached(&["--session", tmux_session]);
     // Brief retry while the freshly-spawned handler attaches and binds the
     // socket. ~1s total — first registrar call eats this; later ones
     // connect immediately.
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(50));
+        if try_send(&socket, &msg) {
+            return;
+        }
+    }
+}
+
+/// Tell the ghostty handler that `tty` hosts a Claude session, spawning it
+/// (one per machine — ghostty surfaces have no session boundary) if none is
+/// listening. The pty path is the pane id in the ghostty namespace.
+pub fn notify_register_ghostty(tty: &str) {
+    let Ok(dir) = ServerDir::for_current(crate::ghostty::SERVER_ID) else {
+        return;
+    };
+    let socket = dir.socket_path(crate::ghostty::SOCKET_KEY);
+    let msg = format!("register {tty}\n");
+    if try_send(&socket, &msg) {
+        return;
+    }
+    spawn_detached(&["--ghostty-daemon"]);
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(50));
         if try_send(&socket, &msg) {
@@ -81,12 +102,12 @@ fn try_send(socket_path: &Path, msg: &str) -> bool {
     }
 }
 
-fn spawn_handler_detached(tmux_session: &str) {
+fn spawn_detached(args: &[&str]) {
     let Ok(exe) = env::current_exe() else {
         return;
     };
     let mut cmd = Command::new(exe);
-    cmd.arg("--session").arg(tmux_session);
+    cmd.args(args);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());

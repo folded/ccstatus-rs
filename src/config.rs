@@ -631,6 +631,65 @@ impl WindowFlag {
     }
 }
 
+/// Opt-in: plain-Ghostty (no tmux) surface features, gated by the `ghostty`
+/// config block:
+///
+/// ```json
+/// { "ghostty": { "title": true } }
+/// ```
+///
+/// Presence of the block enables it; set `"enabled": false` to keep it
+/// configured but dormant. `title` stamps each Claude surface's tab title
+/// (OSC 2) with the same label the tmux window flag uses — the template and
+/// markers come from the `windowFlag` block (whose own `enabled` gates only
+/// the *tmux* window naming, not this).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ghostty {
+    pub enabled: bool,
+    /// Stamp tab titles via OSC 2.
+    pub title: bool,
+}
+
+impl Default for Ghostty {
+    fn default() -> Self {
+        Ghostty {
+            enabled: false,
+            title: true,
+        }
+    }
+}
+
+impl Ghostty {
+    /// Resolve the ghostty config from the config file.
+    pub fn load() -> Self {
+        Self::from_value(read_config().as_ref())
+    }
+
+    fn from_value(v: Option<&Value>) -> Self {
+        let Some(block) = v.and_then(|v| v.get("ghostty")) else {
+            return Ghostty::default();
+        };
+        let d = Ghostty::default();
+        Ghostty {
+            // Presence of the block opts in; `"enabled": false` disables.
+            enabled: block
+                .get("enabled")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
+            title: block
+                .get("title")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(d.title),
+        }
+    }
+
+    /// Whether the registrar should register ghostty surfaces (and spawn the
+    /// handler) at all — false when disabled or no feature is on.
+    pub fn active(&self) -> bool {
+        self.enabled && self.title
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +720,32 @@ mod tests {
         let v = cfg(r#"{ "windowFlag": { "enabled": false } }"#);
         let f = WindowFlag::from_value(Some(&v));
         assert!(!f.enabled);
+    }
+
+    #[test]
+    fn ghostty_absent_is_disabled() {
+        let g = Ghostty::from_value(None);
+        assert!(!g.enabled);
+        assert!(!g.active());
+    }
+
+    #[test]
+    fn ghostty_present_opts_in_with_title_on() {
+        let v = cfg(r#"{ "ghostty": {} }"#);
+        let g = Ghostty::from_value(Some(&v));
+        assert!(g.enabled);
+        assert!(g.title);
+        assert!(g.active());
+    }
+
+    #[test]
+    fn ghostty_enabled_false_or_no_features_is_inactive() {
+        let v = cfg(r#"{ "ghostty": { "enabled": false } }"#);
+        assert!(!Ghostty::from_value(Some(&v)).active());
+        let v = cfg(r#"{ "ghostty": { "title": false } }"#);
+        let g = Ghostty::from_value(Some(&v));
+        assert!(g.enabled); // opted in, but nothing to do
+        assert!(!g.active());
     }
 
     #[test]

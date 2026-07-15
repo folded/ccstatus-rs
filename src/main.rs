@@ -5,8 +5,11 @@ mod color;
 mod config;
 mod control;
 mod daemon;
+mod daemon_ghostty;
+mod flags;
 mod fleet;
 mod format;
+mod ghostty;
 mod git;
 mod heatmap;
 mod hooks;
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
         ParseOutcome::Run(c) => c,
         ParseOutcome::Hook(kind) => return hooks::run(kind),
         ParseOutcome::Handler(session) => return daemon::run(session),
+        ParseOutcome::GhosttyHandler => return daemon_ghostty::run(),
         ParseOutcome::TmuxReset => {
             tmux::reset(&tmux::CliTmux);
             println!("ccstatus: bar reset to defaults");
@@ -105,13 +109,22 @@ fn main() -> ExitCode {
 
     // Store the rendered elements for the daemon and ping it, but only when
     // at least one element is routed to a tmux surface.
-    if let Some(pane_id) = &pane_id
-        && routing.any_tmux()
-        && register_pane(&input, pane_id, &elements).is_some()
-        && let Some(tmux_session) = tmux::CliTmux.session_of(pane_id)
-    {
+    if let Some(pane_id) = &pane_id {
         let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
-        ipc::notify_register(&server_id, &tmux_session, pane_id);
+        let pane_tty = tmux::CliTmux.pane_tty(pane_id).unwrap_or_default();
+        if routing.any_tmux()
+            && register_pane(&input, &server_id, pane_id, pane_tty, &elements).is_some()
+            && let Some(tmux_session) = tmux::CliTmux.session_of(pane_id)
+        {
+            ipc::notify_register(&server_id, &tmux_session, pane_id);
+        }
+    } else if config::Ghostty::load().active()
+        && let Some(tty) = ghostty::surface_tty()
+        && register_pane(&input, ghostty::SERVER_ID, &tty, tty.clone(), &elements).is_some()
+    {
+        // Plain Ghostty (no tmux): the pty path is the pane id; the ghostty
+        // handler stamps the surface's tab title from this pane state.
+        ipc::notify_register_ghostty(&tty);
     }
 
     // `warmth` is computed live from session state, not by render_elements.
@@ -152,20 +165,21 @@ fn active_tmux_pane() -> Option<String> {
     env::var("TMUX_PANE").ok().filter(|s| !s.is_empty())
 }
 
-/// Write per-pane state so the daemon can compose the tmux surfaces from
-/// the rendered elements. Coalesces writes that arrive within 500 ms of an
+/// Write per-pane state so a handler can drive its surface from the rendered
+/// elements. `pane_id` is a tmux pane id (`%5`) or, in the ghostty namespace,
+/// the surface's pty path. Coalesces writes that arrive within 500 ms of an
 /// identical prior write so a streaming statusline call doesn't hammer the
 /// filesystem. Returns the session id that was registered (so the caller
-/// can ping the daemon with it), or None if the input lacked one.
+/// can ping the handler with it), or None if the input lacked one.
 fn register_pane(
     input: &Value,
+    server_id: &str,
     pane_id: &str,
+    pane_tty: String,
     elements: &[(config::Element, String)],
 ) -> Option<String> {
     let session_id = resolve_session_id(input)?;
-    let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
     let claude_pid = resolve_claude_pid();
-    let pane_tty = tmux::CliTmux.pane_tty(pane_id).unwrap_or_default();
     let transcript_path = input
         .get("transcript_path")
         .and_then(|v| v.as_str())
@@ -177,11 +191,11 @@ fn register_pane(
         .map(|(e, c)| (e.key().to_string(), c.clone()))
         .collect();
 
-    if let Some(existing) = state::read_pane(&server_id, pane_id)
+    if let Some(existing) = state::read_pane(server_id, pane_id)
         && existing.session_id == session_id
         && existing.claude_pid == claude_pid
         && existing.elements == element_map
-        && pane_recent(&server_id, pane_id, Duration::from_millis(500))
+        && pane_recent(server_id, pane_id, Duration::from_millis(500))
     {
         return Some(session_id);
     }
@@ -195,7 +209,7 @@ fn register_pane(
         last_warmth: None,
         elements: element_map,
     };
-    let _ = state::write_pane(&server_id, pane_id, &pane_state);
+    let _ = state::write_pane(server_id, pane_id, &pane_state);
     Some(session_id)
 }
 

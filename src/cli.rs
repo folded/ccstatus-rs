@@ -39,6 +39,9 @@ pub enum ParseOutcome {
     /// Run the per-session control-mode handler that drives the status bar
     /// for the given tmux session. Spawned on demand by the registrar.
     Handler(String),
+    /// Run the machine-wide ghostty handler that stamps plain-Ghostty tab
+    /// titles. Spawned on demand by the registrar.
+    GhosttyHandler,
     /// Manually reset the tmux bar to defaults (unset every
     /// `status-format[N]`, clear the `@ccstatus-active` sentinel, set
     /// `status` to `on`). For cleaning up a polluted bar when no
@@ -76,6 +79,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 Some(s) if !s.is_empty() => return ParseOutcome::Handler(s),
                 _ => return ParseOutcome::Error("--session requires a tmux session id".into()),
             },
+            "--ghostty-daemon" => return ParseOutcome::GhosttyHandler,
             "--tmux-reset" => return ParseOutcome::TmuxReset,
             "top" => return ParseOutcome::Top,
             "--hook" => {
@@ -129,6 +133,10 @@ Options:
   --session <id>    Run the per-session control-mode handler for tmux
                     session <id>. Spawned automatically by the registrar;
                     not meant to be run by hand.
+  --ghostty-daemon  Run the handler that stamps plain-Ghostty tab titles
+                    (opt-in via the 'ghostty' config block). Spawned
+                    automatically by the registrar; not meant to be run
+                    by hand.
   --tmux-reset      Restore the global status bar to tmux defaults
                     (status-format[0] window list, higher slots unset,
                     status=on). Cleans up after a crashed daemon.

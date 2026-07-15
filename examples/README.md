@@ -112,6 +112,36 @@ one needs me?" cue, visible in the whole window strip even for unfocused panes
   Code's own window rename (its version) clobbers the flag. The OSC 2 pane title
   (`#T`, Claude's task summary) is a separate channel and is unaffected.
 
+## Ghostty (activity in the tab title, no tmux)
+
+`ghostty` is an opt-in block (sibling to the layouts) for Claude sessions
+running **directly in [Ghostty](https://ghostty.org)** — no tmux. Ghostty has
+no status bar, but its tab titles are settable via escape codes, so a small
+handler stamps each Claude surface's **tab title** with the same label the
+tmux window flag uses:
+
+```json
+{ "ghostty": { "title": true },
+  "windowFlag": { "format": "{claude} {dir} {git}" } }
+```
+
+- **Presence of the block opts in** (set `"enabled": false` to disable). The
+  label's template and glyphs come from the `windowFlag` block above — only
+  `windowFlag.enabled` is ignored here (that gates tmux window naming).
+- Titles in Ghostty are last-writer-wins (Claude Code and shell prompts also
+  set them), so the handler re-asserts the title every ~3 s; expect the other
+  writers' titles to flash through briefly on prompt redraws.
+- **Does not work if you set `title` in your Ghostty config** — that makes
+  Ghostty ignore all escape-code titles.
+- The title is handed back to Ghostty's own naming when Claude exits or the
+  block is disabled. The handler (`ccstatus --ghostty-daemon`) is spawned
+  automatically on the first statusline render inside Ghostty and exits when
+  the last Claude session does. After a rebuild: `pkill -f 'ccstatus
+  --ghostty-daemon'` (it respawns from the new binary).
+- The attention `⚑` clears on your next prompt (surface focus isn't
+  detectable from outside Ghostty), and Ghostty's command-palette session
+  search indexes these titles — searching `⚑` finds sessions awaiting you.
+
 ## Notes
 
 - **The bar shows only while the focused pane is running Claude.** Switching to
