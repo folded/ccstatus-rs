@@ -95,6 +95,103 @@ impl GhosttySurface for CliGhostty {
     }
 }
 
+/// Where the user's attention is, app-level first: probed once per handler
+/// tick and refined per surface by cwd (Ghostty's scripting API exposes the
+/// focused terminal's working directory, but not its tty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppFocus {
+    /// Ghostty is not the frontmost app — every surface is unfocused.
+    Background,
+    /// Ghostty is frontmost; the focused surface's working directory from
+    /// the scripting API, or `None` when unknowable (permission denied,
+    /// scripting error).
+    Front(Option<String>),
+    /// No probe on this platform — focus is unknowable.
+    Unknown,
+}
+
+/// Probe app + surface focus. `scripting_denied` latches an AppleScript
+/// automation denial so a declined TCC prompt is asked exactly once per
+/// handler lifetime.
+#[cfg(target_os = "macos")]
+pub fn probe_focus(scripting_denied: &mut bool) -> AppFocus {
+    match frontmost_is_ghostty() {
+        Some(false) => AppFocus::Background,
+        None => AppFocus::Unknown,
+        Some(true) => {
+            if *scripting_denied {
+                return AppFocus::Front(None);
+            }
+            match focused_terminal_cwd() {
+                Ok(cwd) => AppFocus::Front(cwd),
+                Err(Denied) => {
+                    *scripting_denied = true;
+                    AppFocus::Front(None)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn probe_focus(_scripting_denied: &mut bool) -> AppFocus {
+    AppFocus::Unknown
+}
+
+/// Whether the frontmost app is Ghostty, via `lsappinfo` (no TCC prompt,
+/// unlike System Events). `None` if the probe itself failed.
+#[cfg(target_os = "macos")]
+fn frontmost_is_ghostty() -> Option<bool> {
+    let front = std::process::Command::new("lsappinfo")
+        .arg("front")
+        .output()
+        .ok()?;
+    let asn = String::from_utf8_lossy(&front.stdout).trim().to_string();
+    if !front.status.success() || asn.is_empty() {
+        return None;
+    }
+    let info = std::process::Command::new("lsappinfo")
+        .args(["info", "-only", "bundleID", &asn])
+        .output()
+        .ok()?;
+    if !info.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&info.stdout).contains("com.mitchellh.ghostty"))
+}
+
+/// Marker error: the user declined the automation prompt (AppleEvents error
+/// -1743) — do not ask again.
+#[cfg(target_os = "macos")]
+pub struct Denied;
+
+/// The focused Ghostty surface's working directory via the scripting API
+/// (Ghostty >= 1.3). `Ok(None)` on any non-permission failure — treated as
+/// "frontmost but unknowable".
+#[cfg(target_os = "macos")]
+fn focused_terminal_cwd() -> Result<Option<String>, Denied> {
+    let out = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application id \"com.mitchellh.ghostty\" to get working directory of focused terminal",
+        ])
+        .output();
+    let Ok(out) = out else { return Ok(None) };
+    if !out.status.success() {
+        // -1743: the user declined the automation prompt. Anything else
+        // (missing value, no focused terminal, API drift) is transient.
+        if String::from_utf8_lossy(&out.stderr).contains("-1743") {
+            return Err(Denied);
+        }
+        return Ok(None);
+    }
+    let cwd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if cwd.is_empty() || cwd == "missing value" {
+        return Ok(None);
+    }
+    Ok(Some(cwd))
+}
+
 /// The rxvt notification sequence: `ESC ] 777 ; notify ; title ; body BEL`.
 /// The title must not carry `;` (it would bleed into the body slot); the
 /// body is the final field, so its semicolons are safe. Both are stripped

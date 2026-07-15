@@ -137,12 +137,22 @@ tmux window flag uses:
   suspended). Ghostty auto-clears the bar ~15 s after updates stop, so a
   killed handler leaves clean surfaces.
 - `notify` raises a **desktop notification** when a session settles (turn
-  finished, background tasks drained) — the `⚑` moment as a banner. Ghostty
-  only banners a surface while it's **unfocused** and clicking the banner
-  focuses its tab, so watching a turn finish never pings you. One banner per
-  completion (never re-fired by the tick), and completions that predate the
-  handler stay quiet. Requires Ghostty's `desktop-notifications` (default
-  on) and macOS notification permission for Ghostty.
+  finished, background tasks drained) — the `⚑` moment as a banner, fired
+  only once the tab is actually out of view (other tab, other app), so
+  watching a turn finish never pings you and the one banner isn't wasted
+  while you're still looking. Clicking it focuses the tab. One banner per
+  completion; completions that predate the handler stay quiet, and a banner
+  deferred more than ~2 minutes is dropped as stale. Requires Ghostty's
+  `desktop-notifications` (default on) and macOS notification permission for
+  Ghostty — set the alert style to **Persistent** if you want banners to
+  stick until dismissed.
+- On macOS the handler asks (once) for **Automation permission on Ghostty**
+  to learn which tab you're viewing. Granting it makes the `⚑` clear **when
+  you view the tab** (like tmux) and makes banners tab-accurate; declining
+  degrades gracefully — `⚑` clears on your next prompt, and banners for
+  other tabs wait until Ghostty itself is in the background. Surfaces are
+  matched by working directory, so two Claude sessions in the same directory
+  are conflated for these checks.
 - Titles in Ghostty are last-writer-wins (Claude Code and shell prompts also
   set them), so the handler re-asserts the title every ~3 s; expect the other
   writers' titles to flash through briefly on prompt redraws.

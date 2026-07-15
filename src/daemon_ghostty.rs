@@ -81,6 +81,7 @@ pub fn run() -> ExitCode {
         ttys: HashSet::new(),
         stamped: HashSet::new(),
         notified: HashMap::new(),
+        scripting_denied: false,
         last_activity: Instant::now(),
         surface: Box::new(ghostty::CliGhostty),
         log,
@@ -104,6 +105,10 @@ struct GhosttyHandler {
     /// (or saw at first sight — completions predating the handler don't
     /// banner on spawn). One banner per settled completion, not per tick.
     notified: HashMap<String, i64>,
+    /// The user declined the Ghostty automation prompt: stop asking. Focus
+    /// then degrades to app-level only (banners defer while Ghostty is
+    /// frontmost, `⚑` clears on next prompt instead of on view).
+    scripting_denied: bool,
     last_activity: Instant,
     surface: Box<dyn GhosttySurface>,
     log: DaemonLog,
@@ -222,12 +227,23 @@ impl GhosttyHandler {
         let bg = util::background_task_pids(&procs, &pids);
         let susp = util::suspended_pids(&procs, &pids);
         let now = util::now_unix();
+        let app_focus = ghostty::probe_focus(&mut self.scripting_denied);
 
         for tty in self.ttys.iter().cloned().collect::<Vec<_>>() {
             let Some(ps) = state::read_pane(ghostty::SERVER_ID, &tty) else {
                 continue;
             };
-            let sess = state::read_session(&ps.session_id).unwrap_or_default();
+            let mut sess = state::read_session(&ps.session_id).unwrap_or_default();
+            let focus = surface_focus(&app_focus, sess.cwd.as_deref());
+
+            // Viewed: stamp `last_view_ts` (the shared "you saw it" signal —
+            // clears the ⚑ here, in `top`, and for the banner below), like
+            // the tmux handler's stamp_view.
+            if focus == SurfaceFocus::Viewed {
+                sess.last_view_ts = Some(now);
+                let _ = state::write_session(&ps.session_id, &sess);
+            }
+
             let flags = crate::flags::compute(
                 &self.flag,
                 &sess,
@@ -246,14 +262,13 @@ impl GhosttyHandler {
                     .set_progress(&tty, progress_for(flags.activity, &sess, now));
             }
 
-            // Ghostty suppresses the banner while the surface is focused, so
-            // watching a turn finish never pings; unfocused tabs banner once,
-            // and clicking the banner focuses them.
             let (banner, latch) = notify_action(
                 self.notified.get(&tty).copied(),
                 self.cfg.notify,
                 flags.attention,
                 sess.last_turn_ts.unwrap_or(0),
+                focus,
+                now,
             );
             if banner {
                 self.surface.notify(&tty, "Claude finished", &flags.name);
@@ -304,22 +319,75 @@ fn progress_for(
     }
 }
 
+/// A deferred banner (Ghostty frontmost, focused surface unknowable) stays
+/// eligible this long past its completion; older ones are dropped silently —
+/// a "Claude finished" for something that finished ten minutes ago is noise.
+const NOTIFY_DEFER_CAP_SECS: i64 = 120;
+
+/// One surface's share of the app-level focus probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceFocus {
+    /// This surface is on screen: never banner, stamp it viewed.
+    Viewed,
+    /// Definitely not on screen: a banner will actually show.
+    Unfocused,
+    /// Ghostty is frontmost but the focused surface is unknowable (no
+    /// scripting permission): defer rather than spend the one banner.
+    Ambiguous,
+}
+
+/// Refine the app-level probe for one surface. Surfaces are matched by
+/// working directory (the scripting API exposes no tty), so two sessions in
+/// the same directory are conflated — both read as viewed when either is.
+fn surface_focus(app: &ghostty::AppFocus, sess_cwd: Option<&str>) -> SurfaceFocus {
+    match app {
+        ghostty::AppFocus::Background => SurfaceFocus::Unfocused,
+        ghostty::AppFocus::Front(Some(cwd)) => match sess_cwd {
+            Some(c) if paths_eq(c, cwd) => SurfaceFocus::Viewed,
+            _ => SurfaceFocus::Unfocused,
+        },
+        ghostty::AppFocus::Front(None) => SurfaceFocus::Ambiguous,
+        // No probe on this platform: behave as before (emit once, let
+        // Ghostty's own focus gate decide).
+        ghostty::AppFocus::Unknown => SurfaceFocus::Unfocused,
+    }
+}
+
+/// Trailing-slash-insensitive path equality.
+fn paths_eq(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 /// Pure notification latch: `(banner now?, new latch value)`. `seen` is the
 /// turn timestamp we last notified for (`None` = first sight of this
 /// surface). First sight seeds quietly — completions predating the handler
 /// (or a handler restart) must not banner on spawn. After that, one banner
 /// per settled-unviewed completion (`attention` with a turn newer than the
-/// latch), and the latch follows it whether or not `notify` is on, so
-/// toggling the feature never releases a burst of stale banners.
+/// latch) — but only once the surface is *known* unfocused, so the single
+/// shot isn't spent while the user is still looking (Ghostty would suppress
+/// it and the moment would be lost). Viewed completions and toggled-off
+/// notifies still advance the latch, so nothing stale ever bursts later.
 fn notify_action(
     seen: Option<i64>,
     notify_on: bool,
     attention: bool,
     turn: i64,
+    focus: SurfaceFocus,
+    now: i64,
 ) -> (bool, Option<i64>) {
     match seen {
         None => (false, Some(turn)),
-        Some(s) if attention && turn != s => (notify_on, Some(turn)),
+        Some(s) if attention && turn != s => match focus {
+            SurfaceFocus::Viewed => (false, Some(turn)),
+            SurfaceFocus::Unfocused => (notify_on, Some(turn)),
+            SurfaceFocus::Ambiguous => {
+                if now - turn > NOTIFY_DEFER_CAP_SECS {
+                    (false, Some(turn)) // stale: drop silently
+                } else {
+                    (false, None) // defer; retry next tick
+                }
+            }
+        },
         _ => (false, None),
     }
 }
@@ -412,6 +480,7 @@ mod tests {
             ttys: HashSet::new(),
             stamped: HashSet::new(),
             notified: HashMap::new(),
+            scripting_denied: false,
             last_activity: Instant::now(),
             surface: Box::new(FakeGhostty::new()),
             // Parent dir never exists in tests, so writes no-op silently.
@@ -495,19 +564,90 @@ mod tests {
 
     #[test]
     fn notify_latch_banners_once_per_new_completion() {
+        use SurfaceFocus::*;
+        let now = 210;
         // First sight: seed quietly, even if attention is up.
-        assert_eq!(notify_action(None, true, true, 100), (false, Some(100)));
-        // A new settled completion banners once...
-        assert_eq!(notify_action(Some(100), true, true, 200), (true, Some(200)));
+        assert_eq!(
+            notify_action(None, true, true, 100, Unfocused, now),
+            (false, Some(100))
+        );
+        // A new settled completion banners once while unfocused...
+        assert_eq!(
+            notify_action(Some(100), true, true, 200, Unfocused, now),
+            (true, Some(200))
+        );
         // ...and later ticks of the same completion stay quiet.
-        assert_eq!(notify_action(Some(200), true, true, 200), (false, None));
+        assert_eq!(
+            notify_action(Some(200), true, true, 200, Unfocused, now),
+            (false, None)
+        );
         // Not settled-unviewed -> quiet, latch unchanged.
-        assert_eq!(notify_action(Some(100), true, false, 200), (false, None));
+        assert_eq!(
+            notify_action(Some(100), true, false, 200, Unfocused, now),
+            (false, None)
+        );
         // Feature off: latch still follows the completion (no burst when
         // notify is later re-enabled), but no banner.
         assert_eq!(
-            notify_action(Some(100), false, true, 200),
+            notify_action(Some(100), false, true, 200, Unfocused, now),
             (false, Some(200))
+        );
+    }
+
+    #[test]
+    fn notify_latch_respects_focus() {
+        use SurfaceFocus::*;
+        let now = 210;
+        // Viewed: consumed silently — you're looking at it.
+        assert_eq!(
+            notify_action(Some(100), true, true, 200, Viewed, now),
+            (false, Some(200))
+        );
+        // Ambiguous (Ghostty front, no scripting): defer — don't spend the
+        // one banner while the user may be watching.
+        assert_eq!(
+            notify_action(Some(100), true, true, 200, Ambiguous, now),
+            (false, None)
+        );
+        // Deferred completion fires the moment the app goes to background...
+        assert_eq!(
+            notify_action(Some(100), true, true, 200, Unfocused, now),
+            (true, Some(200))
+        );
+        // ...unless it went stale first: dropped silently.
+        let later = 200 + NOTIFY_DEFER_CAP_SECS + 1;
+        assert_eq!(
+            notify_action(Some(100), true, true, 200, Ambiguous, later),
+            (false, Some(200))
+        );
+    }
+
+    #[test]
+    fn surface_focus_maps_app_probe_by_cwd() {
+        use ghostty::AppFocus;
+        assert_eq!(
+            surface_focus(&AppFocus::Background, Some("/a")),
+            SurfaceFocus::Unfocused
+        );
+        assert_eq!(
+            surface_focus(&AppFocus::Front(Some("/a/".into())), Some("/a")),
+            SurfaceFocus::Viewed // trailing slash tolerated
+        );
+        assert_eq!(
+            surface_focus(&AppFocus::Front(Some("/b".into())), Some("/a")),
+            SurfaceFocus::Unfocused
+        );
+        assert_eq!(
+            surface_focus(&AppFocus::Front(Some("/a".into())), None),
+            SurfaceFocus::Unfocused // no cwd recorded: can't claim viewed
+        );
+        assert_eq!(
+            surface_focus(&AppFocus::Front(None), Some("/a")),
+            SurfaceFocus::Ambiguous
+        );
+        assert_eq!(
+            surface_focus(&AppFocus::Unknown, Some("/a")),
+            SurfaceFocus::Unfocused
         );
     }
 
