@@ -22,15 +22,16 @@ pub const SERVER_ID: &str = "ghostty";
 /// (`handlerg.lock` / `handlerg.sock`). One handler drives every surface.
 pub const SOCKET_KEY: &str = "g";
 
-/// `Some(pty path)` iff this process runs directly inside Ghostty (no tmux —
-/// callers check tmux first) and its controlling terminal is resolvable.
-/// The statusline shares Claude Code's controlling terminal, so this is the
-/// pty of the surface hosting the session.
-pub fn surface_tty() -> Option<String> {
+/// `Some(pty path)` iff this session runs directly inside Ghostty (no tmux —
+/// callers check tmux first) and the Claude process's controlling terminal is
+/// resolvable. Keyed off the *Claude* pid, not our own: Claude Code may spawn
+/// the statusline detached from the terminal session (no ctty), but the
+/// Claude process itself always sits on the surface's pty.
+pub fn surface_tty(claude_pid: u32) -> Option<String> {
     if env::var("TERM_PROGRAM").as_deref() != Ok("ghostty") {
         return None;
     }
-    crate::util::pid_tty_path(std::process::id())
+    crate::util::pid_tty_path(claude_pid)
 }
 
 /// Escape-sequence actuation onto one Ghostty surface (its pty). Writes are

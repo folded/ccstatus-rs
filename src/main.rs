@@ -113,18 +113,37 @@ fn main() -> ExitCode {
         let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
         let pane_tty = tmux::CliTmux.pane_tty(pane_id).unwrap_or_default();
         if routing.any_tmux()
-            && register_pane(&input, &server_id, pane_id, pane_tty, &elements).is_some()
+            && register_pane(
+                &input,
+                &server_id,
+                pane_id,
+                pane_tty,
+                resolve_claude_pid(),
+                &elements,
+            )
+            .is_some()
             && let Some(tmux_session) = tmux::CliTmux.session_of(pane_id)
         {
             ipc::notify_register(&server_id, &tmux_session, pane_id);
         }
-    } else if config::Ghostty::load().active()
-        && let Some(tty) = ghostty::surface_tty()
-        && register_pane(&input, ghostty::SERVER_ID, &tty, tty.clone(), &elements).is_some()
-    {
-        // Plain Ghostty (no tmux): the pty path is the pane id; the ghostty
-        // handler stamps the surface's tab title from this pane state.
-        ipc::notify_register_ghostty(&tty);
+    } else if config::Ghostty::load().active() {
+        // Plain Ghostty (no tmux): the Claude process's pty path is the pane
+        // id; the ghostty handler stamps the surface's tab title from this
+        // pane state.
+        let claude_pid = resolve_claude_pid();
+        if let Some(tty) = ghostty::surface_tty(claude_pid)
+            && register_pane(
+                &input,
+                ghostty::SERVER_ID,
+                &tty,
+                tty.clone(),
+                claude_pid,
+                &elements,
+            )
+            .is_some()
+        {
+            ipc::notify_register_ghostty(&tty);
+        }
     }
 
     // `warmth` is computed live from session state, not by render_elements.
@@ -176,10 +195,10 @@ fn register_pane(
     server_id: &str,
     pane_id: &str,
     pane_tty: String,
+    claude_pid: u32,
     elements: &[(config::Element, String)],
 ) -> Option<String> {
     let session_id = resolve_session_id(input)?;
-    let claude_pid = resolve_claude_pid();
     let transcript_path = input
         .get("transcript_path")
         .and_then(|v| v.as_str())
