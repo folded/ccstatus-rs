@@ -155,19 +155,13 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
                 push_fmt(&mut out, format_args!(" {DIM}@{s}{RESET}"));
             }
         }
-        if let Some(pct) = builtin_7d_pct.and_then(|v| v.as_f64()) {
-            let p = pct.round() as i64;
-            let c = usage_color(p);
-            out.push_str(&sep);
-            push_fmt(&mut out, format_args!("{WHITE}7d{RESET} {c}{p}%{RESET}"));
-            if let Some(epoch) = builtin_7d_reset.and_then(value_as_epoch)
-                && let Some(s) = format_local(epoch, "%a %b %-d, %H:%M")
-            {
-                push_fmt(&mut out, format_args!(" {DIM}@{s}{RESET}"));
-            }
-        }
+        let pct_7d = builtin_7d_pct
+            .and_then(|v| v.as_f64())
+            .map(|n| n.round() as i64);
+        let reset_7d = builtin_7d_reset.and_then(value_as_epoch);
+        let scoped = usage_json.map(scoped_limits).unwrap_or_default();
+        push_weekly(&mut out, &sep, pct_7d, reset_7d, scoped);
         if let Some(data) = usage_json {
-            render_scoped_limits(data, &sep, &mut out);
             render_extra_usage(data, &sep, &mut out);
         }
     } else if let Some(data) = usage_json {
@@ -198,21 +192,12 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
                 .and_then(|x| x.as_f64())
                 .unwrap_or(0.0)
                 .round() as i64;
-            let iso_7d = v.pointer("/seven_day/resets_at").and_then(|x| x.as_str());
-            let c7 = usage_color(pct_7d);
-            out.push_str(&sep);
-            push_fmt(
-                &mut out,
-                format_args!("{WHITE}7d{RESET} {c7}{pct_7d}%{RESET}"),
-            );
-            if let Some(reset) = iso_7d
-                .and_then(iso_to_epoch)
-                .and_then(|e| format_local(e, "%a %b %-d, %H:%M"))
-            {
-                push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
-            }
+            let reset_7d = v
+                .pointer("/seven_day/resets_at")
+                .and_then(|x| x.as_str())
+                .and_then(iso_to_epoch);
+            push_weekly(&mut out, &sep, Some(pct_7d), reset_7d, scoped_limits(data));
 
-            render_scoped_limits(data, &sep, &mut out);
             render_extra_usage(data, &sep, &mut out);
             return out;
         }
@@ -257,47 +242,105 @@ fn effective_builtin(input: &Value) -> bool {
     }
 }
 
-/// Render the model-scoped entries of the API's `limits` array — the
-/// per-model quotas that have no key of their own (e.g. Fable's weekly
-/// limit, `kind: "weekly_scoped"` with `scope.model.display_name: "Fable"`).
-/// Unscoped entries (`session`, `weekly_all`) duplicate the 5h/7d segments
-/// and are skipped. Rendered as `<Model> <pct>% @<reset>`, the reset in the
-/// weekly (`7d`) format — a scoped window carries its own `resets_at`, and
-/// assuming it matches the account-wide weekly reset would bake in an API
-/// coincidence.
-fn render_scoped_limits(data: &str, sep: &str, out: &mut String) {
-    let v: Value = match serde_json::from_str(data) {
-        Ok(v) => v,
-        Err(_) => return,
+/// Display format for weekly reset times (`7d` and scoped quotas alike).
+const WEEKLY_RESET_FMT: &str = "%a %b %-d, %H:%M";
+
+/// Scoped resets within this of the 7d reset count as "the same window".
+/// The live endpoint reports the same weekly boundary with seconds of
+/// jitter across entries (`20:59:59` vs `21:00:00.47`); genuinely distinct
+/// windows differ by hours or days.
+const RESET_GROUP_TOLERANCE_SECS: i64 = 60;
+
+/// A model-scoped quota from the API's `limits` array — a per-model window
+/// with no key of its own (e.g. Fable's weekly limit, `kind:
+/// "weekly_scoped"` with `scope.model.display_name: "Fable"`).
+struct ScopedLimit {
+    label: String,
+    pct: i64,
+    /// Reset epoch, kept numeric so grouping can tolerate reporting jitter.
+    reset: Option<i64>,
+}
+
+/// Parse the model-scoped entries of a usage payload. Unscoped entries
+/// (`session`, `weekly_all`) duplicate the 5h/7d segments and are skipped.
+fn scoped_limits(data: &str) -> Vec<ScopedLimit> {
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return Vec::new();
     };
     let Some(limits) = v.get("limits").and_then(|x| x.as_array()) else {
-        return;
+        return Vec::new();
     };
-    for entry in limits {
-        let Some(label) = entry
-            .pointer("/scope/model/display_name")
-            .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        let Some(pct) = entry
-            .get("percent")
-            .and_then(|x| x.as_f64())
-            .map(|n| n.round() as i64)
-        else {
-            continue;
-        };
-        let c = usage_color(pct);
+    limits
+        .iter()
+        .filter_map(|entry| {
+            let label = entry
+                .pointer("/scope/model/display_name")?
+                .as_str()?
+                .trim()
+                .to_string();
+            if label.is_empty() {
+                return None;
+            }
+            let pct = entry.get("percent")?.as_f64()?.round() as i64;
+            let reset = entry
+                .get("resets_at")
+                .and_then(|x| x.as_str())
+                .and_then(iso_to_epoch);
+            Some(ScopedLimit { label, pct, reset })
+        })
+        .collect()
+}
+
+/// Render the weekly cluster: the account-wide `7d` window with any scoped
+/// quotas resetting at (tolerably) the same moment folded into the same
+/// segment — `7d 10%; Fable 7% @Thu Jul 16, 07:00`, one `@` for the group,
+/// wearing the 7d reset — and the remaining scoped quotas standalone with
+/// their own reset.
+fn push_weekly(
+    out: &mut String,
+    sep: &str,
+    pct_7d: Option<i64>,
+    reset_7d: Option<i64>,
+    scoped: Vec<ScopedLimit>,
+) {
+    let grouped = |s: &ScopedLimit| match (reset_7d, s.reset) {
+        (Some(a), Some(b)) => (a - b).abs() <= RESET_GROUP_TOLERANCE_SECS,
+        _ => false,
+    };
+    let mut rest = Vec::new();
+    if let Some(p) = pct_7d {
+        let c = usage_color(p);
         out.push_str(sep);
-        push_fmt(out, format_args!("{WHITE}{label}{RESET} {c}{pct}%{RESET}"));
-        if let Some(reset) = entry
-            .get("resets_at")
-            .and_then(|x| x.as_str())
-            .and_then(iso_to_epoch)
-            .and_then(|e| format_local(e, "%a %b %-d, %H:%M"))
-        {
-            push_fmt(out, format_args!(" {DIM}@{reset}{RESET}"));
+        push_fmt(out, format_args!("{WHITE}7d{RESET} {c}{p}%{RESET}"));
+        for s in scoped {
+            if grouped(&s) {
+                let c = usage_color(s.pct);
+                push_fmt(
+                    out,
+                    format_args!(
+                        "{DIM};{RESET} {WHITE}{}{RESET} {c}{}%{RESET}",
+                        s.label, s.pct
+                    ),
+                );
+            } else {
+                rest.push(s);
+            }
+        }
+        if let Some(r) = reset_7d.and_then(|e| format_local(e, WEEKLY_RESET_FMT)) {
+            push_fmt(out, format_args!(" {DIM}@{r}{RESET}"));
+        }
+    } else {
+        rest = scoped;
+    }
+    for s in rest {
+        let c = usage_color(s.pct);
+        out.push_str(sep);
+        push_fmt(
+            out,
+            format_args!("{WHITE}{}{RESET} {c}{}%{RESET}", s.label, s.pct),
+        );
+        if let Some(r) = s.reset.and_then(|e| format_local(e, WEEKLY_RESET_FMT)) {
+            push_fmt(out, format_args!(" {DIM}@{r}{RESET}"));
         }
     }
 }
@@ -663,6 +706,50 @@ mod tests {
         let s = format_segment(&input, Some(&usage));
         assert!(s.contains("Fable"));
         assert!(s.contains("6%"));
+    }
+
+    #[test]
+    fn scoped_limit_groups_into_7d_when_displayed_reset_matches() {
+        // API branch: the scoped reset differs from 7d's by a second of
+        // reporting jitter (observed live: 20:59:59 vs 21:00:00.47) ->
+        // same window -> folded into the 7d segment with a single shared
+        // `@` (`7d 9%; Fable 6% @...`).
+        let usage = json!({
+            "five_hour": { "utilization": 31.0 },
+            "seven_day": { "utilization": 9.0,
+                           "resets_at": "2026-07-15T21:00:00.473026+00:00" },
+            "limits": [
+                { "kind": "weekly_scoped", "percent": 6,
+                  "resets_at": "2026-07-15T20:59:59+00:00",
+                  "scope": { "model": { "display_name": "Fable" } } }
+            ]
+        })
+        .to_string();
+        let s = format_segment(&json!({}), Some(&usage));
+        assert!(s.contains("Fable"));
+        assert!(s.contains(';')); // grouped, not a standalone segment
+        assert_eq!(s.matches('@').count(), 1); // one shared weekly reset
+
+        // Builtin branch: stdin epoch matches the scoped ISO reset (same
+        // second) -> grouped there too. 5h contributes the second `@`.
+        let input = json!({
+            "rate_limits": {
+                "five_hour": { "used_percentage": 31.0, "resets_at": 1_700_000_000 },
+                "seven_day": { "used_percentage": 9.0, "resets_at": 1_784_149_200 }
+            }
+        });
+        let usage = json!({
+            "limits": [
+                { "kind": "weekly_scoped", "percent": 6,
+                  "resets_at": "2026-07-15T21:00:00.473515+00:00",
+                  "scope": { "model": { "display_name": "Fable" } } }
+            ]
+        })
+        .to_string();
+        let s = format_segment(&input, Some(&usage));
+        assert!(s.contains("Fable"));
+        assert!(s.contains(';'));
+        assert_eq!(s.matches('@').count(), 2); // 5h + the shared weekly
     }
 
     #[test]
