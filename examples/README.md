@@ -121,7 +121,7 @@ handler stamps each Claude surface's **tab title** with the same label the
 tmux window flag uses:
 
 ```json
-{ "ghostty": { "title": true, "progress": true },
+{ "ghostty": { "title": true, "progress": true, "notify": true },
   "windowFlag": { "format": "{claude} {dir} {git}" } }
 ```
 
@@ -136,6 +136,13 @@ tmux window flag uses:
   and a **red bar** when Claude is blocked on you (permission prompt /
   suspended). Ghostty auto-clears the bar ~15 s after updates stop, so a
   killed handler leaves clean surfaces.
+- `notify` raises a **desktop notification** when a session settles (turn
+  finished, background tasks drained) — the `⚑` moment as a banner. Ghostty
+  only banners a surface while it's **unfocused** and clicking the banner
+  focuses its tab, so watching a turn finish never pings you. One banner per
+  completion (never re-fired by the tick), and completions that predate the
+  handler stay quiet. Requires Ghostty's `desktop-notifications` (default
+  on) and macOS notification permission for Ghostty.
 - Titles in Ghostty are last-writer-wins (Claude Code and shell prompts also
   set them), so the handler re-asserts the title every ~3 s; expect the other
   writers' titles to flash through briefly on prompt redraws.

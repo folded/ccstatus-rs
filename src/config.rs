@@ -635,7 +635,7 @@ impl WindowFlag {
 /// config block:
 ///
 /// ```json
-/// { "ghostty": { "title": true, "progress": true } }
+/// { "ghostty": { "title": true, "progress": true, "notify": true } }
 /// ```
 ///
 /// Presence of the block enables it; set `"enabled": false` to keep it
@@ -644,7 +644,9 @@ impl WindowFlag {
 /// markers come from the `windowFlag` block (whose own `enabled` gates only
 /// the *tmux* window naming, not this). `progress` drives Ghostty's native
 /// progress bar (OSC 9;4, Ghostty >= 1.2): a cache-warmth countdown while
-/// idle, a pulse while working, red when blocked on you.
+/// idle, a pulse while working, red when blocked on you. `notify` raises a
+/// desktop notification (OSC 777) when a session settles — Ghostty banners
+/// it only while the surface is unfocused, so it's quiet while you watch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ghostty {
     pub enabled: bool,
@@ -652,6 +654,8 @@ pub struct Ghostty {
     pub title: bool,
     /// Drive the native progress bar via OSC 9;4.
     pub progress: bool,
+    /// Raise a desktop notification on unattended completion via OSC 777.
+    pub notify: bool,
 }
 
 impl Default for Ghostty {
@@ -660,6 +664,7 @@ impl Default for Ghostty {
             enabled: false,
             title: true,
             progress: true,
+            notify: true,
         }
     }
 }
@@ -683,13 +688,14 @@ impl Ghostty {
             enabled: b("enabled", true),
             title: b("title", d.title),
             progress: b("progress", d.progress),
+            notify: b("notify", d.notify),
         }
     }
 
     /// Whether the registrar should register ghostty surfaces (and spawn the
     /// handler) at all — false when disabled or no feature is on.
     pub fn active(&self) -> bool {
-        self.enabled && (self.title || self.progress)
+        self.enabled && (self.title || self.progress || self.notify)
     }
 }
 
@@ -739,6 +745,7 @@ mod tests {
         assert!(g.enabled);
         assert!(g.title);
         assert!(g.progress);
+        assert!(g.notify);
         assert!(g.active());
     }
 
@@ -746,12 +753,12 @@ mod tests {
     fn ghostty_enabled_false_or_no_features_is_inactive() {
         let v = cfg(r#"{ "ghostty": { "enabled": false } }"#);
         assert!(!Ghostty::from_value(Some(&v)).active());
-        let v = cfg(r#"{ "ghostty": { "title": false, "progress": false } }"#);
+        let v = cfg(r#"{ "ghostty": { "title": false, "progress": false, "notify": false } }"#);
         let g = Ghostty::from_value(Some(&v));
         assert!(g.enabled); // opted in, but nothing to do
         assert!(!g.active());
         // One feature alone keeps it active.
-        let v = cfg(r#"{ "ghostty": { "title": false } }"#);
+        let v = cfg(r#"{ "ghostty": { "title": false, "progress": false } }"#);
         assert!(Ghostty::from_value(Some(&v)).active());
     }
 

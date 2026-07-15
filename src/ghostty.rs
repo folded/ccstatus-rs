@@ -67,6 +67,11 @@ pub trait GhosttySurface {
     /// iTerm2-style OSC 9 *notification*, so an ungated write would raise
     /// desktop banners instead of a bar.
     fn set_progress(&self, tty: &str, p: Progress);
+    /// OSC 777 — raise a desktop notification for this surface. Ghostty only
+    /// banners it while the surface is *unfocused* (clicking focuses the
+    /// tab), which is exactly the "finished while you weren't looking"
+    /// semantics — no view tracking needed on our side.
+    fn notify(&self, tty: &str, title: &str, body: &str);
 }
 
 /// Production adapter: opens the pty and writes escape bytes.
@@ -84,6 +89,19 @@ impl GhosttySurface for CliGhostty {
     fn set_progress(&self, tty: &str, p: Progress) {
         write_tty(tty, &osc_progress(p));
     }
+
+    fn notify(&self, tty: &str, title: &str, body: &str) {
+        write_tty(tty, &osc777(title, body));
+    }
+}
+
+/// The rxvt notification sequence: `ESC ] 777 ; notify ; title ; body BEL`.
+/// The title must not carry `;` (it would bleed into the body slot); the
+/// body is the final field, so its semicolons are safe. Both are stripped
+/// of control characters like titles are.
+fn osc777(title: &str, body: &str) -> Vec<u8> {
+    let title: String = sanitize_title(title).replace(';', ",");
+    format!("\x1b]777;notify;{};{}\x07", title, sanitize_title(body)).into_bytes()
 }
 
 /// The ConEmu progress sequence for a state: `ESC ] 9 ; 4 ; s [; v] BEL`.
@@ -145,6 +163,7 @@ pub enum SurfaceWrite {
     SetTitle(String, String),
     ClearTitle(String),
     SetProgress(String, Progress),
+    Notify(String, String, String),
 }
 
 /// Test adapter: records writes.
@@ -181,6 +200,14 @@ impl GhosttySurface for FakeGhostty {
             .borrow_mut()
             .push(SurfaceWrite::SetProgress(tty.to_string(), p));
     }
+
+    fn notify(&self, tty: &str, title: &str, body: &str) {
+        self.writes.borrow_mut().push(SurfaceWrite::Notify(
+            tty.to_string(),
+            title.to_string(),
+            body.to_string(),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +230,25 @@ mod tests {
         assert_eq!(osc_progress(Progress::NeedsInput), b"\x1b]9;4;2;100\x07");
         assert_eq!(osc_progress(Progress::Working), b"\x1b]9;4;3\x07");
         assert_eq!(osc_progress(Progress::Clear), b"\x1b]9;4;0\x07");
+    }
+
+    #[test]
+    fn osc777_encodes_and_keeps_title_single_field() {
+        assert_eq!(
+            osc777("Claude finished", "⚑ repo ⚠"),
+            "\x1b]777;notify;Claude finished;⚑ repo ⚠\x07".as_bytes()
+        );
+        // A ';' in the title would bleed into the body slot — mapped to ','.
+        // The body is the final field, so its ';' passes through.
+        assert_eq!(
+            osc777("a;b", "c;d"),
+            "\x1b]777;notify;a,b;c;d\x07".as_bytes()
+        );
+        // Control characters stripped from both fields.
+        assert_eq!(
+            osc777("t\x07t", "b\x1bb"),
+            "\x1b]777;notify;tt;bb\x07".as_bytes()
+        );
     }
 
     #[test]

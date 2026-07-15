@@ -23,7 +23,7 @@
 //! before anything is written — writing escape bytes into a stranger's
 //! terminal is the one unforgivable failure mode.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -80,6 +80,7 @@ pub fn run() -> ExitCode {
         config_mtime: config::mtime(),
         ttys: HashSet::new(),
         stamped: HashSet::new(),
+        notified: HashMap::new(),
         last_activity: Instant::now(),
         surface: Box::new(ghostty::CliGhostty),
         log,
@@ -99,6 +100,10 @@ struct GhosttyHandler {
     /// Ttys we currently hold a title on, for restore (clear on prune,
     /// on config-off, and on shutdown).
     stamped: HashSet<String>,
+    /// Per-tty notification latch: the `last_turn_ts` we last notified for
+    /// (or saw at first sight — completions predating the handler don't
+    /// banner on spawn). One banner per settled completion, not per tick.
+    notified: HashMap<String, i64>,
     last_activity: Instant,
     surface: Box<dyn GhosttySurface>,
     log: DaemonLog,
@@ -200,6 +205,7 @@ impl GhosttyHandler {
                 self.surface.set_progress(&tty, ghostty::Progress::Clear);
             }
             self.ttys.remove(&tty);
+            self.notified.remove(&tty);
             self.last_activity = Instant::now();
         }
 
@@ -238,6 +244,22 @@ impl GhosttyHandler {
             if self.cfg.progress && progress_supported(&sess) {
                 self.surface
                     .set_progress(&tty, progress_for(flags.activity, &sess, now));
+            }
+
+            // Ghostty suppresses the banner while the surface is focused, so
+            // watching a turn finish never pings; unfocused tabs banner once,
+            // and clicking the banner focuses them.
+            let (banner, latch) = notify_action(
+                self.notified.get(&tty).copied(),
+                self.cfg.notify,
+                flags.attention,
+                sess.last_turn_ts.unwrap_or(0),
+            );
+            if banner {
+                self.surface.notify(&tty, "Claude finished", &flags.name);
+            }
+            if let Some(l) = latch {
+                self.notified.insert(tty.clone(), l);
             }
             self.stamped.insert(tty);
         }
@@ -279,6 +301,26 @@ fn progress_for(
             Some(pct) if pct > 0 => ghostty::Progress::Remaining(pct),
             _ => ghostty::Progress::Clear,
         },
+    }
+}
+
+/// Pure notification latch: `(banner now?, new latch value)`. `seen` is the
+/// turn timestamp we last notified for (`None` = first sight of this
+/// surface). First sight seeds quietly — completions predating the handler
+/// (or a handler restart) must not banner on spawn. After that, one banner
+/// per settled-unviewed completion (`attention` with a turn newer than the
+/// latch), and the latch follows it whether or not `notify` is on, so
+/// toggling the feature never releases a burst of stale banners.
+fn notify_action(
+    seen: Option<i64>,
+    notify_on: bool,
+    attention: bool,
+    turn: i64,
+) -> (bool, Option<i64>) {
+    match seen {
+        None => (false, Some(turn)),
+        Some(s) if attention && turn != s => (notify_on, Some(turn)),
+        _ => (false, None),
     }
 }
 
@@ -369,6 +411,7 @@ mod tests {
             config_mtime: None,
             ttys: HashSet::new(),
             stamped: HashSet::new(),
+            notified: HashMap::new(),
             last_activity: Instant::now(),
             surface: Box::new(FakeGhostty::new()),
             // Parent dir never exists in tests, so writes no-op silently.
@@ -447,6 +490,24 @@ mod tests {
         assert_eq!(
             progress_for(Waiting, &sess(Some(now - 1620), Some(3600)), now),
             Progress::Remaining(50)
+        );
+    }
+
+    #[test]
+    fn notify_latch_banners_once_per_new_completion() {
+        // First sight: seed quietly, even if attention is up.
+        assert_eq!(notify_action(None, true, true, 100), (false, Some(100)));
+        // A new settled completion banners once...
+        assert_eq!(notify_action(Some(100), true, true, 200), (true, Some(200)));
+        // ...and later ticks of the same completion stay quiet.
+        assert_eq!(notify_action(Some(200), true, true, 200), (false, None));
+        // Not settled-unviewed -> quiet, latch unchanged.
+        assert_eq!(notify_action(Some(100), true, false, 200), (false, None));
+        // Feature off: latch still follows the completion (no burst when
+        // notify is later re-enabled), but no banner.
+        assert_eq!(
+            notify_action(Some(100), false, true, 200),
+            (false, Some(200))
         );
     }
 

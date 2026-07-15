@@ -9,10 +9,12 @@ use crate::config::WindowFlag;
 use crate::fleet;
 use crate::state::SessionState;
 
-/// A pane's derived flag state: what it's doing and the rendered window
-/// label (which already folds the attention flag into its `{claude}` glyph).
+/// A pane's derived flag state: what it's doing, whether it settled unviewed
+/// (the label's `{claude}` glyph already folds this in as `⚑`; the ghostty
+/// handler also latches a notification on it), and the rendered window label.
 pub struct PaneFlags {
     pub activity: fleet::Activity,
+    pub attention: bool,
     pub name: String,
 }
 
@@ -38,7 +40,11 @@ pub fn compute(
     let attention = fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
     let git = sess.cwd.as_deref().and_then(crate::git::status);
     let name = flag.render(activity, attention, git.as_ref(), sess.cwd.as_deref());
-    PaneFlags { activity, name }
+    PaneFlags {
+        activity,
+        attention,
+        name,
+    }
 }
 
 /// The rendered window label alone (the tmux handler's need).
