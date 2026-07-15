@@ -261,8 +261,10 @@ fn effective_builtin(input: &Value) -> bool {
 /// per-model quotas that have no key of their own (e.g. Fable's weekly
 /// limit, `kind: "weekly_scoped"` with `scope.model.display_name: "Fable"`).
 /// Unscoped entries (`session`, `weekly_all`) duplicate the 5h/7d segments
-/// and are skipped. Rendered as `<Model> <pct>%`; the reset time is the
-/// shared weekly reset already shown on `7d`.
+/// and are skipped. Rendered as `<Model> <pct>% @<reset>`, the reset in the
+/// weekly (`7d`) format — a scoped window carries its own `resets_at`, and
+/// assuming it matches the account-wide weekly reset would bake in an API
+/// coincidence.
 fn render_scoped_limits(data: &str, sep: &str, out: &mut String) {
     let v: Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -289,6 +291,14 @@ fn render_scoped_limits(data: &str, sep: &str, out: &mut String) {
         let c = usage_color(pct);
         out.push_str(sep);
         push_fmt(out, format_args!("{WHITE}{label}{RESET} {c}{pct}%{RESET}"));
+        if let Some(reset) = entry
+            .get("resets_at")
+            .and_then(|x| x.as_str())
+            .and_then(iso_to_epoch)
+            .and_then(|e| format_local(e, "%a %b %-d, %H:%M"))
+        {
+            push_fmt(out, format_args!(" {DIM}@{reset}{RESET}"));
+        }
     }
 }
 
@@ -628,6 +638,7 @@ mod tests {
                 { "kind": "session", "group": "session", "percent": 31, "scope": null },
                 { "kind": "weekly_all", "group": "weekly", "percent": 9, "scope": null },
                 { "kind": "weekly_scoped", "group": "weekly", "percent": 6,
+                  "resets_at": "2026-07-15T21:00:00.473515+00:00",
                   "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null } }
             ]
         })
@@ -636,6 +647,9 @@ mod tests {
         let s = format_segment(&json!({}), Some(&usage));
         assert!(s.contains("Fable"));
         assert!(s.contains("6%"));
+        // The scoped window's own reset time renders (the only resets_at in
+        // this payload — fractional-seconds ISO form from the live endpoint).
+        assert!(s.contains('@'));
         // Unscoped entries don't render twice: exactly one 9% (the 7d).
         assert_eq!(s.matches("9%").count(), 1);
 
