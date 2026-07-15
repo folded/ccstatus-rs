@@ -426,11 +426,20 @@ fn valid_tty(tty: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
 }
 
-/// Raise the terminal window hosting `tty`, best-effort. Ghostty's own
-/// AppleScript surface (1.3+) isn't wired yet; the shared tty-keyed raise
-/// covers emulators that expose one today.
+/// Focus the Ghostty tab hosting `tty`, best-effort: Ghostty's scripting
+/// `focus` command selects the exact tab and raises its window, matched by
+/// the session's working directory (the API exposes no tty). Falls back to
+/// the shared tty-keyed window raise (iTerm2/Terminal) if scripting fails.
 #[cfg(target_os = "macos")]
 fn focus_surface(tty: &str) {
+    let cwd = state::read_pane(ghostty::SERVER_ID, tty)
+        .and_then(|p| state::read_session(&p.session_id))
+        .and_then(|s| s.cwd);
+    if let Some(cwd) = cwd
+        && ghostty::focus_tab_by_cwd(&cwd)
+    {
+        return;
+    }
     let _ = crate::window::focus_tty(tty);
 }
 

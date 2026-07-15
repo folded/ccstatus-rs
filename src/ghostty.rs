@@ -192,6 +192,47 @@ fn focused_terminal_cwd() -> Result<Option<String>, Denied> {
     Ok(Some(cwd))
 }
 
+/// Focus the Ghostty terminal working in `cwd`, bringing its window forward
+/// (the `focus` scripting command, Ghostty >= 1.3). Matching is by working
+/// directory — the scripting API exposes no tty — so with several terminals
+/// in the same directory the first match wins. Uses the same Automation
+/// permission as the focus probe; `false` on denial or no match.
+#[cfg(target_os = "macos")]
+pub fn focus_tab_by_cwd(cwd: &str) -> bool {
+    let Some(cwd) = applescript_string(cwd.trim_end_matches('/')) else {
+        return false;
+    };
+    let script = format!(
+        r#"tell application id "com.mitchellh.ghostty"
+  repeat with t in terminals
+    if working directory of t is "{cwd}" then
+      focus t
+      activate
+      return "1"
+    end if
+  end repeat
+end tell
+return "0""#
+    );
+    let Ok(out) = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
+}
+
+/// Escape a string for splicing into an AppleScript literal. `None` for
+/// strings with control characters — safer dropped than quoted.
+#[cfg(target_os = "macos")]
+fn applescript_string(s: &str) -> Option<String> {
+    if s.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// The rxvt notification sequence: `ESC ] 777 ; notify ; title ; body BEL`.
 /// The title must not carry `;` (it would bleed into the body slot); the
 /// body is the final field, so its semicolons are safe. Both are stripped
@@ -327,6 +368,17 @@ mod tests {
         assert_eq!(osc_progress(Progress::NeedsInput), b"\x1b]9;4;2;100\x07");
         assert_eq!(osc_progress(Progress::Working), b"\x1b]9;4;3\x07");
         assert_eq!(osc_progress(Progress::Clear), b"\x1b]9;4;0\x07");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn applescript_string_escapes_or_rejects() {
+        assert_eq!(applescript_string("/a/b"), Some("/a/b".into()));
+        assert_eq!(
+            applescript_string(r#"/a/"quoted"\dir"#),
+            Some(r#"/a/\"quoted\"\\dir"#.into())
+        );
+        assert_eq!(applescript_string("/a\n/b"), None); // control chars: drop
     }
 
     #[test]
