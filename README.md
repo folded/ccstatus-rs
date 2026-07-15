@@ -117,7 +117,9 @@ For Claude sessions running directly in [Ghostty](https://ghostty.org),
 an opt-in `ghostty` config block stamps each session's **tab title** with the
 same activity/git label the tmux window flag uses (`◐ ccstatus-rs ↑`,
 `⚑ repo` for a session that finished while you weren't looking) — the
-across-tab "which one needs me?" cue without tmux. See
+across-tab "which one needs me?" cue without tmux — and drives Ghostty's
+**native progress bar** (≥ 1.2) as a live indicator: a cache-warmth
+countdown while idle, a pulse while working, red when blocked on you. See
 [`examples/README.md`](examples/README.md#ghostty-activity-in-the-tab-title-no-tmux).
 
 ## Build from source

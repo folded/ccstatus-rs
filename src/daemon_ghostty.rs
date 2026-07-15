@@ -161,6 +161,9 @@ impl GhosttyHandler {
             self.config_mtime = m;
             self.cfg = config::Ghostty::load();
             self.flag = config::WindowFlag::load();
+            // A feature may have just been turned off; clear both channels
+            // once and let the next tick re-stamp whatever is still enabled.
+            self.restore_all();
             self.log.write("config reloaded");
         }
     }
@@ -194,6 +197,7 @@ impl GhosttyHandler {
             self.log.write(&format!("surface gone: {tty}"));
             if self.stamped.remove(&tty) {
                 self.surface.clear_title(&tty);
+                self.surface.set_progress(&tty, ghostty::Progress::Clear);
             }
             self.ttys.remove(&tty);
             self.last_activity = Instant::now();
@@ -218,26 +222,76 @@ impl GhosttyHandler {
                 continue;
             };
             let sess = state::read_session(&ps.session_id).unwrap_or_default();
-            let name = crate::flags::window_name(
+            let flags = crate::flags::compute(
                 &self.flag,
                 &sess,
                 susp.contains(&ps.claude_pid),
                 bg.contains(&ps.claude_pid),
                 now,
             );
-            // Re-assert unconditionally: other writers (Claude Code, shell
-            // prompts) clobber the title between ticks.
-            self.surface.set_title(&tty, &name);
+            // Re-assert unconditionally every tick: titles are last-writer-
+            // wins against Claude Code and shell prompts, and OSC 9;4 bars
+            // auto-expire after ~15s (the re-emission is the heartbeat).
+            if self.cfg.title {
+                self.surface.set_title(&tty, &flags.name);
+            }
+            if self.cfg.progress && progress_supported(&sess) {
+                self.surface
+                    .set_progress(&tty, progress_for(flags.activity, &sess, now));
+            }
             self.stamped.insert(tty);
         }
     }
 
-    /// Clear every title we hold and forget them (config-off or shutdown).
+    /// Clear every surface we hold (both channels) and forget them
+    /// (config-off, reload, or shutdown).
     fn restore_all(&mut self) {
         for tty in self.stamped.drain() {
             self.surface.clear_title(&tty);
+            self.surface.set_progress(&tty, ghostty::Progress::Clear);
         }
     }
+}
+
+/// Whether this session's recorded Ghostty version supports OSC 9;4. An
+/// unrecorded version reads as unsupported: pre-1.2 Ghostty parses the
+/// sequence as a desktop notification, so the wrong "yes" is loud.
+fn progress_supported(sess: &state::SessionState) -> bool {
+    sess.term_program_version
+        .as_deref()
+        .is_some_and(ghostty::supports_progress)
+}
+
+/// Map a surface's activity onto the progress bar: red when blocked on the
+/// user, pulsing while a turn or background task runs, and a cache-warmth
+/// countdown while settled — draining over the same 90%-of-TTL window the
+/// warm/cold flip uses, so bar-present == "warm". Gone once cold.
+fn progress_for(
+    activity: crate::fleet::Activity,
+    sess: &state::SessionState,
+    now: i64,
+) -> ghostty::Progress {
+    use crate::fleet::Activity::*;
+    match activity {
+        NeedsInput | Suspended => ghostty::Progress::NeedsInput,
+        Working | BgRunning => ghostty::Progress::Working,
+        Waiting | Idle | Unknown => match cache_remaining_pct(sess, now) {
+            Some(pct) if pct > 0 => ghostty::Progress::Remaining(pct),
+            _ => ghostty::Progress::Clear,
+        },
+    }
+}
+
+/// Percent of the warm window left (100 right after a turn, 0 at the
+/// warm->cold flip), or `None` with no recorded turn.
+fn cache_remaining_pct(sess: &state::SessionState, now: i64) -> Option<u8> {
+    let ts = sess.last_turn_ts?;
+    let idle = (now - ts).max(0);
+    let window = crate::render_tmux::warm_threshold_secs(sess.cache_ttl_secs);
+    if window <= 0 || idle >= window {
+        return Some(0);
+    }
+    Some(((window - idle) * 100 / window) as u8)
 }
 
 /// Whether the pane state behind `tty` names a Claude pid that is alive in
@@ -341,5 +395,68 @@ mod tests {
         assert!(h.stamped.is_empty()); // cleared and forgotten
         // (The write itself lands on the boxed surface; ordering is a
         // single-element set, so emptiness is the observable contract.)
+    }
+
+    #[test]
+    fn progress_maps_activity_and_warmth() {
+        use crate::fleet::Activity::*;
+        use crate::ghostty::Progress;
+        let now = 10_000;
+        let sess = |turn: Option<i64>, ttl: Option<i64>| state::SessionState {
+            last_turn_ts: turn,
+            cache_ttl_secs: ttl,
+            ..Default::default()
+        };
+        // Blocked on the user -> red, regardless of warmth.
+        assert_eq!(
+            progress_for(NeedsInput, &sess(Some(now), None), now),
+            Progress::NeedsInput
+        );
+        assert_eq!(
+            progress_for(Suspended, &sess(Some(now), None), now),
+            Progress::NeedsInput
+        );
+        // Running -> pulse.
+        assert_eq!(
+            progress_for(Working, &sess(None, None), now),
+            Progress::Working
+        );
+        assert_eq!(
+            progress_for(BgRunning, &sess(Some(now), None), now),
+            Progress::Working
+        );
+        // Settled: countdown over the warm window (default TTL 300 -> 270s).
+        assert_eq!(
+            progress_for(Waiting, &sess(Some(now), None), now),
+            Progress::Remaining(100)
+        );
+        assert_eq!(
+            progress_for(Waiting, &sess(Some(now - 135), None), now),
+            Progress::Remaining(50)
+        );
+        // Past the flip -> bar gone. No turn at all -> bar gone.
+        assert_eq!(
+            progress_for(Idle, &sess(Some(now - 300), None), now),
+            Progress::Clear
+        );
+        assert_eq!(
+            progress_for(Unknown, &sess(None, None), now),
+            Progress::Clear
+        );
+        // 1h cache: half the 3240s window left.
+        assert_eq!(
+            progress_for(Waiting, &sess(Some(now - 1620), Some(3600)), now),
+            Progress::Remaining(50)
+        );
+    }
+
+    #[test]
+    fn progress_supported_requires_recorded_1_2() {
+        let mut s = state::SessionState::default();
+        assert!(!progress_supported(&s)); // unrecorded -> no
+        s.term_program_version = Some("1.1.3".into());
+        assert!(!progress_supported(&s));
+        s.term_program_version = Some("1.3.1".into());
+        assert!(progress_supported(&s));
     }
 }

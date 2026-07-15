@@ -635,19 +635,23 @@ impl WindowFlag {
 /// config block:
 ///
 /// ```json
-/// { "ghostty": { "title": true } }
+/// { "ghostty": { "title": true, "progress": true } }
 /// ```
 ///
 /// Presence of the block enables it; set `"enabled": false` to keep it
 /// configured but dormant. `title` stamps each Claude surface's tab title
 /// (OSC 2) with the same label the tmux window flag uses — the template and
 /// markers come from the `windowFlag` block (whose own `enabled` gates only
-/// the *tmux* window naming, not this).
+/// the *tmux* window naming, not this). `progress` drives Ghostty's native
+/// progress bar (OSC 9;4, Ghostty >= 1.2): a cache-warmth countdown while
+/// idle, a pulse while working, red when blocked on you.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ghostty {
     pub enabled: bool,
     /// Stamp tab titles via OSC 2.
     pub title: bool,
+    /// Drive the native progress bar via OSC 9;4.
+    pub progress: bool,
 }
 
 impl Default for Ghostty {
@@ -655,6 +659,7 @@ impl Default for Ghostty {
         Ghostty {
             enabled: false,
             title: true,
+            progress: true,
         }
     }
 }
@@ -670,23 +675,21 @@ impl Ghostty {
             return Ghostty::default();
         };
         let d = Ghostty::default();
+        let b = |key: &str, default: bool| -> bool {
+            block.get(key).and_then(|x| x.as_bool()).unwrap_or(default)
+        };
         Ghostty {
             // Presence of the block opts in; `"enabled": false` disables.
-            enabled: block
-                .get("enabled")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(true),
-            title: block
-                .get("title")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(d.title),
+            enabled: b("enabled", true),
+            title: b("title", d.title),
+            progress: b("progress", d.progress),
         }
     }
 
     /// Whether the registrar should register ghostty surfaces (and spawn the
     /// handler) at all — false when disabled or no feature is on.
     pub fn active(&self) -> bool {
-        self.enabled && self.title
+        self.enabled && (self.title || self.progress)
     }
 }
 
@@ -730,11 +733,12 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_present_opts_in_with_title_on() {
+    fn ghostty_present_opts_in_with_features_on() {
         let v = cfg(r#"{ "ghostty": {} }"#);
         let g = Ghostty::from_value(Some(&v));
         assert!(g.enabled);
         assert!(g.title);
+        assert!(g.progress);
         assert!(g.active());
     }
 
@@ -742,10 +746,13 @@ mod tests {
     fn ghostty_enabled_false_or_no_features_is_inactive() {
         let v = cfg(r#"{ "ghostty": { "enabled": false } }"#);
         assert!(!Ghostty::from_value(Some(&v)).active());
-        let v = cfg(r#"{ "ghostty": { "title": false } }"#);
+        let v = cfg(r#"{ "ghostty": { "title": false, "progress": false } }"#);
         let g = Ghostty::from_value(Some(&v));
         assert!(g.enabled); // opted in, but nothing to do
         assert!(!g.active());
+        // One feature alone keeps it active.
+        let v = cfg(r#"{ "ghostty": { "title": false } }"#);
+        assert!(Ghostty::from_value(Some(&v)).active());
     }
 
     #[test]

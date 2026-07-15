@@ -311,6 +311,10 @@ fn write_session_presence(input: &Value) {
         .ok()
         .filter(|v| !v.is_empty())
         .or(s.term_program);
+    s.term_program_version = env::var("TERM_PROGRAM_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or(s.term_program_version);
     s.iterm_session_id = env::var("ITERM_SESSION_ID")
         .ok()
         .filter(|v| !v.is_empty())

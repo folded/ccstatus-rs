@@ -121,13 +121,21 @@ handler stamps each Claude surface's **tab title** with the same label the
 tmux window flag uses:
 
 ```json
-{ "ghostty": { "title": true },
+{ "ghostty": { "title": true, "progress": true },
   "windowFlag": { "format": "{claude} {dir} {git}" } }
 ```
 
 - **Presence of the block opts in** (set `"enabled": false` to disable). The
   label's template and glyphs come from the `windowFlag` block above — only
   `windowFlag.enabled` is ignored here (that gates tmux window naming).
+- `progress` (Ghostty ≥ 1.2) drives Ghostty's **native progress bar** — the
+  thin bar at the top of the surface — as a live session indicator: a
+  **cache-warmth countdown** while the session waits (full right after a
+  turn, draining to empty exactly when the warmth indicator would flip
+  cold), an **indeterminate pulse** while a turn or background task runs,
+  and a **red bar** when Claude is blocked on you (permission prompt /
+  suspended). Ghostty auto-clears the bar ~15 s after updates stop, so a
+  killed handler leaves clean surfaces.
 - Titles in Ghostty are last-writer-wins (Claude Code and shell prompts also
   set them), so the handler re-asserts the title every ~3 s; expect the other
   writers' titles to flash through briefly on prompt redraws.

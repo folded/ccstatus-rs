@@ -34,6 +34,24 @@ pub fn surface_tty(claude_pid: u32) -> Option<String> {
     crate::util::pid_tty_path(claude_pid)
 }
 
+/// What the native progress bar (OSC 9;4, Ghostty >= 1.2) shows for a
+/// surface. Ghostty renders it as a thin bar at the top of the split and
+/// auto-clears it after ~15s without updates, so the handler's 3s
+/// re-emission doubles as a liveness heartbeat: a dead handler leaves a
+/// clean surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Normal bar at `pct`: the cache-warmth countdown, draining over the
+    /// warm window so bar-present == the warmth segment reading "warm".
+    Remaining(u8),
+    /// Error (red) bar, full: blocked on the user (needs input / suspended).
+    NeedsInput,
+    /// Indeterminate pulse: a turn (or background task) is running.
+    Working,
+    /// Remove the bar (cold, or restore).
+    Clear,
+}
+
 /// Escape-sequence actuation onto one Ghostty surface (its pty). Writes are
 /// best-effort and non-blocking; callers guard liveness (a pty path can be
 /// recycled by an unrelated process — see the handler's prune).
@@ -44,6 +62,11 @@ pub trait GhosttySurface {
     /// OSC 2 with an empty payload — hand the title back to Ghostty's own
     /// logic (config/shell integration), the `automatic-rename on` analogue.
     fn clear_title(&self, tty: &str);
+    /// OSC 9;4 — drive the native progress bar. Callers gate on
+    /// [`supports_progress`]: pre-1.2 Ghostty parses `9;4;…` as an
+    /// iTerm2-style OSC 9 *notification*, so an ungated write would raise
+    /// desktop banners instead of a bar.
+    fn set_progress(&self, tty: &str, p: Progress);
 }
 
 /// Production adapter: opens the pty and writes escape bytes.
@@ -57,6 +80,34 @@ impl GhosttySurface for CliGhostty {
     fn clear_title(&self, tty: &str) {
         write_tty(tty, &osc2(""));
     }
+
+    fn set_progress(&self, tty: &str, p: Progress) {
+        write_tty(tty, &osc_progress(p));
+    }
+}
+
+/// The ConEmu progress sequence for a state: `ESC ] 9 ; 4 ; s [; v] BEL`.
+fn osc_progress(p: Progress) -> Vec<u8> {
+    match p {
+        Progress::Remaining(pct) => format!("\x1b]9;4;1;{}\x07", pct.min(100)),
+        Progress::NeedsInput => "\x1b]9;4;2;100\x07".to_string(),
+        Progress::Working => "\x1b]9;4;3\x07".to_string(),
+        Progress::Clear => "\x1b]9;4;0\x07".to_string(),
+    }
+    .into_bytes()
+}
+
+/// Whether a `TERM_PROGRAM_VERSION` supports OSC 9;4 (Ghostty >= 1.2).
+/// Unparseable versions read as unsupported — the failure mode of a wrong
+/// "yes" is spurious desktop notifications.
+pub fn supports_progress(version: &str) -> bool {
+    let mut it = version.split('.');
+    let major: u32 = match it.next().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => return false,
+    };
+    let minor: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major, minor) >= (1, 2)
 }
 
 /// The OSC 2 set-title sequence, BEL-terminated. The title is sanitized so a
@@ -93,6 +144,7 @@ fn write_tty(tty: &str, bytes: &[u8]) {
 pub enum SurfaceWrite {
     SetTitle(String, String),
     ClearTitle(String),
+    SetProgress(String, Progress),
 }
 
 /// Test adapter: records writes.
@@ -123,6 +175,12 @@ impl GhosttySurface for FakeGhostty {
             .borrow_mut()
             .push(SurfaceWrite::ClearTitle(tty.to_string()));
     }
+
+    fn set_progress(&self, tty: &str, p: Progress) {
+        self.writes
+            .borrow_mut()
+            .push(SurfaceWrite::SetProgress(tty.to_string(), p));
+    }
 }
 
 #[cfg(test)]
@@ -133,6 +191,30 @@ mod tests {
     fn osc2_wraps_title_in_the_sequence() {
         assert_eq!(osc2("⚑ repo ⚠"), "\x1b]2;⚑ repo ⚠\x07".as_bytes());
         assert_eq!(osc2(""), b"\x1b]2;\x07");
+    }
+
+    #[test]
+    fn osc_progress_encodes_each_state() {
+        assert_eq!(osc_progress(Progress::Remaining(73)), b"\x1b]9;4;1;73\x07");
+        assert_eq!(
+            osc_progress(Progress::Remaining(250)),
+            b"\x1b]9;4;1;100\x07"
+        ); // clamped
+        assert_eq!(osc_progress(Progress::NeedsInput), b"\x1b]9;4;2;100\x07");
+        assert_eq!(osc_progress(Progress::Working), b"\x1b]9;4;3\x07");
+        assert_eq!(osc_progress(Progress::Clear), b"\x1b]9;4;0\x07");
+    }
+
+    #[test]
+    fn supports_progress_gates_on_1_2() {
+        assert!(supports_progress("1.2.0"));
+        assert!(supports_progress("1.3.1"));
+        assert!(supports_progress("2.0"));
+        assert!(!supports_progress("1.1.3"));
+        assert!(!supports_progress("1.0.2"));
+        assert!(!supports_progress("0.9"));
+        assert!(!supports_progress(""));
+        assert!(!supports_progress("nightly"));
     }
 
     #[test]

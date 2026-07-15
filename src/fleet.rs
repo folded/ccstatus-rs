@@ -394,6 +394,7 @@ mod tests {
             cwd: None,
             claude_pid: Some(1234),
             term_program: None,
+            term_program_version: None,
             iterm_session_id: None,
             display: None,
         }
@@ -437,6 +438,7 @@ mod tests {
             cwd: None,
             claude_pid: pid,
             term_program: None,
+            term_program_version: None,
             iterm_session_id: None,
             display: None,
         }

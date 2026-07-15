@@ -9,18 +9,25 @@ use crate::config::WindowFlag;
 use crate::fleet;
 use crate::state::SessionState;
 
-/// Pure-ish (spawns `git` for the working-tree glyph): derive a pane's window
-/// label from its session state plus the two process-level signals the
+/// A pane's derived flag state: what it's doing and the rendered window
+/// label (which already folds the attention flag into its `{claude}` glyph).
+pub struct PaneFlags {
+    pub activity: fleet::Activity,
+    pub name: String,
+}
+
+/// Pure-ish (spawns `git` for the working-tree glyph): derive a pane's flag
+/// state from its session state plus the two process-level signals the
 /// timestamps can't carry (`suspended`, `bg_running` — from a `ps` snapshot).
-pub fn window_name(
+pub fn compute(
     flag: &WindowFlag,
     sess: &SessionState,
     suspended: bool,
     bg_running: bool,
     now: i64,
-) -> String {
+) -> PaneFlags {
     let idle_secs = sess.last_turn_ts.map(|t| (now - t).max(0));
-    let act = fleet::activity(
+    let activity = fleet::activity(
         sess.last_prompt_ts,
         sess.last_turn_ts,
         suspended,
@@ -28,9 +35,21 @@ pub fn window_name(
         bg_running,
         idle_secs,
     );
-    let attn = fleet::attention(act, sess.last_turn_ts, sess.last_view_ts);
+    let attention = fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
     let git = sess.cwd.as_deref().and_then(crate::git::status);
-    flag.render(act, attn, git.as_ref(), sess.cwd.as_deref())
+    let name = flag.render(activity, attention, git.as_ref(), sess.cwd.as_deref());
+    PaneFlags { activity, name }
+}
+
+/// The rendered window label alone (the tmux handler's need).
+pub fn window_name(
+    flag: &WindowFlag,
+    sess: &SessionState,
+    suspended: bool,
+    bg_running: bool,
+    now: i64,
+) -> String {
+    compute(flag, sess, suspended, bg_running, now).name
 }
 
 #[cfg(test)]
