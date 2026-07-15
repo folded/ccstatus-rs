@@ -167,6 +167,7 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
             }
         }
         if let Some(data) = usage_json {
+            render_scoped_limits(data, &sep, &mut out);
             render_extra_usage(data, &sep, &mut out);
         }
     } else if let Some(data) = usage_json {
@@ -211,6 +212,7 @@ fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
                 push_fmt(&mut out, format_args!(" {DIM}@{reset}{RESET}"));
             }
 
+            render_scoped_limits(data, &sep, &mut out);
             render_extra_usage(data, &sep, &mut out);
             return out;
         }
@@ -252,6 +254,41 @@ fn effective_builtin(input: &Value) -> bool {
             }
         };
         nonzero(p5) || nonzero(p7) || has_reset(r5) || has_reset(r7)
+    }
+}
+
+/// Render the model-scoped entries of the API's `limits` array — the
+/// per-model quotas that have no key of their own (e.g. Fable's weekly
+/// limit, `kind: "weekly_scoped"` with `scope.model.display_name: "Fable"`).
+/// Unscoped entries (`session`, `weekly_all`) duplicate the 5h/7d segments
+/// and are skipped. Rendered as `<Model> <pct>%`; the reset time is the
+/// shared weekly reset already shown on `7d`.
+fn render_scoped_limits(data: &str, sep: &str, out: &mut String) {
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(limits) = v.get("limits").and_then(|x| x.as_array()) else {
+        return;
+    };
+    for entry in limits {
+        let Some(label) = entry
+            .pointer("/scope/model/display_name")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(pct) = entry
+            .get("percent")
+            .and_then(|x| x.as_f64())
+            .map(|n| n.round() as i64)
+        else {
+            continue;
+        };
+        let c = usage_color(pct);
+        out.push_str(sep);
+        push_fmt(out, format_args!("{WHITE}{label}{RESET} {c}{pct}%{RESET}"));
     }
 }
 
@@ -330,10 +367,17 @@ fn write_builtin_cache(input: &Value, path: &Path, prior: Option<&str>) {
         .pointer("/rate_limits/seven_day/resets_at")
         .and_then(value_as_epoch);
 
-    let extra = prior
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .and_then(|v| v.get("extra_usage").cloned())
-        .unwrap_or(Value::Null);
+    // Carry the API-only sections through the normalisation: the builtin
+    // input has no equivalent of extra-usage or the scoped `limits` array,
+    // and dropping them here would blank those segments until the next
+    // real fetch.
+    let prior_v = prior.and_then(|s| serde_json::from_str::<Value>(s).ok());
+    let carry = |k: &str| {
+        prior_v
+            .as_ref()
+            .and_then(|v| v.get(k).cloned())
+            .unwrap_or(Value::Null)
+    };
 
     let v = serde_json::json!({
         "five_hour": {
@@ -344,7 +388,8 @@ fn write_builtin_cache(input: &Value, path: &Path, prior: Option<&str>) {
             "utilization": pct_7d,
             "resets_at": reset_7d.and_then(epoch_to_iso_utc),
         },
-        "extra_usage": extra,
+        "extra_usage": carry("extra_usage"),
+        "limits": carry("limits"),
     });
     let _ = cache::write_atomic(path, &v.to_string());
 }
@@ -570,6 +615,86 @@ mod tests {
     #[test]
     fn parse_summary_requires_five_hour() {
         assert!(parse_summary(&json!({ "error": "rate limited" })).is_none());
+    }
+
+    #[test]
+    fn scoped_limits_render_model_percent() {
+        // Shape from the live oauth/usage endpoint: unscoped entries mirror
+        // 5h/7d; the scoped one is Fable's own weekly quota.
+        let usage = json!({
+            "five_hour": { "utilization": 31.0 },
+            "seven_day": { "utilization": 9.0 },
+            "limits": [
+                { "kind": "session", "group": "session", "percent": 31, "scope": null },
+                { "kind": "weekly_all", "group": "weekly", "percent": 9, "scope": null },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 6,
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null } }
+            ]
+        })
+        .to_string();
+        // API branch (no builtin input).
+        let s = format_segment(&json!({}), Some(&usage));
+        assert!(s.contains("Fable"));
+        assert!(s.contains("6%"));
+        // Unscoped entries don't render twice: exactly one 9% (the 7d).
+        assert_eq!(s.matches("9%").count(), 1);
+
+        // Builtin branch renders it too.
+        let input = json!({
+            "rate_limits": {
+                "five_hour": { "used_percentage": 31.0, "resets_at": 1_700_000_000 },
+                "seven_day": { "used_percentage": 9.0, "resets_at": 1_700_500_000 }
+            }
+        });
+        let s = format_segment(&input, Some(&usage));
+        assert!(s.contains("Fable"));
+        assert!(s.contains("6%"));
+    }
+
+    #[test]
+    fn scoped_limits_absent_or_null_render_nothing() {
+        let usage = json!({
+            "five_hour": { "utilization": 1.0 },
+            "limits": [
+                { "kind": "weekly_scoped", "percent": 6, "scope": { "model": null } },
+                { "kind": "weekly_scoped", "scope": { "model": { "display_name": "X" } } }
+            ]
+        })
+        .to_string();
+        // No display_name -> skipped; no percent -> skipped.
+        let s = format_segment(&json!({}), Some(&usage));
+        assert!(!s.contains('X'));
+        assert!(!s.contains("6%"));
+    }
+
+    #[test]
+    fn builtin_cache_write_carries_limits_and_extra() {
+        let dir = std::env::temp_dir().join(format!("ccstatus-test-limits-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("usage.json");
+        let prior = json!({
+            "extra_usage": { "is_enabled": true },
+            "limits": [ { "kind": "weekly_scoped", "percent": 6,
+                          "scope": { "model": { "display_name": "Fable" } } } ]
+        })
+        .to_string();
+        let input = json!({
+            "rate_limits": {
+                "five_hour": { "used_percentage": 31.0, "resets_at": 1_700_000_000 },
+                "seven_day": { "used_percentage": 9.0, "resets_at": 1_700_500_000 }
+            }
+        });
+        write_builtin_cache(&input, &path, Some(&prior));
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written.pointer("/limits/0/scope/model/display_name"),
+            Some(&json!("Fable"))
+        );
+        assert_eq!(
+            written.pointer("/extra_usage/is_enabled"),
+            Some(&json!(true))
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
