@@ -185,8 +185,13 @@ fn spawn_daemon_detached() {
     let _ = cmd.spawn();
 }
 
-/// Daemon entrypoint (`--ghostty-daemon`). Single instance, guarded by a lock;
-/// polls the registered surfaces each tick and stamps their titles.
+/// How often the expensive caches (`ps` snapshot, per-surface git status) are
+/// refreshed — independent of, and slower than, the poll cadence. Focus and the
+/// timestamp-derived activity are re-read every poll; bg/suspended and git
+/// (which change slowly and cost process spawns) ride this slower clock.
+const HEAVY_REFRESH: Duration = Duration::from_secs(3);
+
+/// Daemon entrypoint (`--ghostty-daemon`). Single instance, guarded by a lock.
 pub fn run() -> ExitCode {
     let dir = match ServerDir::for_current(SURFACE_SERVER_ID) {
         Ok(d) => d,
@@ -198,17 +203,8 @@ pub fn run() -> ExitCode {
         Err(_) => return ExitCode::FAILURE,
     };
 
-    let log = DaemonLog::for_ghostty();
-    log.write("ghostty daemon started");
-
-    // surface id -> (pty path, last title we wrote) — for change detection
-    // (skip redundant writes) and restore (clear the title when a surface
-    // leaves or the flag is turned off).
-    let mut applied: HashMap<String, (String, String)> = HashMap::new();
-    // surface id -> attention on the previous tick, for edge-triggering the
-    // completion notification (fire when it *becomes* unviewed, not every tick).
-    let mut prev_attn: HashMap<String, bool> = HashMap::new();
-    let mut prev_view = Viewed::Away;
+    let mut daemon = Daemon::new(DaemonLog::for_ghostty());
+    daemon.log.write("ghostty daemon started");
     let mut last_activity = Instant::now();
 
     loop {
@@ -216,114 +212,221 @@ pub fn run() -> ExitCode {
         if !flag.enabled {
             // The title is the only surface the flag drives; nothing to do (a
             // disabled flag also means no notifications).
-            log.write("window flag disabled; clearing titles and exiting");
-            restore_all(&applied);
+            daemon
+                .log
+                .write("window flag disabled; clearing titles and exiting");
+            daemon.restore_all();
             return ExitCode::SUCCESS;
         }
 
-        // Computed once per tick (cheap `lsappinfo`): drives both the view probe
-        // and the adaptive cadence below.
+        // One cheap `lsappinfo` per tick drives both the view probe and the
+        // adaptive cadence.
         let frontmost = ghostty_frontmost();
-        let live = stamp_surfaces(
-            &flag,
-            &mut applied,
-            &mut prev_attn,
-            &mut prev_view,
-            frontmost,
-            &log,
-        );
+        let live = daemon.tick(&flag, frontmost);
         if !live.is_empty() {
             last_activity = Instant::now();
         }
         if live.is_empty() && last_activity.elapsed() > IDLE_EXIT_AFTER {
-            log.write("idle with no surfaces; exiting");
-            restore_all(&applied);
+            daemon.log.write("idle with no surfaces; exiting");
+            daemon.restore_all();
             return ExitCode::SUCCESS;
         }
         thread::sleep(if frontmost { POLL_ACTIVE } else { POLL_IDLE });
     }
 }
 
-/// One poll pass: stamp every live surface's title (OSC 2), fire the completion
-/// notification (OSC 777) on the unviewed-completion edge, drop dead ones, and
-/// clear the title for surfaces that have gone. Returns the set of live surface
-/// ids.
-fn stamp_surfaces(
-    flag: &WindowFlag,
-    applied: &mut HashMap<String, (String, String)>,
-    prev_attn: &mut HashMap<String, bool>,
-    prev_view: &mut Viewed,
-    frontmost: bool,
-    log: &DaemonLog,
-) -> HashSet<String> {
-    let surfaces = state::list_panes(SURFACE_SERVER_ID);
+/// Cross-tick daemon state. The cheap bits (applied titles, edge-tracking) are
+/// updated every poll; `signals` and `git` are caches refreshed on the slower
+/// [`HEAVY_REFRESH`] clock so a fast poll doesn't respawn `ps`/`git`.
+struct Daemon {
+    log: DaemonLog,
+    /// surface id -> (pty, last title written): change detection + restore.
+    applied: HashMap<String, (String, String)>,
+    /// surface id -> attention last tick: edge-triggers the completion notify.
+    prev_attn: HashMap<String, bool>,
+    /// Last resolved view, so transitions log once.
+    prev_view: Viewed,
+    /// `ps`-derived bg/suspended signals, refreshed on the heavy clock.
+    signals: crate::flag::PsSignals,
+    /// cwd -> git state, refreshed on the heavy clock (git spawns are the
+    /// per-surface expense we keep off the fast path).
+    git: HashMap<String, Option<crate::git::GitState>>,
+    /// When the caches were last refreshed (`None` forces a refresh next tick).
+    last_heavy: Option<Instant>,
+}
 
-    // One `ps` snapshot per tick feeds the bg-task / suspended signals.
-    let states: Vec<(String, PaneState)> = surfaces
-        .into_iter()
-        .filter_map(|id| state::read_pane(SURFACE_SERVER_ID, &id).map(|p| (id, p)))
-        .collect();
-    let pids: HashSet<u32> = states.iter().map(|(_, p)| p.claude_pid).collect();
-    let signals = crate::flag::PsSignals::capture(&pids);
-    let now = now_unix();
-
-    // Stamp the viewed surface *before* rendering, so its cleared attention
-    // flag shows this tick rather than next.
-    stamp_views(&states, applied, frontmost, prev_view, log);
-
-    let mut live = HashSet::new();
-    for (id, ps) in states {
-        if !pid_alive(ps.claude_pid) {
-            state::remove_pane(SURFACE_SERVER_ID, &id);
-            log.write(&format!("surface {} pruned (Claude exited)", ps.pane_tty));
-            continue; // its pty is closing anyway; nothing to restore
-        }
-        if live.insert(id.clone()) && !applied.contains_key(&id) {
-            log.write(&format!(
-                "surface {} registered (session {})",
-                ps.pane_tty, ps.session_id
-            ));
-        }
-
-        let sess = state::read_session(&ps.session_id).unwrap_or_default();
-        let title = crate::flag::label(flag, &sess, ps.claude_pid, &signals, now);
-
-        if applied.get(&id).map(|(_, t)| t.as_str()) != Some(title.as_str()) {
-            write_pty(&ps.pane_tty, &osc_title(&title));
-            applied.insert(id.clone(), (ps.pane_tty.clone(), title));
-        }
-
-        // Edge-triggered completion notification: fire once when attention
-        // *becomes* true (a turn just finished unviewed). `Some(false)` guards
-        // against firing on the daemon's first sight of an already-flagged
-        // surface. Once Ghostty view-stamping lands, `attention` will clear
-        // while you're looking, so this is visibility-gated for free.
-        let activity = crate::flag::activity(&sess, ps.claude_pid, &signals, now);
-        let attn = crate::fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
-        if flag.notify && prev_attn.get(&id) == Some(&false) && attn {
-            write_pty(&ps.pane_tty, &osc_notify("Claude", &completion_body(&sess)));
-            log.write(&format!("notified completion on {}", ps.pane_tty));
-        }
-        prev_attn.insert(id, attn);
-    }
-
-    // Surfaces we stamped but that are no longer live: clear our overrides.
-    let gone: Vec<String> = applied
-        .keys()
-        .filter(|id| !live.contains(*id))
-        .cloned()
-        .collect();
-    for id in gone {
-        if let Some((pty, _)) = applied.remove(&id) {
-            write_pty(&pty, &osc_title(""));
-            log.write(&format!("surface {pty} gone; title cleared"));
+impl Daemon {
+    fn new(log: DaemonLog) -> Self {
+        Self {
+            log,
+            applied: HashMap::new(),
+            prev_attn: HashMap::new(),
+            prev_view: Viewed::Away,
+            signals: crate::flag::PsSignals::capture(&HashSet::new()),
+            git: HashMap::new(),
+            last_heavy: None,
         }
     }
-    // Forget notification edge-state for surfaces that are gone, so a returning
-    // session re-notifies rather than being suppressed by a stale `true`.
-    prev_attn.retain(|id, _| live.contains(id));
 
-    live
+    /// One poll pass: refresh the caches if due, stamp the viewed surface, then
+    /// stamp each live surface's title (OSC 2), fire the completion notification
+    /// (OSC 777) on the unviewed-completion edge, drop dead ones, and clear the
+    /// title for surfaces that have gone. Returns the live surface ids.
+    fn tick(&mut self, flag: &WindowFlag, frontmost: bool) -> HashSet<String> {
+        let states: Vec<(String, PaneState)> = state::list_panes(SURFACE_SERVER_ID)
+            .into_iter()
+            .filter_map(|id| state::read_pane(SURFACE_SERVER_ID, &id).map(|p| (id, p)))
+            .collect();
+
+        if self
+            .last_heavy
+            .map(|t| t.elapsed() >= HEAVY_REFRESH)
+            .unwrap_or(true)
+        {
+            self.refresh_heavy(&states);
+        }
+
+        let now = now_unix();
+        // Stamp the viewed surface *before* rendering, so its cleared attention
+        // flag shows this tick rather than next.
+        self.stamp_views(&states, frontmost);
+
+        let mut live = HashSet::new();
+        for (id, ps) in &states {
+            if !pid_alive(ps.claude_pid) {
+                state::remove_pane(SURFACE_SERVER_ID, id);
+                self.log
+                    .write(&format!("surface {} pruned (Claude exited)", ps.pane_tty));
+                continue; // its pty is closing anyway; nothing to restore
+            }
+            if live.insert(id.clone()) && !self.applied.contains_key(id) {
+                self.log.write(&format!(
+                    "surface {} registered (session {})",
+                    ps.pane_tty, ps.session_id
+                ));
+            }
+
+            let sess = state::read_session(&ps.session_id).unwrap_or_default();
+            let activity = crate::flag::activity(&sess, ps.claude_pid, &self.signals, now);
+            let git = sess
+                .cwd
+                .as_deref()
+                .and_then(|c| self.git.get(c))
+                .and_then(|g| g.as_ref());
+            let title = crate::flag::render_label(flag, &sess, activity, git);
+
+            if self.applied.get(id).map(|(_, t)| t.as_str()) != Some(title.as_str()) {
+                write_pty(&ps.pane_tty, &osc_title(&title));
+                self.applied
+                    .insert(id.clone(), (ps.pane_tty.clone(), title));
+            }
+
+            // Edge-triggered completion notification: fire once when attention
+            // *becomes* true (a turn just finished unviewed). `Some(false)`
+            // guards against firing on the daemon's first sight of an
+            // already-flagged surface; the view stamp above suppresses it while
+            // the surface is on screen.
+            let attn = crate::fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
+            if flag.notify && self.prev_attn.get(id) == Some(&false) && attn {
+                write_pty(&ps.pane_tty, &osc_notify("Claude", &completion_body(&sess)));
+                self.log
+                    .write(&format!("notified completion on {}", ps.pane_tty));
+            }
+            self.prev_attn.insert(id.clone(), attn);
+        }
+
+        // Surfaces we stamped but that are no longer live: clear the title.
+        let gone: Vec<String> = self
+            .applied
+            .keys()
+            .filter(|id| !live.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            if let Some((pty, _)) = self.applied.remove(&id) {
+                write_pty(&pty, &osc_title(""));
+                self.log
+                    .write(&format!("surface {pty} gone; title cleared"));
+            }
+        }
+        // Forget notification edge-state for gone surfaces, so a returning
+        // session re-notifies rather than being suppressed by a stale `true`.
+        self.prev_attn.retain(|id, _| live.contains(id));
+
+        live
+    }
+
+    /// Refresh the expensive caches: one `ps` snapshot for the bg/suspended
+    /// signals, and a git status per distinct surface cwd.
+    fn refresh_heavy(&mut self, states: &[(String, PaneState)]) {
+        let pids: HashSet<u32> = states.iter().map(|(_, p)| p.claude_pid).collect();
+        self.signals = crate::flag::PsSignals::capture(&pids);
+        let mut git = HashMap::new();
+        for (_, ps) in states {
+            if let Some(cwd) = state::read_session(&ps.session_id).and_then(|s| s.cwd)
+                && !git.contains_key(&cwd)
+            {
+                let status = crate::git::status(cwd.as_str());
+                git.insert(cwd, status);
+            }
+        }
+        self.git = git;
+        self.last_heavy = Some(Instant::now());
+    }
+
+    /// Stamp `last_view_ts` on the session of the surface the user is currently
+    /// viewing in Ghostty — the Ghostty analog of the tmux handler's per-tick
+    /// view stamp. Its attention flag then clears (and its completion
+    /// notification is suppressed) while it's on screen.
+    ///
+    /// A surface is "viewed" when Ghostty is frontmost (the cheap `lsappinfo`
+    /// gate in `run`, no Automation permission) *and* the focused terminal is
+    /// one of ours — matched by the tab title we set (unique against non-Claude
+    /// tabs and Claudes in a different state) corroborated by the working
+    /// directory. The Automation grant is needed for the title/cwd query;
+    /// without it (or on a non-macOS host, where the probes are no-ops) the flag
+    /// clears on the next prompt instead. Residual conflation: two Claudes in
+    /// the same directory showing the same activity glyph.
+    fn stamp_views(&mut self, states: &[(String, PaneState)], frontmost: bool) {
+        let view = if states.is_empty() || !frontmost {
+            Viewed::Away
+        } else if let Some((name, cwd)) = focused_terminal() {
+            let hit = states.iter().find(|(id, ps)| {
+                self.applied.get(id).map(|(_, t)| t.as_str()) == Some(name.as_str())
+                    && state::read_session(&ps.session_id)
+                        .and_then(|s| s.cwd)
+                        .as_deref()
+                        == Some(cwd.as_str())
+            });
+            match hit {
+                Some((_, ps)) => {
+                    if let Some(mut s) = state::read_session(&ps.session_id) {
+                        s.last_view_ts = Some(now_unix());
+                        let _ = state::write_session(&ps.session_id, &s);
+                    }
+                    Viewed::Surface(ps.pane_tty.clone())
+                }
+                None => Viewed::OtherTab,
+            }
+        } else {
+            // Frontmost but the AppleScript query returned nothing — Automation
+            // permission not granted, or no window. The likely permission tell.
+            Viewed::ScriptUnavailable
+        };
+
+        if view != self.prev_view {
+            self.log.write(&format!("view -> {}", view.label()));
+            self.prev_view = view;
+        }
+    }
+
+    /// Clear the title on every surface we stamped (daemon shutdown / flag off).
+    /// We don't touch the progress bar — Claude Code owns OSC 9;4 natively.
+    fn restore_all(&self) {
+        for (pty, _) in self.applied.values() {
+            write_pty(pty, &osc_title(""));
+        }
+    }
 }
 
 /// The notification body for a completed turn: the session's directory
@@ -338,66 +441,6 @@ fn completion_body(sess: &crate::state::SessionState) -> String {
     match dir {
         Some(d) => format!("Finished in {d}"),
         None => "Finished".to_string(),
-    }
-}
-
-/// Clear the title on every surface we stamped (daemon shutdown / flag off). We
-/// don't touch the progress bar — Claude Code owns OSC 9;4 natively.
-fn restore_all(applied: &HashMap<String, (String, String)>) {
-    for (pty, _) in applied.values() {
-        write_pty(pty, &osc_title(""));
-    }
-}
-
-/// Stamp `last_view_ts` on the session of the surface the user is currently
-/// viewing in Ghostty — the Ghostty analog of the tmux handler's per-tick view
-/// stamp. Its attention flag then clears (and its completion notification is
-/// suppressed) while it's on screen.
-///
-/// A surface is "viewed" when Ghostty is frontmost (cheap `lsappinfo` gate, no
-/// Automation permission) *and* the focused terminal is one of ours — matched
-/// by the tab title we set (unique against non-Claude tabs and Claudes in a
-/// different state) corroborated by the working directory. The one-time
-/// Automation grant is needed for the title/cwd query; without it (or on a
-/// non-macOS host, where the probes are no-ops) the flag clears on the next
-/// prompt instead. The residual conflation is two Claudes in the same directory
-/// showing the same activity glyph.
-fn stamp_views(
-    states: &[(String, PaneState)],
-    applied: &HashMap<String, (String, String)>,
-    frontmost: bool,
-    prev: &mut Viewed,
-    log: &DaemonLog,
-) {
-    let view = if states.is_empty() || !frontmost {
-        Viewed::Away
-    } else if let Some((name, cwd)) = focused_terminal() {
-        let hit = states.iter().find(|(id, ps)| {
-            applied.get(id).map(|(_, t)| t.as_str()) == Some(name.as_str())
-                && state::read_session(&ps.session_id)
-                    .and_then(|s| s.cwd)
-                    .as_deref()
-                    == Some(cwd.as_str())
-        });
-        match hit {
-            Some((_, ps)) => {
-                if let Some(mut s) = state::read_session(&ps.session_id) {
-                    s.last_view_ts = Some(now_unix());
-                    let _ = state::write_session(&ps.session_id, &s);
-                }
-                Viewed::Surface(ps.pane_tty.clone())
-            }
-            None => Viewed::OtherTab,
-        }
-    } else {
-        // Frontmost but the AppleScript query returned nothing — Automation
-        // permission not granted, or no window. The likely permission tell.
-        Viewed::ScriptUnavailable
-    };
-
-    if view != *prev {
-        log.write(&format!("view -> {}", view.label()));
-        *prev = view;
     }
 }
 

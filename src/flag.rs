@@ -60,8 +60,10 @@ pub fn activity(
 }
 
 /// Render the activity-flag label for one surface's session: derive its
-/// [`activity`] and attention state, then apply the [`WindowFlag`] template
-/// (`{claude}`/`{dir}`/`{git}`/`{branch}`).
+/// [`activity`] and attention state, read git status, and apply the
+/// [`WindowFlag`] template (`{claude}`/`{dir}`/`{git}`/`{branch}`). The
+/// convenience form that does the git IO itself — a caller wanting to cache git
+/// across ticks uses [`render_label`] with a precomputed value.
 pub fn label(
     flag: &WindowFlag,
     sess: &SessionState,
@@ -70,7 +72,19 @@ pub fn label(
     now: i64,
 ) -> String {
     let act = activity(sess, claude_pid, signals, now);
-    let attn = crate::fleet::attention(act, sess.last_turn_ts, sess.last_view_ts);
     let git = sess.cwd.as_deref().and_then(crate::git::status);
-    flag.render(act, attn, git.as_ref(), sess.cwd.as_deref())
+    render_label(flag, sess, act, git.as_ref())
+}
+
+/// Apply the [`WindowFlag`] template from an already-derived activity and git
+/// state — no IO, so the (expensive) git status can be supplied from a cache.
+/// Attention is derived from the session's own timestamps, which are cheap.
+pub fn render_label(
+    flag: &WindowFlag,
+    sess: &SessionState,
+    activity: crate::fleet::Activity,
+    git: Option<&crate::git::GitState>,
+) -> String {
+    let attn = crate::fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
+    flag.render(activity, attn, git, sess.cwd.as_deref())
 }
