@@ -38,11 +38,30 @@ impl PsSignals {
     }
 }
 
+/// Derive a surface's [`crate::fleet::Activity`] from its session timestamps and
+/// the tick's [`PsSignals`]. Shared by the flag label and other surfaces (the
+/// Ghostty progress bar) that need the activity but not the rendered label.
+/// `now` is the tick's wall clock (passed in so all surfaces share one reading).
+pub fn activity(
+    sess: &SessionState,
+    claude_pid: u32,
+    signals: &PsSignals,
+    now: i64,
+) -> crate::fleet::Activity {
+    let idle_secs = sess.last_turn_ts.map(|t| (now - t).max(0));
+    crate::fleet::activity(
+        sess.last_prompt_ts,
+        sess.last_turn_ts,
+        signals.susp.contains(&claude_pid),
+        sess.last_notify_ts.is_some(),
+        signals.bg.contains(&claude_pid),
+        idle_secs,
+    )
+}
+
 /// Render the activity-flag label for one surface's session: derive its
-/// [`crate::fleet::Activity`] and attention state from the session timestamps
-/// and the tick's [`PsSignals`], then apply the [`WindowFlag`] template
-/// (`{claude}`/`{dir}`/`{git}`/`{branch}`). `now` is the tick's wall clock
-/// (passed in so all surfaces share one reading).
+/// [`activity`] and attention state, then apply the [`WindowFlag`] template
+/// (`{claude}`/`{dir}`/`{git}`/`{branch}`).
 pub fn label(
     flag: &WindowFlag,
     sess: &SessionState,
@@ -50,15 +69,7 @@ pub fn label(
     signals: &PsSignals,
     now: i64,
 ) -> String {
-    let idle_secs = sess.last_turn_ts.map(|t| (now - t).max(0));
-    let act = crate::fleet::activity(
-        sess.last_prompt_ts,
-        sess.last_turn_ts,
-        signals.susp.contains(&claude_pid),
-        sess.last_notify_ts.is_some(),
-        signals.bg.contains(&claude_pid),
-        idle_secs,
-    );
+    let act = activity(sess, claude_pid, signals, now);
     let attn = crate::fleet::attention(act, sess.last_turn_ts, sess.last_view_ts);
     let git = sess.cwd.as_deref().and_then(crate::git::status);
     flag.render(act, attn, git.as_ref(), sess.cwd.as_deref())

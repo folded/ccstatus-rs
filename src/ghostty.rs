@@ -83,6 +83,54 @@ pub fn osc_title(label: &str) -> String {
     format!("\x1b]2;{clean}\x07")
 }
 
+/// The OSC 9;4 "progress" sequence: `state` is 0=clear, 1=normal (with `pct`),
+/// 2=error, 3=indeterminate, 4=paused; `pct` is the fill (0..=100), meaningful
+/// only for state 1. Ghostty (1.2+), Windows Terminal, and ConEmu render this
+/// as a taskbar/tab progress indicator.
+pub fn osc_progress(state: u8, pct: u8) -> String {
+    format!("\x1b]9;4;{state};{}\x07", pct.min(100))
+}
+
+/// Map a surface's activity + cache-warmth to an OSC 9;4 `(state, pct)`:
+/// - `Working` → indeterminate pulse (a turn is running).
+/// - `NeedsInput` → error/red (blocked on the user — the "look at me" state).
+/// - `Suspended` → paused (Ctrl-Z'd).
+/// - `BgRunning` → indeterminate (a background task is still working).
+/// - settled (`Idle`/`Waiting`/`Unknown`) → a bar draining with the remaining
+///   cache warmth (`warm_pct`), or cleared once cold.
+fn progress_for(activity: crate::fleet::Activity, warm_pct: u8) -> (u8, u8) {
+    use crate::fleet::Activity::*;
+    match activity {
+        Working => (3, 0),
+        NeedsInput => (2, 0),
+        Suspended => (4, 0),
+        BgRunning => (3, 0),
+        Idle | Waiting | Unknown => {
+            if warm_pct > 0 {
+                (1, warm_pct)
+            } else {
+                (0, 0)
+            }
+        }
+    }
+}
+
+/// The percent of the cache-warmth window still remaining for a session
+/// (100 = just finished a turn, 0 = cold), driving the draining progress bar.
+/// `0` when there's no recorded turn (nothing to drain).
+fn warm_pct(sess: &crate::state::SessionState, now: i64) -> u8 {
+    let Some(ts) = sess.last_turn_ts else {
+        return 0;
+    };
+    let idle = (now - ts).max(0);
+    let threshold = crate::render::warm_threshold_secs(sess.cache_ttl_secs);
+    if threshold <= 0 || idle >= threshold {
+        0
+    } else {
+        ((threshold - idle) * 100 / threshold) as u8
+    }
+}
+
 /// Registrar side (runs in the statusline process): record this Ghostty surface
 /// so the daemon can find it, and make sure the daemon is running. No-op unless
 /// we're in Ghostty and the window flag is enabled (the only surface this phase
@@ -172,9 +220,9 @@ pub fn run() -> ExitCode {
         Err(_) => return ExitCode::FAILURE,
     };
 
-    // surface id -> (pty path, last title we wrote) — for change detection
-    // (skip redundant writes) and restore (clear the title when a surface
-    // leaves or the flag is turned off).
+    // surface id -> (pty path, last escapes we wrote) — for change detection
+    // (skip redundant writes) and restore (clear title + progress when a
+    // surface leaves or the flag is turned off).
     let mut applied: HashMap<String, (String, String)> = HashMap::new();
     let mut last_activity = Instant::now();
 
@@ -186,7 +234,7 @@ pub fn run() -> ExitCode {
             return ExitCode::SUCCESS;
         }
 
-        let live = stamp_titles(&flag, &mut applied);
+        let live = stamp_surfaces(&flag, &mut applied);
         if !live.is_empty() {
             last_activity = Instant::now();
         }
@@ -198,10 +246,10 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// One poll pass: stamp every live surface's title with its flag, drop dead
-/// ones, and restore titles for surfaces that have gone. Returns the set of
-/// live surface ids.
-fn stamp_titles(
+/// One poll pass: stamp every live surface's title (OSC 2) and progress bar
+/// (OSC 9;4), drop dead ones, and clear both for surfaces that have gone.
+/// Returns the set of live surface ids.
+fn stamp_surfaces(
     flag: &WindowFlag,
     applied: &mut HashMap<String, (String, String)>,
 ) -> HashSet<String> {
@@ -226,14 +274,17 @@ fn stamp_titles(
 
         let sess = state::read_session(&ps.session_id).unwrap_or_default();
         let title = crate::flag::label(flag, &sess, ps.claude_pid, &signals, now);
+        let activity = crate::flag::activity(&sess, ps.claude_pid, &signals, now);
+        let (pstate, ppct) = progress_for(activity, warm_pct(&sess, now));
+        let escapes = format!("{}{}", osc_title(&title), osc_progress(pstate, ppct));
 
-        if applied.get(&id).map(|(_, t)| t.as_str()) != Some(title.as_str()) {
-            write_pty(&ps.pane_tty, &osc_title(&title));
-            applied.insert(id, (ps.pane_tty, title));
+        if applied.get(&id).map(|(_, e)| e.as_str()) != Some(escapes.as_str()) {
+            write_pty(&ps.pane_tty, &escapes);
+            applied.insert(id, (ps.pane_tty, escapes));
         }
     }
 
-    // Surfaces we stamped but that are no longer live: clear our title override.
+    // Surfaces we stamped but that are no longer live: clear our overrides.
     let gone: Vec<String> = applied
         .keys()
         .filter(|id| !live.contains(*id))
@@ -241,17 +292,23 @@ fn stamp_titles(
         .collect();
     for id in gone {
         if let Some((pty, _)) = applied.remove(&id) {
-            write_pty(&pty, &osc_title(""));
+            write_pty(&pty, &cleared());
         }
     }
 
     live
 }
 
-/// Clear the title on every surface we stamped (daemon shutdown / flag off).
+/// The escapes that hand a surface back: empty title, progress bar removed.
+fn cleared() -> String {
+    format!("{}{}", osc_title(""), osc_progress(0, 0))
+}
+
+/// Clear title + progress on every surface we stamped (daemon shutdown / flag
+/// off).
 fn restore_all(applied: &HashMap<String, (String, String)>) {
     for (pty, _) in applied.values() {
-        write_pty(pty, &osc_title(""));
+        write_pty(pty, &cleared());
     }
 }
 
@@ -288,5 +345,26 @@ mod tests {
         assert_eq!(osc_title(""), "\x1b]2;\x07");
         // An embedded terminator / newline can't break out of the sequence.
         assert_eq!(osc_title("a\x07b\nc\x1b"), "\x1b]2;abc\x07");
+    }
+
+    #[test]
+    fn osc_progress_formats_and_clamps() {
+        assert_eq!(osc_progress(1, 42), "\x1b]9;4;1;42\x07");
+        assert_eq!(osc_progress(0, 0), "\x1b]9;4;0;0\x07");
+        assert_eq!(osc_progress(1, 250), "\x1b]9;4;1;100\x07"); // clamped
+    }
+
+    #[test]
+    fn progress_maps_activity_to_state() {
+        use crate::fleet::Activity::*;
+        assert_eq!(progress_for(Working, 0), (3, 0)); // pulse
+        assert_eq!(progress_for(BgRunning, 0), (3, 0)); // pulse
+        assert_eq!(progress_for(NeedsInput, 0), (2, 0)); // error/red
+        assert_eq!(progress_for(Suspended, 0), (4, 0)); // paused
+        // Settled: draining bar while warm, cleared once cold.
+        assert_eq!(progress_for(Idle, 80), (1, 80));
+        assert_eq!(progress_for(Waiting, 5), (1, 5));
+        assert_eq!(progress_for(Idle, 0), (0, 0));
+        assert_eq!(progress_for(Unknown, 0), (0, 0));
     }
 }
