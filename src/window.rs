@@ -211,7 +211,153 @@ return "0""#
         let Some(tty) = sanitize_tty(tty) else {
             return false;
         };
-        focus_iterm2_tty(&tty) || focus_terminal_app(&tty)
+        focus_iterm2_tty(&tty) || focus_terminal_app(&tty) || focus_ghostty_tty(&tty)
+    }
+
+    /// Surface the Ghostty tab whose pty is `tty` — used to raise the window
+    /// hosting a tmux client after a tmux jump. Ghostty's scripting can't address
+    /// a terminal by tty, so we identify it with a one-shot **title handshake**:
+    /// gate on the tty actually being Ghostty-hosted (process ancestry, so we
+    /// never touch another emulator's title), plant a unique title through the
+    /// pty, focus the terminal that now carries it, and restore the original
+    /// title. Best-effort; `false` if not Ghostty-hosted or the terminal wasn't
+    /// found.
+    fn focus_ghostty_tty(tty: &str) -> bool {
+        if !tty_hosted_by_ghostty(tty) {
+            return false;
+        }
+        // (id, name) before the handshake, so we can restore the real title.
+        let before = ghostty_terminals();
+        if before.is_empty() {
+            return false;
+        }
+        let sentinel = format!("ccstatus-focus-{}", tty.trim_start_matches("/dev/"));
+        write_tty_title(tty, &sentinel);
+        // Give Ghostty a moment to parse the OSC 2 before we look it up.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        match focus_terminal_named(&sentinel) {
+            Some(id) => {
+                if let Some((_, old)) = before.iter().find(|(i, _)| *i == id) {
+                    write_tty_title(tty, old);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a process with controlling tty `tty` descends from the Ghostty
+    /// app — the gate that keeps the title handshake from writing to a non-Ghostty
+    /// emulator's pty.
+    fn tty_hosted_by_ghostty(tty: &str) -> bool {
+        use std::collections::HashMap;
+        let short = tty.trim_start_matches("/dev/");
+        let Ok(out) = Command::new("ps")
+            .args(["-t", short, "-o", "pid="])
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let tty_pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if tty_pids.is_empty() {
+            return false;
+        }
+        let procs = crate::util::ps_snapshot();
+        let mut ppid: HashMap<u32, u32> = HashMap::new();
+        let mut cmd: HashMap<u32, &str> = HashMap::new();
+        for p in &procs {
+            ppid.insert(p.pid, p.ppid);
+            cmd.insert(p.pid, p.command.as_str());
+        }
+        const GHOSTTY_EXE: &str = "Ghostty.app/Contents/MacOS/ghostty";
+        for start in tty_pids {
+            let mut cur = start;
+            for _ in 0..12 {
+                if cmd.get(&cur).is_some_and(|c| c.contains(GHOSTTY_EXE)) {
+                    return true;
+                }
+                match ppid.get(&cur) {
+                    Some(&p) if p > 1 => cur = p,
+                    _ => break,
+                }
+            }
+        }
+        false
+    }
+
+    /// Every Ghostty terminal as `(id, name)`, for capturing titles before the
+    /// handshake.
+    fn ghostty_terminals() -> Vec<(String, String)> {
+        let script = r#"tell application "Ghostty"
+  set out to ""
+  repeat with w in windows
+    repeat with t in terminals of w
+      set out to out & (id of t) & tab & (name of t) & linefeed
+    end repeat
+  end repeat
+  return out
+end tell"#;
+        let Ok(out) = Command::new("osascript").arg("-e").arg(script).output() else {
+            return Vec::new();
+        };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect()
+    }
+
+    /// Focus (and bring forward) the Ghostty terminal whose title is `name`,
+    /// returning its id. `name` is our ASCII sentinel, safe to splice.
+    fn focus_terminal_named(name: &str) -> Option<String> {
+        let script = format!(
+            r#"tell application "Ghostty"
+  repeat with w in windows
+    repeat with t in terminals of w
+      if name of t is "{name}" then
+        focus t
+        activate
+        return id of t
+      end if
+    end repeat
+  end repeat
+end tell
+return """#
+        );
+        let out = Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// Write an `OSC 2` set-title to a pty (control chars stripped). Best-effort;
+    /// `O_NOCTTY` so opening the tty never makes it our controlling terminal.
+    fn write_tty_title(tty: &str, title: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(tty)
+        {
+            let _ = write!(f, "\x1b]2;{clean}\x07");
+        }
     }
 
     /// Select the iTerm2 session with this GUID and bring iTerm2 forward.
