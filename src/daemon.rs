@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use crate::config::{self, Align, Element};
 use crate::control::{self, Connection, EventStream, Writer};
 use crate::fleet;
+use crate::render;
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
 use crate::state;
@@ -385,7 +386,7 @@ impl Handler {
         let last_turn = session.last_turn_ts?;
         let idle = crate::util::now_unix().saturating_sub(last_turn);
         Some(
-            if idle < render_tmux::warm_threshold_secs(session.cache_ttl_secs) {
+            if idle < render::warm_threshold_secs(session.cache_ttl_secs) {
                 "warm"
             } else {
                 "cold"
@@ -400,7 +401,7 @@ impl Handler {
             return;
         };
         let sess = state::read_session(&pane.session_id).unwrap_or_default();
-        let warmth = render_tmux::warmth_segment(&sess);
+        let warmth = render::warmth_segment(&sess);
         let content = |e: Element| -> Option<String> {
             if e.is_live() {
                 warmth.clone()
@@ -638,9 +639,7 @@ fn row_format(
             .filter_map(content)
             .filter(|s| !s.is_empty())
             .collect();
-        render_tmux::ansi_to_tmux(&render_tmux::join_segments(
-            parts.iter().map(String::as_str),
-        ))
+        render_tmux::ansi_to_tmux(&render::join_segments(parts.iter().map(String::as_str)))
     };
     let mut row = group(Align::Left);
     let right = group(Align::Right);
@@ -670,9 +669,7 @@ fn plan_edge(
         // the elements; no-op on a fresh activate).
         return Side::Inherit;
     }
-    let mine = render_tmux::ansi_to_tmux(&render_tmux::join_segments(
-        parts.iter().map(String::as_str),
-    ));
+    let mine = render_tmux::ansi_to_tmux(&render::join_segments(parts.iter().map(String::as_str)));
     let combined = match (user.is_empty(), align) {
         (true, _) => mine,
         (false, Align::Left) => format!("{mine} {user}"),
@@ -877,7 +874,7 @@ mod tests {
             _ => None,
         };
         let plan = plan_bar(&routing, &content, "BASE", "", "", None, "");
-        let expected = render_tmux::ansi_to_tmux(&render_tmux::join_segments(["M", "C"]));
+        let expected = render_tmux::ansi_to_tmux(&render::join_segments(["M", "C"]));
         assert_eq!(plan.formats[0], expected);
         assert!(expected.contains('|')); // the ` | ` separator survived
     }

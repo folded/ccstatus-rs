@@ -13,6 +13,7 @@ mod hooks;
 mod install;
 mod ipc;
 mod oauth;
+mod render;
 mod render_tmux;
 mod server_dir;
 mod state;
@@ -124,7 +125,7 @@ fn main() -> ExitCode {
         config::Dest::Claude { .. }
     ) && let Some(sid) = resolve_session_id(&input)
         && let Some(sess) = state::read_session(&sid)
-        && let Some(seg) = render_tmux::warmth_segment(&sess)
+        && let Some(seg) = render::warmth_segment(&sess)
     {
         elements.push((config::Element::Warmth, seg));
     }
@@ -503,7 +504,7 @@ fn compose_claude(
         // Inline segments, split into left and right groups (render order from
         // the config list).
         let group = |align: Align| {
-            render_tmux::join_segments(
+            render::join_segments(
                 routing
                     .claude_at(n, align)
                     .into_iter()
@@ -540,7 +541,7 @@ fn compose_claude(
 fn paint_background(line: &str, width: u16, (r, g, b): (u8, u8, u8)) -> String {
     let prefix = format!("\x1b[48;2;{r};{g};{b}m");
     let body = line.replace(RESET, &format!("{RESET}{prefix}"));
-    let pad = (width as usize).saturating_sub(render_tmux::visible_width(line));
+    let pad = (width as usize).saturating_sub(render::visible_width(line));
     format!("{prefix}{body}{}{RESET}", " ".repeat(pad))
 }
 
@@ -552,11 +553,11 @@ fn compose_claude_line(left: &str, right: &str, width: u16) -> Option<String> {
         (true, true) => None,
         (false, true) => Some(left.to_string()),
         (true, false) => {
-            let pad = (width as usize).saturating_sub(render_tmux::visible_width(right));
+            let pad = (width as usize).saturating_sub(render::visible_width(right));
             Some(format!("{}{right}", " ".repeat(pad)))
         }
         (false, false) => {
-            let used = render_tmux::visible_width(left) + render_tmux::visible_width(right);
+            let used = render::visible_width(left) + render::visible_width(right);
             // Keep at least one space so the groups never touch when the line
             // is too narrow to hold both.
             let pad = (width as usize).saturating_sub(used).max(1);
@@ -666,7 +667,7 @@ mod tests {
     fn line_right_group_padded_to_cols() {
         // "L" + pad + "RIGHT" must end exactly at column 10.
         let line = compose_claude_line("L", "RIGHT", 10).unwrap();
-        assert_eq!(render_tmux::visible_width(&line), 10);
+        assert_eq!(render::visible_width(&line), 10);
         assert_eq!(line, "L    RIGHT");
     }
 
@@ -733,7 +734,7 @@ mod tests {
         let elements = vec![(Element::Version, "v2.1.168".to_string())];
         // At 80 cols the right group must end at col 80-4=76, not 80.
         let out = compose_claude(&elements, &routing, 80, None);
-        assert_eq!(render_tmux::visible_width(&out), 76);
+        assert_eq!(render::visible_width(&out), 76);
         assert!(out.ends_with("v2.1.168"));
     }
 
@@ -748,6 +749,6 @@ mod tests {
             format!("{bg}{BLUE}M{RESET}{bg}    {RESET}")
         );
         // The visible width (ignoring escapes) fills the line exactly.
-        assert_eq!(render_tmux::visible_width(&painted), 5);
+        assert_eq!(render::visible_width(&painted), 5);
     }
 }

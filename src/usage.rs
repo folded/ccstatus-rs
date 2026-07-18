@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::color::*;
 use crate::format::push_fmt;
-use crate::render_tmux;
+use crate::render;
 use crate::{api, cache, oauth};
 
 /// The account-global usage snapshot, read from the freshest on-disk usage
@@ -135,7 +135,7 @@ fn load_usage(input: &Value, config_dir: &str) -> Option<String> {
 /// the segment. Covers effective-builtin detection, the builtin branch, the
 /// API branch, the `5h - / 7d -` fallback, and extra-usage.
 fn format_segment(input: &Value, usage_json: Option<&str>) -> String {
-    let sep = render_tmux::sep();
+    let sep = render::sep();
     let mut out = String::new();
 
     let builtin_5h_pct = input.pointer("/rate_limits/five_hour/used_percentage");
@@ -353,7 +353,7 @@ fn write_builtin_cache(input: &Value, path: &Path, prior: Option<&str>) {
 /// a separator before each item; as a standalone element it must not start
 /// with one (surface composition adds separators).
 fn strip_leading_sep(s: String) -> String {
-    let sp = render_tmux::sep();
+    let sp = render::sep();
     s.strip_prefix(sp.as_str()).map(str::to_string).unwrap_or(s)
 }
 
