@@ -204,6 +204,7 @@ pub fn run() -> ExitCode {
     // surface id -> attention on the previous tick, for edge-triggering the
     // completion notification (fire when it *becomes* unviewed, not every tick).
     let mut prev_attn: HashMap<String, bool> = HashMap::new();
+    let mut prev_view = Viewed::Away;
     let mut last_activity = Instant::now();
 
     loop {
@@ -216,7 +217,7 @@ pub fn run() -> ExitCode {
             return ExitCode::SUCCESS;
         }
 
-        let live = stamp_surfaces(&flag, &mut applied, &mut prev_attn, &log);
+        let live = stamp_surfaces(&flag, &mut applied, &mut prev_attn, &mut prev_view, &log);
         if !live.is_empty() {
             last_activity = Instant::now();
         }
@@ -237,6 +238,7 @@ fn stamp_surfaces(
     flag: &WindowFlag,
     applied: &mut HashMap<String, (String, String)>,
     prev_attn: &mut HashMap<String, bool>,
+    prev_view: &mut Viewed,
     log: &DaemonLog,
 ) -> HashSet<String> {
     let surfaces = state::list_panes(SURFACE_SERVER_ID);
@@ -252,7 +254,7 @@ fn stamp_surfaces(
 
     // Stamp the viewed surface *before* rendering, so its cleared attention
     // flag shows this tick rather than next.
-    stamp_views(&states, applied);
+    stamp_views(&states, applied, prev_view, log);
 
     let mut live = HashSet::new();
     for (id, ps) in states {
@@ -345,22 +347,65 @@ fn restore_all(applied: &HashMap<String, (String, String)>) {
 /// non-macOS host, where the probes are no-ops) the flag clears on the next
 /// prompt instead. The residual conflation is two Claudes in the same directory
 /// showing the same activity glyph.
-fn stamp_views(states: &[(String, PaneState)], applied: &HashMap<String, (String, String)>) {
-    if states.is_empty() || !ghostty_frontmost() {
-        return;
-    }
-    let Some((name, cwd)) = focused_terminal() else {
-        return; // Ghostty not frontmost, or scripting denied/unavailable
-    };
-    for (id, ps) in states {
-        let our_title = applied.get(id).map(|(_, t)| t.as_str());
-        let sess_cwd = state::read_session(&ps.session_id).and_then(|s| s.cwd);
-        if our_title == Some(name.as_str()) && sess_cwd.as_deref() == Some(cwd.as_str()) {
-            if let Some(mut s) = state::read_session(&ps.session_id) {
-                s.last_view_ts = Some(now_unix());
-                let _ = state::write_session(&ps.session_id, &s);
+fn stamp_views(
+    states: &[(String, PaneState)],
+    applied: &HashMap<String, (String, String)>,
+    prev: &mut Viewed,
+    log: &DaemonLog,
+) {
+    let view = if states.is_empty() || !ghostty_frontmost() {
+        Viewed::Away
+    } else if let Some((name, cwd)) = focused_terminal() {
+        let hit = states.iter().find(|(id, ps)| {
+            applied.get(id).map(|(_, t)| t.as_str()) == Some(name.as_str())
+                && state::read_session(&ps.session_id)
+                    .and_then(|s| s.cwd)
+                    .as_deref()
+                    == Some(cwd.as_str())
+        });
+        match hit {
+            Some((_, ps)) => {
+                if let Some(mut s) = state::read_session(&ps.session_id) {
+                    s.last_view_ts = Some(now_unix());
+                    let _ = state::write_session(&ps.session_id, &s);
+                }
+                Viewed::Surface(ps.pane_tty.clone())
             }
-            return; // first (title, cwd) match wins
+            None => Viewed::OtherTab,
+        }
+    } else {
+        // Frontmost but the AppleScript query returned nothing — Automation
+        // permission not granted, or no window. The likely permission tell.
+        Viewed::ScriptUnavailable
+    };
+
+    if view != *prev {
+        log.write(&format!("view -> {}", view.label()));
+        *prev = view;
+    }
+}
+
+/// What the view probe resolved to on a tick, tracked so transitions are logged
+/// once (not every tick). `ScriptUnavailable` is the diagnostic case: Ghostty is
+/// frontmost but the scripting query failed, which usually means the Automation
+/// permission hasn't been granted.
+#[derive(Clone, PartialEq)]
+enum Viewed {
+    Away,
+    ScriptUnavailable,
+    OtherTab,
+    Surface(String),
+}
+
+impl Viewed {
+    fn label(&self) -> String {
+        match self {
+            Viewed::Away => "away (Ghostty not frontmost / no surfaces)".to_string(),
+            Viewed::ScriptUnavailable => {
+                "frontmost, scripting unavailable (Automation not granted?)".to_string()
+            }
+            Viewed::OtherTab => "other (non-Claude) tab".to_string(),
+            Viewed::Surface(pty) => format!("surface {pty}"),
         }
     }
 }
