@@ -45,6 +45,9 @@ pub enum ParseOutcome {
     /// daemon is running.
     TmuxReset,
     Install,
+    /// Run the singleton Ghostty title daemon. Spawned on demand by the
+    /// registrar; not meant to be run by hand.
+    GhosttyDaemon,
     /// Interactive aggregate view of every live Claude session, with
     /// jump-to-session.
     Top,
@@ -77,6 +80,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 _ => return ParseOutcome::Error("--session requires a tmux session id".into()),
             },
             "--tmux-reset" => return ParseOutcome::TmuxReset,
+            "--ghostty-daemon" => return ParseOutcome::GhosttyDaemon,
             "top" => return ParseOutcome::Top,
             "--hook" => {
                 let kind = match iter.next().as_deref() {
@@ -129,6 +133,8 @@ Options:
   --session <id>    Run the per-session control-mode handler for tmux
                     session <id>. Spawned automatically by the registrar;
                     not meant to be run by hand.
+  --ghostty-daemon  Run the Ghostty title daemon (stamps tab titles with the
+                    activity flag). Spawned automatically; not run by hand.
   --tmux-reset      Restore the global status bar to tmux defaults
                     (status-format[0] window list, higher slots unset,
                     status=on). Cleans up after a crashed daemon.

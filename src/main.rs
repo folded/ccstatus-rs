@@ -53,6 +53,7 @@ fn main() -> ExitCode {
             println!("ccstatus: bar reset to defaults");
             return ExitCode::SUCCESS;
         }
+        ParseOutcome::GhosttyDaemon => return ghostty::run(),
         ParseOutcome::Top => return top::run(),
         ParseOutcome::Install => {
             return match install::run() {
@@ -114,6 +115,13 @@ fn main() -> ExitCode {
     {
         let server_id = tmux::server_id().unwrap_or_else(|| "unknown".to_string());
         ipc::notify_register(&server_id, &tmux_session, pane_id);
+    }
+
+    // Outside tmux, register a Ghostty surface (the pty resolved from the Claude
+    // pid) so the Ghostty daemon can stamp its tab title. Gated on the cheap env
+    // check so non-Ghostty terminals don't pay for the pid resolution.
+    if pane_id.is_none() && ghostty::is_active() {
+        ghostty::register(&input, resolve_claude_pid());
     }
 
     // `warmth` is computed live from session state, not by render_elements.

@@ -216,6 +216,26 @@ pub fn remove_pane(server_id: &str, pane_id: &str) {
     let _ = std::fs::remove_file(pane_path(server_id, pane_id));
 }
 
+/// The pane/surface ids with state under `server_id` (the `.json` basenames in
+/// `pane/<server_id>/`). Ids are already filename-safe (they came from
+/// [`sanitize`] on write), so they round-trip back through [`read_pane`]. Empty
+/// when the server has no directory yet.
+pub fn list_panes(server_id: &str) -> Vec<String> {
+    let dir = cache::cache_dir().join("pane").join(sanitize(server_id));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".json")
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Strip path separators and other awkward characters so that an externally
 /// supplied id can't escape the state directory or break shell substitution.
 /// tmux pane ids look like `%5`; session ids are UUID-ish; both survive.
