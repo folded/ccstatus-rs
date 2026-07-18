@@ -5,6 +5,7 @@ mod color;
 mod config;
 mod control;
 mod daemon;
+mod dlog;
 mod flag;
 mod fleet;
 mod format;

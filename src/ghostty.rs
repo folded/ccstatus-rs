@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::config::WindowFlag;
+use crate::dlog::DaemonLog;
 use crate::server_dir::ServerDir;
 use crate::state::{self, PaneState};
 use crate::util::{self, now_unix, pid_alive, resolve_session_id};
@@ -44,7 +45,7 @@ use crate::util::{self, now_unix, pid_alive, resolve_session_id};
 /// The `server`/`pane` directory namespace for Ghostty surfaces. Ghostty has no
 /// tmux server, so all surfaces (across every Ghostty window) share one
 /// namespace and one daemon — distinct from the per-tmux-server hashes.
-const SURFACE_SERVER_ID: &str = "ghostty";
+pub const SURFACE_SERVER_ID: &str = "ghostty";
 
 /// Lock/socket basename for the singleton daemon (there is one, not one per
 /// session as in tmux).
@@ -193,9 +194,12 @@ pub fn run() -> ExitCode {
         Err(_) => return ExitCode::FAILURE,
     };
 
-    // surface id -> (pty path, last escapes we wrote) — for change detection
-    // (skip redundant writes) and restore (clear title + progress when a
-    // surface leaves or the flag is turned off).
+    let log = DaemonLog::for_ghostty();
+    log.write("ghostty daemon started");
+
+    // surface id -> (pty path, last title we wrote) — for change detection
+    // (skip redundant writes) and restore (clear the title when a surface
+    // leaves or the flag is turned off).
     let mut applied: HashMap<String, (String, String)> = HashMap::new();
     // surface id -> attention on the previous tick, for edge-triggering the
     // completion notification (fire when it *becomes* unviewed, not every tick).
@@ -205,17 +209,19 @@ pub fn run() -> ExitCode {
     loop {
         let flag = WindowFlag::load();
         if !flag.enabled {
-            // The title/progress are the only surfaces the flag drives; nothing
-            // to do (a disabled flag also means no notifications).
+            // The title is the only surface the flag drives; nothing to do (a
+            // disabled flag also means no notifications).
+            log.write("window flag disabled; clearing titles and exiting");
             restore_all(&applied);
             return ExitCode::SUCCESS;
         }
 
-        let live = stamp_surfaces(&flag, &mut applied, &mut prev_attn);
+        let live = stamp_surfaces(&flag, &mut applied, &mut prev_attn, &log);
         if !live.is_empty() {
             last_activity = Instant::now();
         }
         if live.is_empty() && last_activity.elapsed() > IDLE_EXIT_AFTER {
+            log.write("idle with no surfaces; exiting");
             restore_all(&applied);
             return ExitCode::SUCCESS;
         }
@@ -231,6 +237,7 @@ fn stamp_surfaces(
     flag: &WindowFlag,
     applied: &mut HashMap<String, (String, String)>,
     prev_attn: &mut HashMap<String, bool>,
+    log: &DaemonLog,
 ) -> HashSet<String> {
     let surfaces = state::list_panes(SURFACE_SERVER_ID);
 
@@ -247,9 +254,15 @@ fn stamp_surfaces(
     for (id, ps) in states {
         if !pid_alive(ps.claude_pid) {
             state::remove_pane(SURFACE_SERVER_ID, &id);
+            log.write(&format!("surface {} pruned (Claude exited)", ps.pane_tty));
             continue; // its pty is closing anyway; nothing to restore
         }
-        live.insert(id.clone());
+        if live.insert(id.clone()) && !applied.contains_key(&id) {
+            log.write(&format!(
+                "surface {} registered (session {})",
+                ps.pane_tty, ps.session_id
+            ));
+        }
 
         let sess = state::read_session(&ps.session_id).unwrap_or_default();
         let title = crate::flag::label(flag, &sess, ps.claude_pid, &signals, now);
@@ -268,6 +281,7 @@ fn stamp_surfaces(
         let attn = crate::fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
         if flag.notify && prev_attn.get(&id) == Some(&false) && attn {
             write_pty(&ps.pane_tty, &osc_notify("Claude", &completion_body(&sess)));
+            log.write(&format!("notified completion on {}", ps.pane_tty));
         }
         prev_attn.insert(id, attn);
     }
@@ -281,6 +295,7 @@ fn stamp_surfaces(
     for id in gone {
         if let Some((pty, _)) = applied.remove(&id) {
             write_pty(&pty, &osc_title(""));
+            log.write(&format!("surface {pty} gone; title cleared"));
         }
     }
     // Forget notification edge-state for surfaces that are gone, so a returning

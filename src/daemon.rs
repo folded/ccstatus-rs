@@ -28,9 +28,7 @@
 //! `set -u -t X …`, so the global config is never written.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
@@ -38,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, Align, Element};
 use crate::control::{self, Connection, EventStream, Writer};
+use crate::dlog::DaemonLog;
 use crate::flag;
 use crate::render;
 use crate::render_tmux;
@@ -725,42 +724,6 @@ fn spawn_socket_reader(socket: std::os::unix::net::UnixListener, tx: mpsc::Sende
             }
         }
     });
-}
-
-struct DaemonLog {
-    path: PathBuf,
-}
-
-impl DaemonLog {
-    fn for_session(server_id: &str, session: &str) -> Self {
-        let path = crate::cache::cache_dir()
-            .join("server")
-            .join(server_id)
-            .join(format!("handler{}.log", sanitize_session(session)));
-        Self { path }
-    }
-
-    fn write(&self, msg: &str) {
-        let Ok(mut f) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        else {
-            return;
-        };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "{ts} {msg}");
-    }
-}
-
-/// Session ids (`$1`) → a filename-safe suffix.
-fn sanitize_session(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
 }
 
 #[cfg(test)]
