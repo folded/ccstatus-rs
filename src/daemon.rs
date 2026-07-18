@@ -128,6 +128,7 @@ pub fn run(session: String) -> ExitCode {
         focused_pane: initial_focus,
         rendered: None,
         last_warmth: None,
+        last_fingerprint: None,
         last_activity: Instant::now(),
         flag: config::WindowFlag::load(),
         flagged: HashMap::new(),
@@ -157,6 +158,12 @@ struct Handler {
     /// Claude pane to another within the same session.
     rendered: Option<String>,
     last_warmth: Option<&'static str>,
+    /// Content fingerprint of the rendered pane's element map, so a turn that
+    /// rewrites the tokens/context elements while the same pane stays focused
+    /// triggers a re-render. Without this the bar only refreshes on a focus
+    /// change; the registrar writes fresh element data every turn but the
+    /// daemon would otherwise ignore it (same pane -> `Noop`).
+    last_fingerprint: Option<u64>,
     last_activity: Instant,
     /// Opt-in per-pane window-name activity flag (the across-tab "needs me?"
     /// cue). Unlike the status bar, this stamps *every* registered Claude pane's
@@ -314,18 +321,24 @@ impl Handler {
         let force = std::mem::take(&mut self.force_rerender);
         let warmth = focused_claude.as_deref().and_then(|p| self.pane_warmth(p));
         let warmth_changed = warmth != self.last_warmth;
+        let fingerprint = focused_claude
+            .as_deref()
+            .and_then(|p| self.pane_fingerprint(p));
+        let data_changed = fingerprint != self.last_fingerprint;
 
         match decide(
             self.rendered.as_deref(),
             focused_claude.as_deref(),
             force,
             warmth_changed,
+            data_changed,
         ) {
             Action::Activate(pane) => {
                 self.log.write(&format!("activate via focused {pane}"));
                 self.render_and_apply(&pane);
                 self.rendered = Some(pane);
                 self.last_warmth = warmth;
+                self.last_fingerprint = fingerprint;
                 self.last_activity = Instant::now();
                 self.refresh();
             }
@@ -333,6 +346,7 @@ impl Handler {
                 self.render_and_apply(&pane);
                 self.rendered = Some(pane);
                 self.last_warmth = warmth;
+                self.last_fingerprint = fingerprint;
                 self.refresh();
             }
             Action::Deactivate => {
@@ -340,10 +354,29 @@ impl Handler {
                 tmux::restore_session(self.tmux.as_ref(), &self.session);
                 self.rendered = None;
                 self.last_warmth = None;
+                self.last_fingerprint = None;
                 self.refresh();
             }
             Action::Noop => {}
         }
+    }
+
+    /// Cheap content fingerprint of a pane's rendered element map: the daemon
+    /// re-renders when this changes, so a turn that rewrites the tokens/context
+    /// elements refreshes the bar even without a focus change. Hashes the
+    /// sorted `(key, value)` pairs so it's insensitive to map ordering and
+    /// changes only when the composed content would.
+    fn pane_fingerprint(&self, pane_id: &str) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let pane = state::read_pane(&self.server_id, pane_id)?;
+        let mut entries: Vec<(&String, &String)> = pane.elements.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (k, v) in entries {
+            k.hash(&mut h);
+            v.hash(&mut h);
+        }
+        Some(h.finish())
     }
 
     fn pane_warmth(&self, pane_id: &str) -> Option<&'static str> {
@@ -496,17 +529,20 @@ pub enum Action {
 /// `None` when inactive); `focused_claude` is `Some(pane)` iff the focused pane
 /// is a registered Claude pane (the handler computes both and passes them in).
 /// A focus move between two Claude panes (`rendered != focused`) re-renders so
-/// the bar tracks the newly-focused session's data.
+/// the bar tracks the newly-focused session's data. So does a same-pane change
+/// in warmth (`warmth_changed`) or rendered element content (`data_changed`,
+/// e.g. tokens updating as a turn streams).
 pub fn decide(
     rendered: Option<&str>,
     focused_claude: Option<&str>,
     force: bool,
     warmth_changed: bool,
+    data_changed: bool,
 ) -> Action {
     match (rendered, focused_claude) {
         (None, Some(p)) => Action::Activate(p.to_string()),
         (Some(_), None) => Action::Deactivate,
-        (Some(prev), Some(p)) if prev != p || force || warmth_changed => {
+        (Some(prev), Some(p)) if prev != p || force || warmth_changed || data_changed => {
             Action::Rerender(p.to_string())
         }
         _ => Action::Noop,
@@ -759,30 +795,41 @@ mod tests {
     fn decide_covers_the_transition_table() {
         // inactive + Claude focused -> activate
         assert_eq!(
-            decide(None, Some("%1"), false, false),
+            decide(None, Some("%1"), false, false, false),
             Action::Activate("%1".into())
         );
         // active + focus left Claude -> deactivate
-        assert_eq!(decide(Some("%1"), None, false, false), Action::Deactivate);
+        assert_eq!(
+            decide(Some("%1"), None, false, false, false),
+            Action::Deactivate
+        );
         // active + same Claude focused, nothing changed -> noop
-        assert_eq!(decide(Some("%1"), Some("%1"), false, false), Action::Noop);
+        assert_eq!(
+            decide(Some("%1"), Some("%1"), false, false, false),
+            Action::Noop
+        );
         // active + focus moved to a different Claude pane -> rerender
         assert_eq!(
-            decide(Some("%1"), Some("%2"), false, false),
+            decide(Some("%1"), Some("%2"), false, false, false),
             Action::Rerender("%2".into())
         );
         // active + same Claude focused, forced -> rerender
         assert_eq!(
-            decide(Some("%1"), Some("%1"), true, false),
+            decide(Some("%1"), Some("%1"), true, false, false),
             Action::Rerender("%1".into())
         );
         // active + same Claude focused, warmth flipped -> rerender
         assert_eq!(
-            decide(Some("%1"), Some("%1"), false, true),
+            decide(Some("%1"), Some("%1"), false, true, false),
+            Action::Rerender("%1".into())
+        );
+        // active + same Claude focused, element content changed -> rerender
+        assert_eq!(
+            decide(Some("%1"), Some("%1"), false, false, true),
             Action::Rerender("%1".into())
         );
         // inactive + nothing focused -> noop
-        assert_eq!(decide(None, None, true, true), Action::Noop);
+        assert_eq!(decide(None, None, true, true, true), Action::Noop);
     }
 
     #[test]
