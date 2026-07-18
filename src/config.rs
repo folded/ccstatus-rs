@@ -465,6 +465,10 @@ pub fn mtime() -> Option<std::time::SystemTime> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowFlag {
     pub enabled: bool,
+    /// Fire a desktop notification (OSC 777) when a turn completes unviewed.
+    /// Opt-in (default off) because it's more intrusive than the tab flag.
+    /// Only the Ghostty backend acts on it (tmux has no equivalent).
+    pub notify: bool,
     /// Window-name template. Tokens `{claude}` (activity marker), `{dir}` (cwd
     /// basename), `{git}` (git-state glyph), `{branch}` (git branch) are
     /// substituted; an empty token contributes nothing and the result is
@@ -494,6 +498,7 @@ impl Default for WindowFlag {
     fn default() -> Self {
         WindowFlag {
             enabled: false,
+            notify: false,
             format: "{claude} {dir} {git}".to_string(),
             needs_input: "●".to_string(),
             working: "◐".to_string(),
@@ -545,6 +550,10 @@ impl WindowFlag {
                 .get("enabled")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(true),
+            notify: block
+                .get("notify")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             format: block
                 .get("format")
                 .and_then(|x| x.as_str())

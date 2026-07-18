@@ -1,4 +1,4 @@
-//! Ghostty backend: detection, surface identity, and the title daemon.
+//! Ghostty backend: detection, surface identity, and the polling daemon.
 //!
 //! A Claude running directly in Ghostty (no tmux) has no tmux pane id to key
 //! its surface on. The addressing handle is instead the **pty path** the
@@ -12,9 +12,15 @@
 //! Unlike tmux (a per-session control-mode handler driven by focus events),
 //! Ghostty has no session concept and no event stream, so the backend is a
 //! **single polling daemon**: it enumerates the registered surfaces every tick
-//! and stamps each one's tab title (OSC 2) with the same activity flag the tmux
-//! backend puts on the window name (see [`crate::config::WindowFlag`]). Ghostty
-//! titles are last-writer-wins, so the flag is re-asserted every tick.
+//! and drives three per-surface indicators from plain pty escapes —
+//!
+//! - **tab title** (OSC 2) carrying the same activity flag the tmux backend
+//!   puts on the window name (see [`crate::config::WindowFlag`]); titles are
+//!   last-writer-wins, so it's re-asserted every tick;
+//! - **progress bar** (OSC 9;4) as a live indicator (pulse while working, red
+//!   when blocked, draining with cache warmth once settled);
+//! - a **desktop notification** (OSC 777), edge-triggered on an unviewed
+//!   completion when `windowFlag.notify` is set.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -89,6 +95,19 @@ pub fn osc_title(label: &str) -> String {
 /// as a taskbar/tab progress indicator.
 pub fn osc_progress(state: u8, pct: u8) -> String {
     format!("\x1b]9;4;{state};{}\x07", pct.min(100))
+}
+
+/// The OSC 777 "notify" sequence: `ESC ] 777 ; notify ; <title> ; <body> BEL`,
+/// which Ghostty (and urxvt) turn into a desktop notification. Control chars are
+/// stripped from both fields so they can't corrupt the escape or inject extra
+/// `;` separators.
+pub fn osc_notify(title: &str, body: &str) -> String {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_control() && *c != ';')
+            .collect::<String>()
+    };
+    format!("\x1b]777;notify;{};{}\x07", clean(title), clean(body))
 }
 
 /// Map a surface's activity + cache-warmth to an OSC 9;4 `(state, pct)`:
@@ -224,17 +243,21 @@ pub fn run() -> ExitCode {
     // (skip redundant writes) and restore (clear title + progress when a
     // surface leaves or the flag is turned off).
     let mut applied: HashMap<String, (String, String)> = HashMap::new();
+    // surface id -> attention on the previous tick, for edge-triggering the
+    // completion notification (fire when it *becomes* unviewed, not every tick).
+    let mut prev_attn: HashMap<String, bool> = HashMap::new();
     let mut last_activity = Instant::now();
 
     loop {
         let flag = WindowFlag::load();
         if !flag.enabled {
-            // The title is the only surface this phase drives; nothing to do.
+            // The title/progress are the only surfaces the flag drives; nothing
+            // to do (a disabled flag also means no notifications).
             restore_all(&applied);
             return ExitCode::SUCCESS;
         }
 
-        let live = stamp_surfaces(&flag, &mut applied);
+        let live = stamp_surfaces(&flag, &mut applied, &mut prev_attn);
         if !live.is_empty() {
             last_activity = Instant::now();
         }
@@ -252,6 +275,7 @@ pub fn run() -> ExitCode {
 fn stamp_surfaces(
     flag: &WindowFlag,
     applied: &mut HashMap<String, (String, String)>,
+    prev_attn: &mut HashMap<String, bool>,
 ) -> HashSet<String> {
     let surfaces = state::list_panes(SURFACE_SERVER_ID);
 
@@ -280,8 +304,19 @@ fn stamp_surfaces(
 
         if applied.get(&id).map(|(_, e)| e.as_str()) != Some(escapes.as_str()) {
             write_pty(&ps.pane_tty, &escapes);
-            applied.insert(id, (ps.pane_tty, escapes));
+            applied.insert(id.clone(), (ps.pane_tty.clone(), escapes));
         }
+
+        // Edge-triggered completion notification: fire once when attention
+        // *becomes* true (a turn just finished unviewed). `Some(false)` guards
+        // against firing on the daemon's first sight of an already-flagged
+        // surface. Once Ghostty view-stamping lands, `attention` will clear
+        // while you're looking, so this is visibility-gated for free.
+        let attn = crate::fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
+        if flag.notify && prev_attn.get(&id) == Some(&false) && attn {
+            write_pty(&ps.pane_tty, &osc_notify("Claude", &completion_body(&sess)));
+        }
+        prev_attn.insert(id, attn);
     }
 
     // Surfaces we stamped but that are no longer live: clear our overrides.
@@ -295,8 +330,26 @@ fn stamp_surfaces(
             write_pty(&pty, &cleared());
         }
     }
+    // Forget notification edge-state for surfaces that are gone, so a returning
+    // session re-notifies rather than being suppressed by a stale `true`.
+    prev_attn.retain(|id, _| live.contains(id));
 
     live
+}
+
+/// The notification body for a completed turn: the session's directory
+/// basename, or a neutral fallback.
+fn completion_body(sess: &crate::state::SessionState) -> String {
+    let dir = sess
+        .cwd
+        .as_deref()
+        .map(|p| p.trim_end_matches('/'))
+        .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
+        .filter(|c| !c.is_empty());
+    match dir {
+        Some(d) => format!("Finished in {d}"),
+        None => "Finished".to_string(),
+    }
 }
 
 /// The escapes that hand a surface back: empty title, progress bar removed.
@@ -352,6 +405,24 @@ mod tests {
         assert_eq!(osc_progress(1, 42), "\x1b]9;4;1;42\x07");
         assert_eq!(osc_progress(0, 0), "\x1b]9;4;0;0\x07");
         assert_eq!(osc_progress(1, 250), "\x1b]9;4;1;100\x07"); // clamped
+    }
+
+    #[test]
+    fn osc_notify_formats_and_strips_separators() {
+        assert_eq!(
+            osc_notify("Claude", "Finished in demoproj"),
+            "\x1b]777;notify;Claude;Finished in demoproj\x07"
+        );
+        // Stray `;` / control chars can't inject extra fields or terminate early.
+        assert_eq!(osc_notify("a;b", "c\x07d\ne"), "\x1b]777;notify;ab;cde\x07");
+    }
+
+    #[test]
+    fn completion_body_uses_dir_basename() {
+        let mut s = crate::state::SessionState::default();
+        assert_eq!(completion_body(&s), "Finished");
+        s.cwd = Some("/Users/x/repo/demoproj/".to_string());
+        assert_eq!(completion_body(&s), "Finished in demoproj");
     }
 
     #[test]
