@@ -12,15 +12,17 @@
 //! Unlike tmux (a per-session control-mode handler driven by focus events),
 //! Ghostty has no session concept and no event stream, so the backend is a
 //! **single polling daemon**: it enumerates the registered surfaces every tick
-//! and drives three per-surface indicators from plain pty escapes —
+//! and drives two per-surface indicators from plain pty escapes —
 //!
 //! - **tab title** (OSC 2) carrying the same activity flag the tmux backend
 //!   puts on the window name (see [`crate::config::WindowFlag`]); titles are
 //!   last-writer-wins, so it's re-asserted every tick;
-//! - **progress bar** (OSC 9;4) as a live indicator (pulse while working, red
-//!   when blocked, draining with cache warmth once settled);
 //! - a **desktop notification** (OSC 777), edge-triggered on an unviewed
 //!   completion when `windowFlag.notify` is set.
+//!
+//! It deliberately does *not* drive the progress bar (OSC 9;4): Claude Code
+//! emits that natively (`terminalProgressBarEnabled`) and in real time, so a
+//! second writer on the same pty would only fight it.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -89,14 +91,6 @@ pub fn osc_title(label: &str) -> String {
     format!("\x1b]2;{clean}\x07")
 }
 
-/// The OSC 9;4 "progress" sequence: `state` is 0=clear, 1=normal (with `pct`),
-/// 2=error, 3=indeterminate, 4=paused; `pct` is the fill (0..=100), meaningful
-/// only for state 1. Ghostty (1.2+), Windows Terminal, and ConEmu render this
-/// as a taskbar/tab progress indicator.
-pub fn osc_progress(state: u8, pct: u8) -> String {
-    format!("\x1b]9;4;{state};{}\x07", pct.min(100))
-}
-
 /// The OSC 777 "notify" sequence: `ESC ] 777 ; notify ; <title> ; <body> BEL`,
 /// which Ghostty (and urxvt) turn into a desktop notification. Control chars are
 /// stripped from both fields so they can't corrupt the escape or inject extra
@@ -108,46 +102,6 @@ pub fn osc_notify(title: &str, body: &str) -> String {
             .collect::<String>()
     };
     format!("\x1b]777;notify;{};{}\x07", clean(title), clean(body))
-}
-
-/// Map a surface's activity + cache-warmth to an OSC 9;4 `(state, pct)`:
-/// - `Working` → indeterminate pulse (a turn is running).
-/// - `NeedsInput` → error/red (blocked on the user — the "look at me" state).
-/// - `Suspended` → paused (Ctrl-Z'd).
-/// - `BgRunning` → indeterminate (a background task is still working).
-/// - settled (`Idle`/`Waiting`/`Unknown`) → a bar draining with the remaining
-///   cache warmth (`warm_pct`), or cleared once cold.
-fn progress_for(activity: crate::fleet::Activity, warm_pct: u8) -> (u8, u8) {
-    use crate::fleet::Activity::*;
-    match activity {
-        Working => (3, 0),
-        NeedsInput => (2, 0),
-        Suspended => (4, 0),
-        BgRunning => (3, 0),
-        Idle | Waiting | Unknown => {
-            if warm_pct > 0 {
-                (1, warm_pct)
-            } else {
-                (0, 0)
-            }
-        }
-    }
-}
-
-/// The percent of the cache-warmth window still remaining for a session
-/// (100 = just finished a turn, 0 = cold), driving the draining progress bar.
-/// `0` when there's no recorded turn (nothing to drain).
-fn warm_pct(sess: &crate::state::SessionState, now: i64) -> u8 {
-    let Some(ts) = sess.last_turn_ts else {
-        return 0;
-    };
-    let idle = (now - ts).max(0);
-    let threshold = crate::render::warm_threshold_secs(sess.cache_ttl_secs);
-    if threshold <= 0 || idle >= threshold {
-        0
-    } else {
-        ((threshold - idle) * 100 / threshold) as u8
-    }
 }
 
 /// Registrar side (runs in the statusline process): record this Ghostty surface
@@ -269,9 +223,10 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// One poll pass: stamp every live surface's title (OSC 2) and progress bar
-/// (OSC 9;4), drop dead ones, and clear both for surfaces that have gone.
-/// Returns the set of live surface ids.
+/// One poll pass: stamp every live surface's title (OSC 2), fire the completion
+/// notification (OSC 777) on the unviewed-completion edge, drop dead ones, and
+/// clear the title for surfaces that have gone. Returns the set of live surface
+/// ids.
 fn stamp_surfaces(
     flag: &WindowFlag,
     applied: &mut HashMap<String, (String, String)>,
@@ -298,13 +253,10 @@ fn stamp_surfaces(
 
         let sess = state::read_session(&ps.session_id).unwrap_or_default();
         let title = crate::flag::label(flag, &sess, ps.claude_pid, &signals, now);
-        let activity = crate::flag::activity(&sess, ps.claude_pid, &signals, now);
-        let (pstate, ppct) = progress_for(activity, warm_pct(&sess, now));
-        let escapes = format!("{}{}", osc_title(&title), osc_progress(pstate, ppct));
 
-        if applied.get(&id).map(|(_, e)| e.as_str()) != Some(escapes.as_str()) {
-            write_pty(&ps.pane_tty, &escapes);
-            applied.insert(id.clone(), (ps.pane_tty.clone(), escapes));
+        if applied.get(&id).map(|(_, t)| t.as_str()) != Some(title.as_str()) {
+            write_pty(&ps.pane_tty, &osc_title(&title));
+            applied.insert(id.clone(), (ps.pane_tty.clone(), title));
         }
 
         // Edge-triggered completion notification: fire once when attention
@@ -312,6 +264,7 @@ fn stamp_surfaces(
         // against firing on the daemon's first sight of an already-flagged
         // surface. Once Ghostty view-stamping lands, `attention` will clear
         // while you're looking, so this is visibility-gated for free.
+        let activity = crate::flag::activity(&sess, ps.claude_pid, &signals, now);
         let attn = crate::fleet::attention(activity, sess.last_turn_ts, sess.last_view_ts);
         if flag.notify && prev_attn.get(&id) == Some(&false) && attn {
             write_pty(&ps.pane_tty, &osc_notify("Claude", &completion_body(&sess)));
@@ -327,7 +280,7 @@ fn stamp_surfaces(
         .collect();
     for id in gone {
         if let Some((pty, _)) = applied.remove(&id) {
-            write_pty(&pty, &cleared());
+            write_pty(&pty, &osc_title(""));
         }
     }
     // Forget notification edge-state for surfaces that are gone, so a returning
@@ -352,16 +305,11 @@ fn completion_body(sess: &crate::state::SessionState) -> String {
     }
 }
 
-/// The escapes that hand a surface back: empty title, progress bar removed.
-fn cleared() -> String {
-    format!("{}{}", osc_title(""), osc_progress(0, 0))
-}
-
-/// Clear title + progress on every surface we stamped (daemon shutdown / flag
-/// off).
+/// Clear the title on every surface we stamped (daemon shutdown / flag off). We
+/// don't touch the progress bar — Claude Code owns OSC 9;4 natively.
 fn restore_all(applied: &HashMap<String, (String, String)>) {
     for (pty, _) in applied.values() {
-        write_pty(pty, &cleared());
+        write_pty(pty, &osc_title(""));
     }
 }
 
@@ -401,13 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn osc_progress_formats_and_clamps() {
-        assert_eq!(osc_progress(1, 42), "\x1b]9;4;1;42\x07");
-        assert_eq!(osc_progress(0, 0), "\x1b]9;4;0;0\x07");
-        assert_eq!(osc_progress(1, 250), "\x1b]9;4;1;100\x07"); // clamped
-    }
-
-    #[test]
     fn osc_notify_formats_and_strips_separators() {
         assert_eq!(
             osc_notify("Claude", "Finished in demoproj"),
@@ -423,19 +364,5 @@ mod tests {
         assert_eq!(completion_body(&s), "Finished");
         s.cwd = Some("/Users/x/repo/demoproj/".to_string());
         assert_eq!(completion_body(&s), "Finished in demoproj");
-    }
-
-    #[test]
-    fn progress_maps_activity_to_state() {
-        use crate::fleet::Activity::*;
-        assert_eq!(progress_for(Working, 0), (3, 0)); // pulse
-        assert_eq!(progress_for(BgRunning, 0), (3, 0)); // pulse
-        assert_eq!(progress_for(NeedsInput, 0), (2, 0)); // error/red
-        assert_eq!(progress_for(Suspended, 0), (4, 0)); // paused
-        // Settled: draining bar while warm, cleared once cold.
-        assert_eq!(progress_for(Idle, 80), (1, 80));
-        assert_eq!(progress_for(Waiting, 5), (1, 5));
-        assert_eq!(progress_for(Idle, 0), (0, 0));
-        assert_eq!(progress_for(Unknown, 0), (0, 0));
     }
 }
