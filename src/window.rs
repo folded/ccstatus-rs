@@ -236,24 +236,12 @@ return "0""#
         }
     }
 
-    /// The controlling tty of `pid` as a `/dev/ttysNNN` path. `ps` prints the
-    /// short form (`ttys001`) or `??`/empty for a process with no controlling
-    /// terminal; we reject the latter and prefix `/dev/` to match what the
-    /// emulators report. Validated to a tty-safe alphabet for the AppleScript
-    /// literal.
+    /// The controlling tty of `pid` as an AppleScript-safe `/dev/ttysNNN` path.
+    /// [`crate::util::pid_tty`] resolves and `/dev/`-prefixes it (rejecting a
+    /// process with no controlling terminal); we then validate it to a tty-safe
+    /// alphabet before splicing into an AppleScript literal.
     fn pid_tty(pid: u32) -> Option<String> {
-        let out = Command::new("ps")
-            .args(["-o", "tty=", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if t.is_empty() || t == "??" || t == "?" {
-            return None;
-        }
-        sanitize_tty(&t)
+        sanitize_tty(&crate::util::pid_tty(pid)?)
     }
 
     /// Normalise a tty to a `/dev/ttysNNN` path, rejecting any value carrying

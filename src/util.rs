@@ -173,6 +173,41 @@ fn roots_with_descendant_matching(
     out
 }
 
+/// The controlling tty of `pid` as a `/dev/…` path, or `None` when the process
+/// has none. `ps -o tty=` prints the short form (`ttys001` on macOS, `pts/2` on
+/// Linux) or `??`/`?`/empty for a process with no controlling terminal; we
+/// reject the latter and prefix `/dev/` so the result matches what emulators and
+/// tmux report. Cross-platform (BSD and procps `ps` agree on `-o tty=`).
+///
+/// This is the surface-identity anchor for a Claude running directly in a
+/// terminal (no tmux): the statusline process is spawned detached with no
+/// controlling tty of its own, so a surface is addressed by resolving the pty
+/// from the *Claude* pid instead (see [`is_interactive_claude`]).
+pub fn pid_tty(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "tty=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    normalize_tty(&t)
+}
+
+/// Pure: normalise a `ps`-reported tty to a `/dev/…` path, rejecting the
+/// no-controlling-terminal markers (`??`, `?`, empty). Split out for testing.
+fn normalize_tty(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw == "??" || raw == "?" {
+        return None;
+    }
+    if raw.starts_with("/dev/") {
+        Some(raw.to_string())
+    } else {
+        Some(format!("/dev/{raw}"))
+    }
+}
+
 /// Extract the Claude session id from a stdin payload. Prefers an explicit
 /// `session_id` top-level field; falls back to the basename (without
 /// extension) of `transcript_path` so older / leaner payloads still work.
@@ -198,6 +233,21 @@ pub fn resolve_session_id(input: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::is_interactive_claude_cmd as ic;
+    use super::normalize_tty;
+
+    #[test]
+    fn normalize_tty_prefixes_and_rejects_no_terminal() {
+        assert_eq!(normalize_tty("ttys001").as_deref(), Some("/dev/ttys001"));
+        assert_eq!(normalize_tty("pts/2").as_deref(), Some("/dev/pts/2"));
+        assert_eq!(
+            normalize_tty("/dev/ttys003").as_deref(),
+            Some("/dev/ttys003")
+        );
+        // No controlling terminal.
+        assert_eq!(normalize_tty("??"), None);
+        assert_eq!(normalize_tty("?"), None);
+        assert_eq!(normalize_tty(""), None);
+    }
 
     #[test]
     fn interactive_claude_accepts_both_launcher_forms() {

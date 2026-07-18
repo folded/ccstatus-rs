@@ -7,6 +7,7 @@ mod control;
 mod daemon;
 mod fleet;
 mod format;
+mod ghostty;
 mod git;
 mod heatmap;
 mod hooks;
