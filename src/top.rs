@@ -37,8 +37,10 @@ use crate::usage;
 use crate::window;
 
 /// How often the table re-reads the state dir (also the input poll timeout, so
-/// keys stay responsive while we wait for the next refresh).
-const REFRESH: Duration = Duration::from_millis(1500);
+/// keys stay responsive while we wait for the next refresh). Short, so the
+/// recency (`--lru`) order settles quickly after you switch sessions — the view
+/// stamps it sorts on are only refreshed on the daemons' tick.
+const REFRESH: Duration = Duration::from_millis(600);
 
 // Truecolor palette, mirroring `crate::color` for the ANSI statusline.
 const C_BLUE: Color = Color::Rgb(0, 153, 255);
@@ -103,7 +105,10 @@ fn event_loop(terminal: &mut Term, lru: bool) -> io::Result<()> {
     let my_server = tmux::server_id();
     let mut views = collect(lru);
     let mut state = TableState::default();
-    state.select(selected_index(0, views.len()));
+    // Tab-switcher: start on the *second* row (the session you were in before
+    // this one), like alt-tab — so a bare invoke+Enter flips you back. Triage
+    // starts on the top (most urgent) row.
+    state.select(selected_index(if lru { 1 } else { 0 }, views.len()));
     let mut last_refresh = Instant::now();
 
     loop {
