@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, Align, Element};
 use crate::control::{self, Connection, EventStream, Writer};
-use crate::fleet;
+use crate::flag;
 use crate::render;
 use crate::render_tmux;
 use crate::server_dir::ServerDir;
@@ -451,13 +451,7 @@ impl Handler {
             .iter()
             .filter_map(|p| state::read_pane(&self.server_id, p).map(|ps| ps.claude_pid))
             .collect();
-        let procs = if pids.is_empty() {
-            Vec::new()
-        } else {
-            crate::util::ps_snapshot()
-        };
-        let bg = crate::util::background_task_pids(&procs, &pids);
-        let susp = crate::util::suspended_pids(&procs, &pids);
+        let signals = flag::PsSignals::capture(&pids);
         let now = crate::util::now_unix();
 
         for pane in self.panes.iter().cloned().collect::<Vec<_>>() {
@@ -465,20 +459,7 @@ impl Handler {
                 continue;
             };
             let sess = state::read_session(&ps.session_id).unwrap_or_default();
-            let idle_secs = sess.last_turn_ts.map(|t| (now - t).max(0));
-            let act = fleet::activity(
-                sess.last_prompt_ts,
-                sess.last_turn_ts,
-                susp.contains(&ps.claude_pid),
-                sess.last_notify_ts.is_some(),
-                bg.contains(&ps.claude_pid),
-                idle_secs,
-            );
-            let attn = fleet::attention(act, sess.last_turn_ts, sess.last_view_ts);
-            let git = sess.cwd.as_deref().and_then(crate::git::status);
-            let name = self
-                .flag
-                .render(act, attn, git.as_ref(), sess.cwd.as_deref());
+            let name = flag::label(&self.flag, &sess, ps.claude_pid, &signals, now);
             if self.flagged.get(&pane) != Some(&name) {
                 self.tmux.rename_window(&pane, &name);
                 self.flagged.insert(pane, name);

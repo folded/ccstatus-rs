@@ -5,6 +5,7 @@ mod color;
 mod config;
 mod control;
 mod daemon;
+mod flag;
 mod fleet;
 mod format;
 mod ghostty;

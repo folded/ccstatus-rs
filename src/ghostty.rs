@@ -213,13 +213,7 @@ fn stamp_titles(
         .filter_map(|id| state::read_pane(SURFACE_SERVER_ID, &id).map(|p| (id, p)))
         .collect();
     let pids: HashSet<u32> = states.iter().map(|(_, p)| p.claude_pid).collect();
-    let procs = if pids.is_empty() {
-        Vec::new()
-    } else {
-        util::ps_snapshot()
-    };
-    let bg = util::background_task_pids(&procs, &pids);
-    let susp = util::suspended_pids(&procs, &pids);
+    let signals = crate::flag::PsSignals::capture(&pids);
     let now = now_unix();
 
     let mut live = HashSet::new();
@@ -231,18 +225,7 @@ fn stamp_titles(
         live.insert(id.clone());
 
         let sess = state::read_session(&ps.session_id).unwrap_or_default();
-        let idle_secs = sess.last_turn_ts.map(|t| (now - t).max(0));
-        let act = crate::fleet::activity(
-            sess.last_prompt_ts,
-            sess.last_turn_ts,
-            susp.contains(&ps.claude_pid),
-            sess.last_notify_ts.is_some(),
-            bg.contains(&ps.claude_pid),
-            idle_secs,
-        );
-        let attn = crate::fleet::attention(act, sess.last_turn_ts, sess.last_view_ts);
-        let git = sess.cwd.as_deref().and_then(crate::git::status);
-        let title = flag.render(act, attn, git.as_ref(), sess.cwd.as_deref());
+        let title = crate::flag::label(flag, &sess, ps.claude_pid, &signals, now);
 
         if applied.get(&id).map(|(_, t)| t.as_str()) != Some(title.as_str()) {
             write_pty(&ps.pane_tty, &osc_title(&title));
