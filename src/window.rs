@@ -47,10 +47,11 @@ pub enum WindowTarget {
     /// the emulator) to its window via the jump command at focus time.
     LinuxWindow { claude_pid: u32 },
     /// A Ghostty terminal (macOS), focused via Ghostty's AppleScript `focus`
-    /// command. Matched by working directory — the only key Ghostty's scripting
-    /// exposes that we share — so the first terminal in `cwd` wins if several
-    /// sit in the same directory.
-    Ghostty { cwd: String },
+    /// command. Matched by the tab title we set (`title`, the activity flag —
+    /// distinct from a plain shell tab in the same dir) and corroborated by
+    /// working directory; falls back to the first terminal in `cwd` when the
+    /// title doesn't match (e.g. the flag changed since the fleet was read).
+    Ghostty { cwd: String, title: Option<String> },
 }
 
 /// Pure: derive a window target from a session's captured terminal identity.
@@ -83,10 +84,14 @@ pub fn target_for(
                 claude_pid.map(|p| WindowTarget::TerminalApp { claude_pid: p })
             }
             // Ghostty exposes no per-session handle to its scripting API, so we
-            // address the terminal by its working directory at focus time.
+            // address the terminal by working directory (+ the flag title, which
+            // the fleet fills in) at focus time.
             Some("ghostty") => cwd
                 .filter(|c| !c.is_empty())
-                .map(|c| WindowTarget::Ghostty { cwd: c.to_string() }),
+                .map(|c| WindowTarget::Ghostty {
+                    cwd: c.to_string(),
+                    title: None,
+                }),
             _ => None,
         }
     }
@@ -151,28 +156,43 @@ mod macos {
                 Some(tty) => focus_terminal_app(&tty),
                 None => false,
             },
-            WindowTarget::Ghostty { cwd } => focus_ghostty(cwd),
+            WindowTarget::Ghostty { cwd, title } => focus_ghostty(cwd, title.as_deref()),
             // Not produced on macOS (see `target_for`).
             WindowTarget::LinuxWindow { .. } => false,
         }
     }
 
-    /// Focus the Ghostty terminal whose working directory is `cwd` and bring
-    /// Ghostty forward, via the scripting `focus` command (needs the one-time
-    /// Automation grant). First match wins when several terminals share `cwd`.
-    fn focus_ghostty(cwd: &str) -> bool {
-        let esc = cwd.replace('\\', "\\\\").replace('"', "\\\"");
+    /// Focus the Ghostty terminal for this surface and bring Ghostty forward,
+    /// via the scripting `focus` command (needs the one-time Automation grant).
+    /// Prefer the terminal whose title is our flag *and* whose working directory
+    /// matches — so a plain shell tab in the same dir doesn't win; fall back to
+    /// the first terminal in `cwd` when no title matches.
+    fn focus_ghostty(cwd: &str, title: Option<&str>) -> bool {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let cwd = esc(cwd);
+        // `missing value` is AppleScript's null; an empty title literal never
+        // equals a real title, so a `None`/empty title just uses the fallback.
+        let title = title.map(esc).unwrap_or_default();
         let script = format!(
             r#"tell application "Ghostty"
+  set fallback to missing value
   repeat with w in windows
     repeat with t in terminals of w
-      if working directory of t is "{esc}" then
-        focus t
-        activate
-        return "1"
+      if working directory of t is "{cwd}" then
+        if name of t is "{title}" then
+          focus t
+          activate
+          return "1"
+        end if
+        if fallback is missing value then set fallback to t
       end if
     end repeat
   end repeat
+  if fallback is not missing value then
+    focus fallback
+    activate
+    return "1"
+  end if
 end tell
 return "0""#
         );
@@ -424,11 +444,13 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn target_for_ghostty_uses_cwd() {
-        // Ghostty is addressed by working directory.
+        // Ghostty is addressed by working directory (title filled in by the
+        // fleet, so `None` here).
         assert_eq!(
             target_for(Some("ghostty"), None, Some(9), None, Some("/repo/x")),
             Some(WindowTarget::Ghostty {
-                cwd: "/repo/x".into()
+                cwd: "/repo/x".into(),
+                title: None,
             })
         );
         // No cwd (or empty) — nothing to match on.

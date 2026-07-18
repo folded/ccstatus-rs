@@ -264,14 +264,31 @@ pub fn collect() -> Vec<SessionView> {
     };
     let bg_sessions = by_pid(&bg_pids);
     let suspended = by_pid(&suspended_pids);
-    build_views(
+    let mut views = build_views(
         &sessions,
         &pane_index,
         &live_servers,
         &bg_sessions,
         &suspended,
         now_unix(),
-    )
+    );
+    fill_ghostty_titles(&mut views);
+    views
+}
+
+/// Fill each Ghostty jump target's expected tab title — the activity flag the
+/// daemon stamps — so a jump can pick the Claude tab over a plain shell tab in
+/// the same directory. Recomputed here from the same activity/attention the
+/// fleet already derived, so it matches what the daemon wrote (in a stable
+/// state); a brief mismatch just falls back to cwd-only matching.
+fn fill_ghostty_titles(views: &mut [SessionView]) {
+    let flag = crate::config::WindowFlag::load();
+    for v in views.iter_mut() {
+        if let Some(WindowTarget::Ghostty { cwd, title }) = &mut v.window {
+            let git = crate::git::status(cwd);
+            *title = Some(flag.render(v.activity, v.attention, git.as_ref(), Some(cwd)));
+        }
+    }
 }
 
 /// Pure: collapse sessions that share a `claude_pid` down to the most
