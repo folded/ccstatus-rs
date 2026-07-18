@@ -120,6 +120,11 @@ pub struct SessionView {
     pub attention: bool,
     /// Seconds since the last recorded turn, or `None` if no turn yet.
     pub idle_secs: Option<i64>,
+    /// When this session was last *seen*: its `last_view_ts` (when its pane/tab
+    /// was last focused) if the daemon ever stamped one, else its last activity
+    /// (newest of prompt/turn). The sort key for `top`'s recency (tab-switcher)
+    /// mode; `None` only for a session with no view, prompt, or turn yet.
+    pub last_seen: Option<i64>,
     /// The tmux pane backing this session, or `None` for a non-tmux Claude.
     pub address: Option<PaneAddr>,
     /// The OS terminal window backing a *non-tmux* Claude (iTerm2/Terminal on
@@ -183,6 +188,9 @@ pub fn build_views(
                 activity,
                 attention: attention(activity, s.last_turn_ts, s.last_view_ts),
                 idle_secs,
+                last_seen: s
+                    .last_view_ts
+                    .or_else(|| s.last_prompt_ts.max(s.last_turn_ts)),
                 address,
                 window,
                 jumpable,

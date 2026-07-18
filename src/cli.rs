@@ -49,8 +49,11 @@ pub enum ParseOutcome {
     /// registrar; not meant to be run by hand.
     GhosttyDaemon,
     /// Interactive aggregate view of every live Claude session, with
-    /// jump-to-session.
-    Top,
+    /// jump-to-session. `lru` orders by most-recently-seen (tab-switcher) rather
+    /// than by triage urgency.
+    Top {
+        lru: bool,
+    },
     /// Follow the backend daemon logs live (merged, tagged by source).
     Log,
     Help,
@@ -83,7 +86,11 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             },
             "--tmux-reset" => return ParseOutcome::TmuxReset,
             "--ghostty-daemon" => return ParseOutcome::GhosttyDaemon,
-            "top" => return ParseOutcome::Top,
+            "top" => {
+                // `top` is terminal; scan the rest for its flags.
+                let lru = iter.any(|a| a == "--lru");
+                return ParseOutcome::Top { lru };
+            }
             "log" => return ParseOutcome::Log,
             "--hook" => {
                 let kind = match iter.next().as_deref() {
@@ -127,8 +134,9 @@ Options:
   --no-heatmap      Hide the per-day token-usage heatmap rows
   --updates         Check for newer ccstatus releases (off by default)
   --no-updates      Disable update check (default)
-  top               Interactive table of every live Claude session, with
-                    jump-to-session (Enter). Quit with q.
+  top [--lru]       Interactive table of every live Claude session, with
+                    jump-to-session (Enter). Quit with q. --lru orders by
+                    most-recently-seen (tab-switcher) instead of by urgency.
   log               Follow the backend daemon logs live (tmux handlers and
                     the Ghostty daemon), merged and tagged by source.
   --install         Wire this binary into ~/.claude/settings.json

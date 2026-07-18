@@ -55,8 +55,8 @@ fn dim() -> Style {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-pub fn run() -> ExitCode {
-    match run_inner() {
+pub fn run(lru: bool) -> ExitCode {
+    match run_inner(lru) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("ccstatus top: {e}");
@@ -65,7 +65,22 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn run_inner() -> io::Result<()> {
+/// Collect the fleet, ordered for the active mode: recency (most-recently-seen
+/// first — tab-switcher) when `lru`, else the triage order `fleet::collect`
+/// already applies.
+fn collect(lru: bool) -> Vec<SessionView> {
+    let mut views = fleet::collect();
+    if lru {
+        views.sort_by(|a, b| {
+            b.last_seen
+                .cmp(&a.last_seen)
+                .then_with(|| a.claude_session.cmp(&b.claude_session))
+        });
+    }
+    views
+}
+
+fn run_inner(lru: bool) -> io::Result<()> {
     if !io::stdout().is_terminal() {
         return Err(io::Error::other("not a terminal"));
     }
@@ -75,7 +90,7 @@ fn run_inner() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     terminal.hide_cursor()?;
 
-    let res = event_loop(&mut terminal);
+    let res = event_loop(&mut terminal, lru);
 
     // Restore the terminal regardless of how the loop ended.
     disable_raw_mode()?;
@@ -84,15 +99,15 @@ fn run_inner() -> io::Result<()> {
     res
 }
 
-fn event_loop(terminal: &mut Term) -> io::Result<()> {
+fn event_loop(terminal: &mut Term, lru: bool) -> io::Result<()> {
     let my_server = tmux::server_id();
-    let mut views = fleet::collect();
+    let mut views = collect(lru);
     let mut state = TableState::default();
     state.select(selected_index(0, views.len()));
     let mut last_refresh = Instant::now();
 
     loop {
-        terminal.draw(|f| ui(f, &views, &mut state, my_server.as_deref()))?;
+        terminal.draw(|f| ui(f, &views, &mut state, my_server.as_deref(), lru))?;
 
         // Block for input only until the next scheduled refresh.
         let timeout = REFRESH.saturating_sub(last_refresh.elapsed());
@@ -105,7 +120,7 @@ fn event_loop(terminal: &mut Term) -> io::Result<()> {
                 KeyCode::Char('j') | KeyCode::Down => move_selection(&mut state, &views, 1),
                 KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, &views, -1),
                 KeyCode::Char('r') => {
-                    views = fleet::collect();
+                    views = collect(lru);
                     last_refresh = Instant::now();
                     reclamp(&mut state, &views);
                 }
@@ -122,7 +137,7 @@ fn event_loop(terminal: &mut Term) -> io::Result<()> {
         }
 
         if last_refresh.elapsed() >= REFRESH {
-            views = fleet::collect();
+            views = collect(lru);
             last_refresh = Instant::now();
             reclamp(&mut state, &views);
         }
@@ -174,7 +189,13 @@ fn reclamp(state: &mut TableState, views: &[SessionView]) {
 
 // ---- rendering -----------------------------------------------------------
 
-fn ui(f: &mut Frame, views: &[SessionView], state: &mut TableState, my_server: Option<&str>) {
+fn ui(
+    f: &mut Frame,
+    views: &[SessionView],
+    state: &mut TableState,
+    my_server: Option<&str>,
+    lru: bool,
+) {
     let [header, divider, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -195,9 +216,11 @@ fn ui(f: &mut Frame, views: &[SessionView], state: &mut TableState, my_server: O
         f.render_stateful_widget(table(views, my_server, body.width), body, state);
     }
 
+    // Note the sort mode so it's clear whether rows are triaged or by recency.
+    let order = if lru { "recent" } else { "triage" };
     f.render_widget(
         Paragraph::new(Line::styled(
-            "j/k or ↑/↓ move · Enter jump · r refresh · q quit",
+            format!("j/k or ↑/↓ move · Enter jump · r refresh · q quit · sort: {order}"),
             dim(),
         )),
         footer,
@@ -475,6 +498,7 @@ mod tests {
             activity: Activity::Waiting,
             attention: false,
             idle_secs: Some(42),
+            last_seen: Some(1_000),
             address,
             window: None,
             jumpable,
@@ -494,7 +518,8 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
         let mut state = TableState::default();
         state.select(Some(0));
-        term.draw(|f| ui(f, &views, &mut state, None)).unwrap();
+        term.draw(|f| ui(f, &views, &mut state, None, false))
+            .unwrap();
 
         let buf = term.backend().buffer();
         let mut lines: Vec<String> = Vec::new();

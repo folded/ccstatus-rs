@@ -57,7 +57,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         ParseOutcome::GhosttyDaemon => return ghostty::run(),
-        ParseOutcome::Top => return top::run(),
+        ParseOutcome::Top { lru } => return top::run(lru),
         ParseOutcome::Log => return logview::run(),
         ParseOutcome::Install => {
             return match install::run() {
