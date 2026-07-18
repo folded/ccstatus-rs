@@ -15,6 +15,7 @@ mod heatmap;
 mod hooks;
 mod install;
 mod ipc;
+mod logview;
 mod oauth;
 mod render;
 mod render_tmux;
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
         }
         ParseOutcome::GhosttyDaemon => return ghostty::run(),
         ParseOutcome::Top => return top::run(),
+        ParseOutcome::Log => return logview::run(),
         ParseOutcome::Install => {
             return match install::run() {
                 Ok(()) => ExitCode::SUCCESS,

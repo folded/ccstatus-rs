@@ -51,6 +51,8 @@ pub enum ParseOutcome {
     /// Interactive aggregate view of every live Claude session, with
     /// jump-to-session.
     Top,
+    /// Follow the backend daemon logs live (merged, tagged by source).
+    Log,
     Help,
     Version,
     Error(String),
@@ -82,6 +84,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--tmux-reset" => return ParseOutcome::TmuxReset,
             "--ghostty-daemon" => return ParseOutcome::GhosttyDaemon,
             "top" => return ParseOutcome::Top,
+            "log" => return ParseOutcome::Log,
             "--hook" => {
                 let kind = match iter.next().as_deref() {
                     Some("stop") => HookKind::Stop,
@@ -126,6 +129,8 @@ Options:
   --no-updates      Disable update check (default)
   top               Interactive table of every live Claude session, with
                     jump-to-session (Enter). Quit with q.
+  log               Follow the backend daemon logs live (tmux handlers and
+                    the Ghostty daemon), merged and tagged by source.
   --install         Wire this binary into ~/.claude/settings.json
                     (statusLine + activity hooks) and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop,
