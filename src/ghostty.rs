@@ -51,9 +51,13 @@ pub const SURFACE_SERVER_ID: &str = "ghostty";
 /// session as in tmux).
 const DAEMON_KEY: &str = "daemon";
 
-/// Poll cadence — matches the tmux handler's timer. Ghostty gives us no events,
-/// so this is the *only* clock: focus/activity are re-derived each tick.
-const TICK: Duration = Duration::from_secs(3);
+/// Poll cadence. Ghostty gives us no events, so polling is the only clock —
+/// but we adapt it: poll fast while Ghostty is frontmost (you're looking, so the
+/// flag clearing / activity glyph should feel responsive), and slowly otherwise
+/// (backgrounded — e.g. you're in another app — so keep the ps/git/scripting
+/// cost low).
+const POLL_ACTIVE: Duration = Duration::from_secs(1);
+const POLL_IDLE: Duration = Duration::from_secs(3);
 
 /// Grace after the last surface goes before the daemon exits.
 const IDLE_EXIT_AFTER: Duration = Duration::from_secs(5);
@@ -217,7 +221,17 @@ pub fn run() -> ExitCode {
             return ExitCode::SUCCESS;
         }
 
-        let live = stamp_surfaces(&flag, &mut applied, &mut prev_attn, &mut prev_view, &log);
+        // Computed once per tick (cheap `lsappinfo`): drives both the view probe
+        // and the adaptive cadence below.
+        let frontmost = ghostty_frontmost();
+        let live = stamp_surfaces(
+            &flag,
+            &mut applied,
+            &mut prev_attn,
+            &mut prev_view,
+            frontmost,
+            &log,
+        );
         if !live.is_empty() {
             last_activity = Instant::now();
         }
@@ -226,7 +240,7 @@ pub fn run() -> ExitCode {
             restore_all(&applied);
             return ExitCode::SUCCESS;
         }
-        thread::sleep(TICK);
+        thread::sleep(if frontmost { POLL_ACTIVE } else { POLL_IDLE });
     }
 }
 
@@ -239,6 +253,7 @@ fn stamp_surfaces(
     applied: &mut HashMap<String, (String, String)>,
     prev_attn: &mut HashMap<String, bool>,
     prev_view: &mut Viewed,
+    frontmost: bool,
     log: &DaemonLog,
 ) -> HashSet<String> {
     let surfaces = state::list_panes(SURFACE_SERVER_ID);
@@ -254,7 +269,7 @@ fn stamp_surfaces(
 
     // Stamp the viewed surface *before* rendering, so its cleared attention
     // flag shows this tick rather than next.
-    stamp_views(&states, applied, prev_view, log);
+    stamp_views(&states, applied, frontmost, prev_view, log);
 
     let mut live = HashSet::new();
     for (id, ps) in states {
@@ -350,10 +365,11 @@ fn restore_all(applied: &HashMap<String, (String, String)>) {
 fn stamp_views(
     states: &[(String, PaneState)],
     applied: &HashMap<String, (String, String)>,
+    frontmost: bool,
     prev: &mut Viewed,
     log: &DaemonLog,
 ) {
-    let view = if states.is_empty() || !ghostty_frontmost() {
+    let view = if states.is_empty() || !frontmost {
         Viewed::Away
     } else if let Some((name, cwd)) = focused_terminal() {
         let hit = states.iter().find(|(id, ps)| {
