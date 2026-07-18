@@ -46,6 +46,11 @@ pub enum WindowTarget {
     /// A Linux terminal window, raised by mapping this pid (or an ancestor —
     /// the emulator) to its window via the jump command at focus time.
     LinuxWindow { claude_pid: u32 },
+    /// A Ghostty terminal (macOS), focused via Ghostty's AppleScript `focus`
+    /// command. Matched by working directory — the only key Ghostty's scripting
+    /// exposes that we share — so the first terminal in `cwd` wins if several
+    /// sit in the same directory.
+    Ghostty { cwd: String },
 }
 
 /// Pure: derive a window target from a session's captured terminal identity.
@@ -59,6 +64,7 @@ pub fn target_for(
     iterm_session_id: Option<&str>,
     claude_pid: Option<u32>,
     display: Option<&str>,
+    cwd: Option<&str>,
 ) -> Option<WindowTarget> {
     // A tmux session is jumped by switching its client (`focus_pane`), never by
     // raising a window — its `TERM_PROGRAM` is `tmux` on every platform.
@@ -76,12 +82,18 @@ pub fn target_for(
             Some("Apple_Terminal") => {
                 claude_pid.map(|p| WindowTarget::TerminalApp { claude_pid: p })
             }
+            // Ghostty exposes no per-session handle to its scripting API, so we
+            // address the terminal by its working directory at focus time.
+            Some("ghostty") => cwd
+                .filter(|c| !c.is_empty())
+                .map(|c| WindowTarget::Ghostty { cwd: c.to_string() }),
             _ => None,
         }
     }
     #[cfg(target_os = "linux")]
     {
         let _ = iterm_session_id;
+        let _ = cwd;
         // No portable per-session window handle on Linux; the jump command maps
         // the pid to its window at focus time. Addressable only with a
         // graphical display (else there's nothing to raise — headless/SSH).
@@ -94,7 +106,7 @@ pub fn target_for(
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (term_program, iterm_session_id, claude_pid, display);
+        let _ = (term_program, iterm_session_id, claude_pid, display, cwd);
         None
     }
 }
@@ -139,9 +151,32 @@ mod macos {
                 Some(tty) => focus_terminal_app(&tty),
                 None => false,
             },
+            WindowTarget::Ghostty { cwd } => focus_ghostty(cwd),
             // Not produced on macOS (see `target_for`).
             WindowTarget::LinuxWindow { .. } => false,
         }
+    }
+
+    /// Focus the Ghostty terminal whose working directory is `cwd` and bring
+    /// Ghostty forward, via the scripting `focus` command (needs the one-time
+    /// Automation grant). First match wins when several terminals share `cwd`.
+    fn focus_ghostty(cwd: &str) -> bool {
+        let esc = cwd.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            r#"tell application "Ghostty"
+  repeat with w in windows
+    repeat with t in terminals of w
+      if working directory of t is "{esc}" then
+        focus t
+        activate
+        return "1"
+      end if
+    end repeat
+  end repeat
+end tell
+return "0""#
+        );
+        run_osascript(&script)
     }
 
     /// Raise the emulator window whose session/tab is on `tty`, trying iTerm2
@@ -369,6 +404,7 @@ mod tests {
             Some("w0t0p0:CD4CA6CF-3A9C-464A-B736-B13BFEC9452C"),
             Some(123),
             None,
+            None,
         );
         assert_eq!(
             t,
@@ -381,18 +417,39 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn target_for_terminal_uses_pid() {
-        let t = target_for(Some("Apple_Terminal"), None, Some(456), None);
+        let t = target_for(Some("Apple_Terminal"), None, Some(456), None, None);
         assert_eq!(t, Some(WindowTarget::TerminalApp { claude_pid: 456 }));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn target_for_ghostty_uses_cwd() {
+        // Ghostty is addressed by working directory.
+        assert_eq!(
+            target_for(Some("ghostty"), None, Some(9), None, Some("/repo/x")),
+            Some(WindowTarget::Ghostty {
+                cwd: "/repo/x".into()
+            })
+        );
+        // No cwd (or empty) — nothing to match on.
+        assert_eq!(target_for(Some("ghostty"), None, Some(9), None, None), None);
+        assert_eq!(
+            target_for(Some("ghostty"), None, Some(9), None, Some("")),
+            None
+        );
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn target_for_unrecognised_terminal_is_none() {
         // Inside tmux TERM_PROGRAM is "tmux" — not a window we address here.
-        assert_eq!(target_for(Some("tmux"), None, Some(1), None), None);
-        assert_eq!(target_for(None, None, Some(1), None), None);
+        assert_eq!(target_for(Some("tmux"), None, Some(1), None, None), None);
+        assert_eq!(target_for(None, None, Some(1), None, None), None);
         // iTerm with no session id can't be addressed.
-        assert_eq!(target_for(Some("iTerm.app"), None, Some(1), None), None);
+        assert_eq!(
+            target_for(Some("iTerm.app"), None, Some(1), None, None),
+            None
+        );
     }
 
     #[test]
@@ -400,18 +457,28 @@ mod tests {
     fn target_for_linux_needs_a_display() {
         // A non-tmux Claude with a pid and a display is window-jumpable.
         assert_eq!(
-            target_for(None, None, Some(42), Some(":0")),
+            target_for(None, None, Some(42), Some(":0"), None),
             Some(WindowTarget::LinuxWindow { claude_pid: 42 })
         );
-        // Wayland display works too; TERM_PROGRAM is irrelevant on Linux.
+        // Wayland display works too; TERM_PROGRAM is irrelevant on Linux (a
+        // Ghostty session jumps by pid there, not by cwd).
         assert_eq!(
-            target_for(Some("foot"), None, Some(7), Some("wayland-1")),
+            target_for(
+                Some("ghostty"),
+                None,
+                Some(7),
+                Some("wayland-1"),
+                Some("/repo/x")
+            ),
             Some(WindowTarget::LinuxWindow { claude_pid: 7 })
         );
         // No display (headless/SSH), no pid, empty display, or tmux -> none.
-        assert_eq!(target_for(None, None, Some(42), None), None);
-        assert_eq!(target_for(None, None, Some(42), Some("")), None);
-        assert_eq!(target_for(None, None, None, Some(":0")), None);
-        assert_eq!(target_for(Some("tmux"), None, Some(42), Some(":0")), None);
+        assert_eq!(target_for(None, None, Some(42), None, None), None);
+        assert_eq!(target_for(None, None, Some(42), Some(""), None), None);
+        assert_eq!(target_for(None, None, None, Some(":0"), None), None);
+        assert_eq!(
+            target_for(Some("tmux"), None, Some(42), Some(":0"), None),
+            None
+        );
     }
 }
