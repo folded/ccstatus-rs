@@ -250,6 +250,10 @@ fn stamp_surfaces(
     let signals = crate::flag::PsSignals::capture(&pids);
     let now = now_unix();
 
+    // Stamp the viewed surface *before* rendering, so its cleared attention
+    // flag shows this tick rather than next.
+    stamp_views(&states, applied);
+
     let mut live = HashSet::new();
     for (id, ps) in states {
         if !pid_alive(ps.claude_pid) {
@@ -326,6 +330,98 @@ fn restore_all(applied: &HashMap<String, (String, String)>) {
     for (pty, _) in applied.values() {
         write_pty(pty, &osc_title(""));
     }
+}
+
+/// Stamp `last_view_ts` on the session of the surface the user is currently
+/// viewing in Ghostty — the Ghostty analog of the tmux handler's per-tick view
+/// stamp. Its attention flag then clears (and its completion notification is
+/// suppressed) while it's on screen.
+///
+/// A surface is "viewed" when Ghostty is frontmost (cheap `lsappinfo` gate, no
+/// Automation permission) *and* the focused terminal is one of ours — matched
+/// by the tab title we set (unique against non-Claude tabs and Claudes in a
+/// different state) corroborated by the working directory. The one-time
+/// Automation grant is needed for the title/cwd query; without it (or on a
+/// non-macOS host, where the probes are no-ops) the flag clears on the next
+/// prompt instead. The residual conflation is two Claudes in the same directory
+/// showing the same activity glyph.
+fn stamp_views(states: &[(String, PaneState)], applied: &HashMap<String, (String, String)>) {
+    if states.is_empty() || !ghostty_frontmost() {
+        return;
+    }
+    let Some((name, cwd)) = focused_terminal() else {
+        return; // Ghostty not frontmost, or scripting denied/unavailable
+    };
+    for (id, ps) in states {
+        let our_title = applied.get(id).map(|(_, t)| t.as_str());
+        let sess_cwd = state::read_session(&ps.session_id).and_then(|s| s.cwd);
+        if our_title == Some(name.as_str()) && sess_cwd.as_deref() == Some(cwd.as_str()) {
+            if let Some(mut s) = state::read_session(&ps.session_id) {
+                s.last_view_ts = Some(now_unix());
+                let _ = state::write_session(&ps.session_id, &s);
+            }
+            return; // first (title, cwd) match wins
+        }
+    }
+}
+
+/// Whether Ghostty is the frontmost application, via `lsappinfo` (a public API
+/// needing no Automation permission — the cheap gate before any scripting).
+#[cfg(target_os = "macos")]
+fn ghostty_frontmost() -> bool {
+    let Ok(front) = Command::new("lsappinfo").arg("front").output() else {
+        return false;
+    };
+    let asn = String::from_utf8_lossy(&front.stdout);
+    let asn = asn.trim();
+    if asn.is_empty() {
+        return false;
+    }
+    let Ok(info) = Command::new("lsappinfo")
+        .args(["info", "-only", "name", asn])
+        .output()
+    else {
+        return false;
+    };
+    // lsappinfo prints `"LSDisplayName"="Ghostty"`.
+    String::from_utf8_lossy(&info.stdout).contains("=\"Ghostty\"")
+}
+
+/// The `(title, working directory)` of the terminal the user is focused on in
+/// Ghostty, or `None` when Ghostty isn't frontmost or the scripting call fails
+/// (no Automation grant / no window). Needs the one-time Automation permission.
+#[cfg(target_os = "macos")]
+fn focused_terminal() -> Option<(String, String)> {
+    let script = r#"tell application "Ghostty"
+  if not frontmost then return ""
+  set t to focused terminal of selected tab of front window
+  return (name of t) & linefeed & (working directory of t)
+end tell"#;
+    let out = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim_end_matches('\n');
+    if s.is_empty() {
+        return None;
+    }
+    let (name, cwd) = s.split_once('\n')?;
+    Some((name.to_string(), cwd.to_string()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ghostty_frontmost() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn focused_terminal() -> Option<(String, String)> {
+    None
 }
 
 /// Write bytes to a pty, best-effort. `O_NOCTTY` is essential: the daemon is a
