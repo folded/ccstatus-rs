@@ -80,7 +80,7 @@ fn discover_logs(root: &Path) -> Vec<PathBuf> {
     logs
 }
 
-/// A short source tag, `<server-dir>/<stem>` (e.g. `ghostty/daemon`,
+/// A short source tag, `<server-dir>/<stem>` (e.g. `surface/daemon`,
 /// `1b08f661/handler-0`), so merged lines are attributable.
 fn source_label(path: &Path) -> String {
     let parent = path

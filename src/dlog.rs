@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! /tmp/ccstatus-<uid>/server/<server-hash>/handler<sess>.log   tmux handler
-//! /tmp/ccstatus-<uid>/server/ghostty/daemon.log                ghostty daemon
+//! /tmp/ccstatus-<uid>/server/surface/daemon.log                surface daemon
 //! ```
 //!
 //! Each line is `<unix-ts> <message>`. Writes are best-effort: a failed open
@@ -34,9 +34,9 @@ impl DaemonLog {
         Self::at(server_id, &format!("handler{}", sanitize_session(session)))
     }
 
-    /// The singleton Ghostty daemon's log (`server/ghostty/daemon.log`).
-    pub fn for_ghostty() -> Self {
-        Self::at(crate::ghostty::SURFACE_SERVER_ID, "daemon")
+    /// The singleton direct-terminal daemon's log (`server/surface/daemon.log`).
+    pub fn for_surface() -> Self {
+        Self::at(crate::surface::SURFACE_SERVER_ID, "daemon")
     }
 
     pub fn write(&self, msg: &str) {

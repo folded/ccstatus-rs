@@ -1,5 +1,6 @@
 //! The per-surface activity-flag label, shared by the surfaces that carry it:
-//! the tmux window name (`daemon`) and the Ghostty tab title (`ghostty`).
+//! the tmux window name (`daemon`) and the direct-terminal tab title
+//! (`surface`).
 //!
 //! Both backends do the same thing each tick — turn a session's timestamps plus
 //! a `ps`-derived view of its process into a [`WindowFlag`]-rendered label —
@@ -39,8 +40,8 @@ impl PsSignals {
 }
 
 /// Derive a surface's [`crate::fleet::Activity`] from its session timestamps and
-/// the tick's [`PsSignals`]. Shared by the flag label and other surfaces (the
-/// Ghostty progress bar) that need the activity but not the rendered label.
+/// the tick's [`PsSignals`]. Shared by the flag label and callers that need the
+/// activity but not the rendered label (e.g. the completion-notification edge).
 /// `now` is the tick's wall clock (passed in so all surfaces share one reading).
 pub fn activity(
     sess: &SessionState,

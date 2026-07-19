@@ -338,10 +338,10 @@ fn read_pane_index() -> HashMap<String, PaneAddr> {
     };
     for server in servers.flatten() {
         let server_id = server.file_name().to_string_lossy().to_string();
-        // Ghostty surfaces live under this namespace too, but they aren't tmux
-        // panes — they jump as OS windows (via `window::target_for`), so keep
-        // them out of the tmux pane index.
-        if server_id == crate::ghostty::SURFACE_SERVER_ID {
+        // Direct-terminal surfaces live under this namespace too, but they
+        // aren't tmux panes — they jump as OS windows (via `window::target_for`),
+        // so keep them out of the tmux pane index.
+        if server_id == crate::surface::SURFACE_SERVER_ID {
             continue;
         }
         let Ok(files) = fs::read_dir(server.path()) else {

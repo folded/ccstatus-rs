@@ -9,7 +9,6 @@ mod dlog;
 mod flag;
 mod fleet;
 mod format;
-mod ghostty;
 mod git;
 mod heatmap;
 mod hooks;
@@ -21,6 +20,7 @@ mod render;
 mod render_tmux;
 mod server_dir;
 mod state;
+mod surface;
 mod term;
 mod tmux;
 mod top;
@@ -56,7 +56,7 @@ fn main() -> ExitCode {
             println!("ccstatus: bar reset to defaults");
             return ExitCode::SUCCESS;
         }
-        ParseOutcome::GhosttyDaemon => return ghostty::run(),
+        ParseOutcome::SurfaceDaemon => return surface::run(),
         ParseOutcome::Top { lru } => return top::run(lru),
         ParseOutcome::Log => return logview::run(),
         ParseOutcome::Install => {
@@ -124,8 +124,8 @@ fn main() -> ExitCode {
     // Outside tmux, register a direct-terminal surface (the pty resolved from
     // the Claude pid) so the daemon can stamp its tab title. Gated on the cheap
     // env check so unrecognized terminals don't pay for the pid resolution.
-    if pane_id.is_none() && ghostty::is_active() {
-        ghostty::register(&input, resolve_claude_pid());
+    if pane_id.is_none() && surface::is_active() {
+        surface::register(&input, resolve_claude_pid());
     }
 
     // `warmth` is computed live from session state, not by render_elements.

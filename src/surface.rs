@@ -46,20 +46,21 @@ use crate::server_dir::ServerDir;
 use crate::state::{self, PaneState};
 use crate::util::{self, now_unix, pid_alive, resolve_session_id};
 
-/// The `server`/`pane` directory namespace for Ghostty surfaces. Ghostty has no
-/// tmux server, so all surfaces (across every Ghostty window) share one
-/// namespace and one daemon — distinct from the per-tmux-server hashes.
-pub const SURFACE_SERVER_ID: &str = "ghostty";
+/// The `server`/`pane` directory namespace for direct-terminal surfaces. These
+/// emulators have no tmux server, so all surfaces (across every window, every
+/// emulator) share one namespace and one daemon — distinct from the
+/// per-tmux-server hashes.
+pub const SURFACE_SERVER_ID: &str = "surface";
 
 /// Lock/socket basename for the singleton daemon (there is one, not one per
 /// session as in tmux).
 const DAEMON_KEY: &str = "daemon";
 
-/// Poll cadence. Ghostty gives us no events, so polling is the only clock —
-/// but we adapt it: poll fast while Ghostty is frontmost (you're looking, so the
-/// flag clearing / activity glyph should feel responsive), and slowly otherwise
-/// (backgrounded — e.g. you're in another app — so keep the ps/git/scripting
-/// cost low).
+/// Poll cadence. These emulators give us no events, so polling is the only
+/// clock — but we adapt it: poll fast while a supported emulator is frontmost
+/// (you're looking, so the flag clearing / activity glyph should feel
+/// responsive), and slowly otherwise (backgrounded — e.g. you're in another app
+/// — so keep the ps/git/scripting cost low).
 const POLL_ACTIVE: Duration = Duration::from_secs(1);
 const POLL_IDLE: Duration = Duration::from_secs(3);
 
@@ -230,7 +231,7 @@ fn spawn_daemon_detached() {
         return;
     };
     let mut cmd = Command::new(exe);
-    cmd.arg("--ghostty-daemon");
+    cmd.arg("--surface-daemon");
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
@@ -251,7 +252,7 @@ fn spawn_daemon_detached() {
 /// (which change slowly and cost process spawns) ride this slower clock.
 const HEAVY_REFRESH: Duration = Duration::from_secs(3);
 
-/// Daemon entrypoint (`--ghostty-daemon`). Single instance, guarded by a lock.
+/// Daemon entrypoint (`--surface-daemon`). Single instance, guarded by a lock.
 pub fn run() -> ExitCode {
     let dir = match ServerDir::for_current(SURFACE_SERVER_ID) {
         Ok(d) => d,
@@ -263,8 +264,8 @@ pub fn run() -> ExitCode {
         Err(_) => return ExitCode::FAILURE,
     };
 
-    let mut daemon = Daemon::new(DaemonLog::for_ghostty());
-    daemon.log.write("ghostty daemon started");
+    let mut daemon = Daemon::new(DaemonLog::for_surface());
+    daemon.log.write("surface daemon started");
     let mut last_activity = Instant::now();
 
     loop {
@@ -535,9 +536,9 @@ fn completion_body(sess: &crate::state::SessionState) -> String {
 }
 
 /// What the view probe resolved to on a tick, tracked so transitions are logged
-/// once (not every tick). `ScriptUnavailable` is the diagnostic case: Ghostty is
-/// frontmost but the scripting query failed, which usually means the Automation
-/// permission hasn't been granted.
+/// once (not every tick). `ScriptUnavailable` is the diagnostic case: an
+/// emulator is frontmost but the scripting query failed, which usually means the
+/// Automation permission hasn't been granted.
 #[derive(Clone, PartialEq)]
 enum Viewed {
     Away,
@@ -549,7 +550,7 @@ enum Viewed {
 impl Viewed {
     fn label(&self) -> String {
         match self {
-            Viewed::Away => "away (Ghostty not frontmost / no surfaces)".to_string(),
+            Viewed::Away => "away (no supported emulator frontmost / no surfaces)".to_string(),
             Viewed::ScriptUnavailable => {
                 "frontmost, scripting unavailable (Automation not granted?)".to_string()
             }

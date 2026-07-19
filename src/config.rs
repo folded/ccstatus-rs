@@ -465,9 +465,10 @@ pub fn mtime() -> Option<std::time::SystemTime> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowFlag {
     pub enabled: bool,
-    /// Fire a desktop notification (OSC 777) when a turn completes unviewed.
-    /// Opt-in (default off) because it's more intrusive than the tab flag.
-    /// Only the Ghostty backend acts on it (tmux has no equivalent).
+    /// Fire a desktop notification when a turn completes unviewed. Opt-in
+    /// (default off) because it's more intrusive than the tab flag. Only the
+    /// direct-terminal backend acts on it — OSC 777 (Ghostty), OSC 9 (iTerm2),
+    /// or a native notification (Terminal.app); tmux has no equivalent.
     pub notify: bool,
     /// Window-name template. Tokens `{claude}` (activity marker), `{dir}` (cwd
     /// basename), `{git}` (git-state glyph), `{branch}` (git branch) are
