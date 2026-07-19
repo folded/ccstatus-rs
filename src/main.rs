@@ -158,32 +158,64 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Returns `Some(pane_id)` if Claude Code was launched inside tmux. Reads the
-/// env; the decision lives in [`tmux_pane`].
+/// Returns `Some(pane_id)` if Claude Code is running in a tmux pane.
+///
+/// `$TMUX_PANE` gives the pane id, but it can't be trusted on its own: a GUI
+/// terminal (Terminal.app, iTerm2, …) first launched from a tmux context freezes
+/// `$TMUX`/`$TMUX_PANE` into its process env and hands that stale pair to every
+/// window it opens, for the life of the app — so the vars are set with no tmux
+/// managing the window. We confirm with process ancestry instead: tmux's server
+/// spawns each pane's shell as a child, so a real pane has the `tmux` process up
+/// its parent chain, while an inheriting GUI terminal does not. The env var is
+/// only a cheap gate — absent it, there's nothing to verify and we skip the walk.
 fn active_tmux_pane() -> Option<String> {
-    tmux_pane(
-        env::var("TMUX").ok().as_deref(),
-        env::var("TMUX_PANE").ok().as_deref(),
-        env::var("TERM_PROGRAM").ok().as_deref(),
-    )
+    let pane = env::var("TMUX_PANE").ok().filter(|s| !s.is_empty())?;
+    let ppid = unsafe { libc::getppid() } as u32;
+    has_tmux_ancestor(ppid).then_some(pane)
 }
 
-/// Pure: whether we're in a tmux pane, from the three env values. Both `$TMUX`
-/// and `$TMUX_PANE` must be non-empty — but that alone isn't enough, because a
-/// GUI terminal (iTerm2, Terminal.app, …) launched from a tmux context inherits
-/// a *stale* `$TMUX` that its process keeps handing to every window it opens,
-/// long after (or regardless of whether) that tmux is ours. The tell is
-/// `TERM_PROGRAM`: a real tmux pane reports `tmux`, while a GUI terminal reports
-/// its own name — so a non-empty `TERM_PROGRAM` that isn't `tmux` means the
-/// `$TMUX` is stale and we're really on that terminal's stdout. An absent
-/// `TERM_PROGRAM` (very old tmux) is left trusted, preserving prior behaviour.
-fn tmux_pane(tmux: Option<&str>, pane: Option<&str>, term_program: Option<&str>) -> Option<String> {
-    tmux.filter(|s| !s.is_empty())?;
-    let pane = pane.filter(|s| !s.is_empty())?;
-    match term_program {
-        Some(tp) if !tp.is_empty() && tp != "tmux" => None,
-        _ => Some(pane.to_string()),
+/// Whether a `tmux` process is a forebear of `pid`. Bounded walk (the tmux server
+/// sits just above the pane shell — shell → claude → statusline is only a few
+/// hops), stopping at init. A gone process or a broken chain reads as "no".
+fn has_tmux_ancestor(pid: u32) -> bool {
+    let mut pid = pid;
+    for _ in 0..16 {
+        let Some((ppid, cmd)) = pid_parent_command(pid) else {
+            return false;
+        };
+        if is_tmux_cmd(&cmd) {
+            return true;
+        }
+        if ppid <= 1 {
+            return false;
+        }
+        pid = ppid;
     }
+    false
+}
+
+/// `(ppid, command)` for `pid` from a single `ps`, or `None` if it's gone.
+fn pid_parent_command(pid: u32) -> Option<(u32, String)> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let (ppid, cmd) = s.trim().split_once(char::is_whitespace)?;
+    Some((ppid.trim().parse().ok()?, cmd.trim().to_string()))
+}
+
+/// Pure: whether a command line is the tmux server/client — argv[0]'s basename is
+/// exactly `tmux` (so `/opt/homebrew/bin/tmux` and `tmux attach` match), or the
+/// Linux server form `tmux: server`. Excludes lookalikes (`tmuxinator`, a
+/// `vim tmux.conf`).
+fn is_tmux_cmd(cmd: &str) -> bool {
+    let exe = cmd.split_whitespace().next().unwrap_or("");
+    let base = exe.rsplit('/').next().unwrap_or(exe);
+    base == "tmux" || base == "tmux:"
 }
 
 /// Write per-pane state so the daemon can compose the tmux surfaces from
@@ -692,43 +724,25 @@ mod tests {
     }
 
     #[test]
-    fn tmux_pane_requires_both_vars() {
-        // Real tmux pane: TERM_PROGRAM is `tmux`.
-        assert_eq!(
-            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("tmux")).as_deref(),
-            Some("%3")
-        );
-        // Missing either var -> not in tmux.
-        assert_eq!(tmux_pane(None, Some("%3"), Some("tmux")), None);
-        assert_eq!(tmux_pane(Some("/tmp/sock,1,0"), None, Some("tmux")), None);
-        assert_eq!(tmux_pane(Some(""), Some("%3"), Some("tmux")), None);
+    fn is_tmux_cmd_matches_server_and_client_forms() {
+        // Bare invocation, absolute path, client attach — all the tmux server or
+        // client, which a real pane descends from.
+        assert!(is_tmux_cmd("tmux"));
+        assert!(is_tmux_cmd("/opt/homebrew/bin/tmux"));
+        assert!(is_tmux_cmd("/usr/bin/tmux new-session -s work"));
+        assert!(is_tmux_cmd("tmux attach -t 0"));
+        // Linux server form.
+        assert!(is_tmux_cmd("tmux: server (default)"));
     }
 
     #[test]
-    fn tmux_pane_rejects_stale_tmux_in_gui_terminal() {
-        // A GUI terminal launched from a tmux context inherits a stale $TMUX,
-        // but reports its own TERM_PROGRAM -> not a real tmux pane.
-        assert_eq!(
-            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("Apple_Terminal")),
-            None
-        );
-        assert_eq!(
-            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("iTerm.app")),
-            None
-        );
-        assert_eq!(
-            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("ghostty")),
-            None
-        );
-        // Absent TERM_PROGRAM (very old tmux) stays trusted.
-        assert_eq!(
-            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), None).as_deref(),
-            Some("%3")
-        );
-        assert_eq!(
-            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("")).as_deref(),
-            Some("%3")
-        );
+    fn is_tmux_cmd_rejects_lookalikes() {
+        assert!(!is_tmux_cmd("tmuxinator start work"));
+        assert!(!is_tmux_cmd("/usr/bin/tmuxp load foo"));
+        assert!(!is_tmux_cmd("vim tmux.conf"));
+        assert!(!is_tmux_cmd("-zsh"));
+        assert!(!is_tmux_cmd("claude"));
+        assert!(!is_tmux_cmd(""));
     }
 
     #[test]
