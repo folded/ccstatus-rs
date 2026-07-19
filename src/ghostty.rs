@@ -1,24 +1,28 @@
-//! Ghostty backend: detection, surface identity, and the polling daemon.
+//! Direct-terminal backend: detection, surface identity, and the polling
+//! daemon. Drives a Claude running *directly* in a GUI terminal emulator
+//! (Ghostty, iTerm2, Terminal.app) — no tmux — where the tmux backend's
+//! per-session control-mode handler doesn't apply.
 //!
-//! A Claude running directly in Ghostty (no tmux) has no tmux pane id to key
-//! its surface on. The addressing handle is instead the **pty path** the
-//! emulator allocated for the session — the role tmux's `%N` pane id plays
-//! everywhere else. It's resolved from the *Claude* pid, not from the
-//! statusline process: Claude Code spawns the statusline detached with no
-//! controlling tty, so the statusline can't read its own — but the interactive
-//! Claude process's controlling tty *is* the Ghostty pty (see
-//! [`crate::util::pid_tty`]).
+//! Such a Claude has no tmux pane id to key its surface on. The addressing
+//! handle is instead the **pty path** the emulator allocated for the session —
+//! the role tmux's `%N` pane id plays everywhere else. It's resolved from the
+//! *Claude* pid, not from the statusline process: Claude Code spawns the
+//! statusline detached with no controlling tty, so the statusline can't read
+//! its own — but the interactive Claude process's controlling tty *is* the
+//! emulator pty (see [`crate::util::pid_tty`]).
 //!
-//! Unlike tmux (a per-session control-mode handler driven by focus events),
-//! Ghostty has no session concept and no event stream, so the backend is a
-//! **single polling daemon**: it enumerates the registered surfaces every tick
-//! and drives two per-surface indicators from plain pty escapes —
+//! None of these emulators offer tmux's per-session event stream, so the
+//! backend is a **single polling daemon**: it enumerates the registered
+//! surfaces every tick and drives two per-surface indicators —
 //!
-//! - **tab title** (OSC 2) carrying the same activity flag the tmux backend
-//!   puts on the window name (see [`crate::config::WindowFlag`]); titles are
-//!   last-writer-wins, so it's re-asserted every tick;
-//! - a **desktop notification** (OSC 777), edge-triggered on an unviewed
-//!   completion when `windowFlag.notify` is set.
+//! - **tab title** (OSC 2, a plain pty escape honored by all three) carrying
+//!   the same activity flag the tmux backend puts on the window name (see
+//!   [`crate::config::WindowFlag`]); titles are last-writer-wins, so it's
+//!   re-asserted every tick;
+//! - a **desktop notification**, edge-triggered on an unviewed completion when
+//!   `windowFlag.notify` is set. The mechanism is per-emulator ([`Emulator`]):
+//!   OSC 777 (Ghostty), OSC 9 (iTerm2), or a native notification (Terminal.app,
+//!   which has no notification escape).
 //!
 //! It deliberately does *not* drive the progress bar (OSC 9;4): Claude Code
 //! emits that natively (`terminalProgressBarEnabled`) and in real time, so a
@@ -62,25 +66,18 @@ const POLL_IDLE: Duration = Duration::from_secs(3);
 /// Grace after the last surface goes before the daemon exits.
 const IDLE_EXIT_AFTER: Duration = Duration::from_secs(5);
 
-/// Pure: whether `term_program` names Ghostty. Ghostty sets
-/// `TERM_PROGRAM=ghostty`; inside tmux `TERM_PROGRAM` is `tmux` instead, so a
-/// tmux-hosted Ghostty correctly reads as *not* Ghostty here (and is driven by
-/// the tmux backend). Split from the env read for testing.
-pub fn is_ghostty(term_program: Option<&str>) -> bool {
-    term_program == Some("ghostty")
-}
-
-/// Whether this process is hosted directly by Ghostty (cheap env check, no
-/// process-tree walk). Gate the pid resolution behind this so non-Ghostty
-/// terminals don't pay for it.
+/// Whether this process is hosted directly by a supported terminal emulator
+/// (cheap env check, no process-tree walk). Gate the pid resolution behind this
+/// so unrecognized terminals — and tmux, whose `TERM_PROGRAM` is `tmux` and is
+/// driven by the tmux backend — don't pay for it.
 pub fn is_active() -> bool {
-    is_ghostty(env::var("TERM_PROGRAM").ok().as_deref())
+    Emulator::from_term_program(env::var("TERM_PROGRAM").ok().as_deref()).is_some()
 }
 
-/// `Some(pty_path)` when Claude is running directly in Ghostty: the surface id
-/// (the emulator's pty, resolved from `claude_pid`). `None` outside Ghostty, or
-/// when the pty can't be resolved (no controlling terminal). The caller passes
-/// the already-resolved interactive-Claude pid.
+/// `Some(pty_path)` when Claude is running directly in a supported emulator: the
+/// surface id (the emulator's pty, resolved from `claude_pid`). `None` outside
+/// one, or when the pty can't be resolved (no controlling terminal). The caller
+/// passes the already-resolved interactive-Claude pid.
 pub fn active_surface(claude_pid: u32) -> Option<String> {
     if !is_active() {
         return None;
@@ -171,10 +168,11 @@ pub fn osc9_notify(message: &str) -> String {
     format!("\x1b]9;{clean}\x07")
 }
 
-/// Registrar side (runs in the statusline process): record this Ghostty surface
-/// so the daemon can find it, and make sure the daemon is running. No-op unless
-/// we're in Ghostty and the window flag is enabled (the only surface this phase
-/// drives). `claude_pid` is the already-resolved interactive-Claude pid.
+/// Registrar side (runs in the statusline process): record this direct-terminal
+/// surface so the daemon can find it, and make sure the daemon is running. No-op
+/// unless we're in a supported emulator and the window flag is enabled (the only
+/// surface this phase drives). `claude_pid` is the already-resolved
+/// interactive-Claude pid.
 pub fn register(input: &Value, claude_pid: u32) {
     let Some(session_id) = resolve_session_id(input) else {
         return;
@@ -694,15 +692,6 @@ fn write_pty(pty: &str, data: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_ghostty_only() {
-        assert!(is_ghostty(Some("ghostty")));
-        assert!(!is_ghostty(Some("tmux"))); // ghostty-in-tmux is driven by tmux
-        assert!(!is_ghostty(Some("iTerm.app")));
-        assert!(!is_ghostty(Some("Apple_Terminal")));
-        assert!(!is_ghostty(None));
-    }
 
     #[test]
     fn osc_title_wraps_and_strips_control_chars() {

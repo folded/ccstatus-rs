@@ -121,9 +121,9 @@ fn main() -> ExitCode {
         ipc::notify_register(&server_id, &tmux_session, pane_id);
     }
 
-    // Outside tmux, register a Ghostty surface (the pty resolved from the Claude
-    // pid) so the Ghostty daemon can stamp its tab title. Gated on the cheap env
-    // check so non-Ghostty terminals don't pay for the pid resolution.
+    // Outside tmux, register a direct-terminal surface (the pty resolved from
+    // the Claude pid) so the daemon can stamp its tab title. Gated on the cheap
+    // env check so unrecognized terminals don't pay for the pid resolution.
     if pane_id.is_none() && ghostty::is_active() {
         ghostty::register(&input, resolve_claude_pid());
     }
