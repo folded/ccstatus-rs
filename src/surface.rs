@@ -99,9 +99,8 @@ enum Emulator {
 }
 
 /// How the daemon identifies the surface the user is currently looking at, per
-/// emulator. iTerm2/Terminal expose the focused tab's tty to scripting, so they
-/// match the surface directly; Ghostty exposes no tty, so it falls back to the
-/// title we stamped, corroborated by cwd.
+/// emulator. Both are stable handles independent of the tab title, so the probe
+/// works even when Claude Code owns the title.
 ///
 /// `allow(dead_code)`: the variants are constructed only by the macOS focus
 /// probe, so both read as unused when compiling for other platforms.
@@ -110,9 +109,10 @@ enum FocusKey {
     /// iTerm2 / Terminal.app: the focused tab's controlling tty, matched exactly
     /// against the surface `pane_tty` (precise — no same-dir conflation).
     Tty(String),
-    /// Ghostty: (tab title, working directory) — the title we stamped plus the
-    /// session cwd, since Ghostty's scripting exposes no per-terminal tty.
-    TitleCwd { name: String, cwd: String },
+    /// Ghostty: the focused terminal's scripting `id`, matched against the id we
+    /// learned for each surface via the one-shot title handshake (Ghostty exposes
+    /// no tty, but its ids are stable and title-independent).
+    GhosttyId(String),
 }
 
 impl Emulator {
@@ -321,6 +321,17 @@ struct Daemon {
     /// Whether we've already logged the "Claude Code owns the title" hint (once
     /// per daemon life, so the log isn't spammed each tick).
     title_hinted: bool,
+    /// Ghostty surface pty -> its scripting terminal `id`, learned once per
+    /// surface via the title handshake. Lets the view probe match the focused
+    /// Ghostty terminal by a stable, title-independent handle (Ghostty exposes no
+    /// tty), so it works even when Claude Code owns the visible title.
+    ghostty_ids: HashMap<String, String>,
+    /// Ghostty ptys whose handshake has failed, so the "could not map" note is
+    /// logged once each rather than every retry tick.
+    ghostty_missed: HashSet<String>,
+    /// Monotonic counter making each handshake sentinel unique (no wall clock /
+    /// RNG available in a way that survives resume; a counter suffices).
+    handshake_seq: u64,
 }
 
 impl Daemon {
@@ -334,6 +345,9 @@ impl Daemon {
             git: HashMap::new(),
             last_heavy: None,
             title_hinted: false,
+            ghostty_ids: HashMap::new(),
+            ghostty_missed: HashSet::new(),
+            handshake_seq: 0,
         }
     }
 
@@ -364,11 +378,16 @@ impl Daemon {
         for (id, ps) in &states {
             if !pid_alive(ps.claude_pid) {
                 state::remove_pane(SURFACE_SERVER_ID, id);
+                self.ghostty_ids.remove(&ps.pane_tty);
+                self.ghostty_missed.remove(&ps.pane_tty);
                 self.log
                     .write(&format!("surface {} pruned (Claude exited)", ps.pane_tty));
                 continue; // its pty is closing anyway; nothing to restore
             }
-            if live.insert(id.clone()) && !self.applied.contains_key(id) {
+            // First sight of this surface (tracked via `prev_attn`, which is
+            // written for every live surface at the end of the loop — unlike
+            // `applied`, which is only populated when we actually stamp a title).
+            if live.insert(id.clone()) && !self.prev_attn.contains_key(id) {
                 self.log.write(&format!(
                     "surface {} registered (session {})",
                     ps.pane_tty, ps.session_id
@@ -376,6 +395,34 @@ impl Daemon {
             }
 
             let sess = state::read_session(&ps.session_id).unwrap_or_default();
+
+            // Learn this Ghostty surface's terminal id once (stable, cached), via
+            // the title handshake — the view probe then matches the focused
+            // terminal by id, independent of who owns the visible title.
+            if matches!(
+                Emulator::from_term_program(sess.term_program.as_deref()),
+                Some(Emulator::Ghostty)
+            ) && !self.ghostty_ids.contains_key(&ps.pane_tty)
+            {
+                self.handshake_seq += 1;
+                if let Some(gid) = ghostty_id_for_pty(&ps.pane_tty, self.handshake_seq) {
+                    self.ghostty_missed.remove(&ps.pane_tty);
+                    self.log.write(&format!(
+                        "mapped surface {} -> ghostty {}",
+                        ps.pane_tty, gid
+                    ));
+                    self.ghostty_ids.insert(ps.pane_tty.clone(), gid);
+                } else if self.ghostty_missed.insert(ps.pane_tty.clone()) {
+                    // Log the miss once per surface (not every retry): usually
+                    // Ghostty isn't scriptable yet or the Automation grant is
+                    // missing. We keep retrying quietly on later ticks.
+                    self.log.write(&format!(
+                        "could not map ghostty surface {} (Automation not granted, or Ghostty not scriptable?)",
+                        ps.pane_tty
+                    ));
+                }
+            }
+
             let activity = crate::flag::activity(&sess, ps.claude_pid, &self.signals, now);
             let git = sess
                 .cwd
@@ -438,6 +485,9 @@ impl Daemon {
         // Forget notification edge-state for gone surfaces, so a returning
         // session re-notifies rather than being suppressed by a stale `true`.
         self.prev_attn.retain(|id, _| live.contains(id));
+        // Drop cached ids for gone surfaces (a returning pty re-handshakes).
+        self.ghostty_ids.retain(|pty, _| live.contains(pty));
+        self.ghostty_missed.retain(|pty| live.contains(pty));
 
         live
     }
@@ -504,24 +554,23 @@ impl Daemon {
 
     /// The registered surface a focus key points at, restricted to surfaces of
     /// emulator `e` (so one emulator's key can't match another's). `Tty` is an
-    /// exact `pane_tty` match; `TitleCwd` matches the title we stamped plus the
-    /// session cwd.
+    /// exact `pane_tty` match; `GhosttyId` matches the id we learned for the
+    /// surface via the handshake.
     fn match_surface<'a>(
         &self,
         states: &'a [(String, PaneState)],
         e: Emulator,
         key: &FocusKey,
     ) -> Option<&'a PaneState> {
-        states.iter().find_map(|(id, ps)| {
+        states.iter().find_map(|(_, ps)| {
             let sess = state::read_session(&ps.session_id).unwrap_or_default();
             if Emulator::from_term_program(sess.term_program.as_deref()) != Some(e) {
                 return None;
             }
             let hit = match key {
                 FocusKey::Tty(tty) => &ps.pane_tty == tty,
-                FocusKey::TitleCwd { name, cwd } => {
-                    self.applied.get(id).map(|(_, t)| t.as_str()) == Some(name.as_str())
-                        && sess.cwd.as_deref() == Some(cwd.as_str())
+                FocusKey::GhosttyId(id) => {
+                    self.ghostty_ids.get(&ps.pane_tty).map(String::as_str) == Some(id.as_str())
                 }
             };
             hit.then_some(ps)
@@ -617,19 +666,13 @@ impl Emulator {
     /// / no window). Needs the one-time Automation permission.
     fn focused_surface(self) -> Option<FocusKey> {
         match self {
-            Self::Ghostty => {
-                let script = r#"tell application "Ghostty"
+            Self::Ghostty => run_osascript_line(
+                r#"tell application "Ghostty"
   if not frontmost then return ""
-  set t to focused terminal of selected tab of front window
-  return (name of t) & linefeed & (working directory of t)
-end tell"#;
-                let s = run_osascript_line(script)?;
-                let (name, cwd) = s.split_once('\n')?;
-                Some(FocusKey::TitleCwd {
-                    name: name.to_string(),
-                    cwd: cwd.to_string(),
-                })
-            }
+  return id of focused terminal of selected tab of front window
+end tell"#,
+            )
+            .map(FocusKey::GhosttyId),
             Self::ITerm2 => run_osascript_line(
                 r#"tell application "iTerm2"
   if not frontmost then return ""
@@ -663,6 +706,65 @@ fn run_osascript_line(script: &str) -> Option<String> {
     let s = String::from_utf8_lossy(&out.stdout);
     let s = s.trim_end_matches('\n');
     (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Every Ghostty terminal as `(id, name)`. The `id` is a stable,
+/// title-independent scripting handle; `name` is the current tab title (used
+/// only to spot our sentinel during the handshake).
+#[cfg(target_os = "macos")]
+fn ghostty_terminals() -> Vec<(String, String)> {
+    let script = r#"tell application "Ghostty"
+  set out to ""
+  repeat with w in windows
+    repeat with t in terminals of w
+      set out to out & (id of t) & tab & (name of t) & linefeed
+    end repeat
+  end repeat
+  return out
+end tell"#;
+    let Ok(out) = Command::new("osascript").arg("-e").arg(script).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(id, name)| (id.to_string(), name.to_string()))
+        .collect()
+}
+
+/// Learn the Ghostty scripting `id` of the terminal on `pty` via a one-shot title
+/// handshake: snapshot the terminals, plant a unique sentinel title through the
+/// pty, find the terminal that now carries it, then restore its prior title.
+/// `None` when Ghostty isn't scriptable or the sentinel was clobbered mid-window
+/// by a concurrent title write — the caller just retries next tick. Because the
+/// id is stable and title-independent, this runs once per surface.
+#[cfg(target_os = "macos")]
+fn ghostty_id_for_pty(pty: &str, nonce: u64) -> Option<String> {
+    let before = ghostty_terminals();
+    if before.is_empty() {
+        return None;
+    }
+    let sentinel = format!("ccstatus-map-{nonce}");
+    write_pty(pty, &osc_title(&sentinel));
+    thread::sleep(Duration::from_millis(80));
+    let id = ghostty_terminals()
+        .into_iter()
+        .find(|(_, name)| *name == sentinel)
+        .map(|(id, _)| id)?;
+    // Hand the title back: restore what the terminal showed before we borrowed
+    // it. (In owned mode the daemon re-stamps the flag next tick anyway.)
+    if let Some((_, old)) = before.iter().find(|(i, _)| *i == id) {
+        write_pty(pty, &osc_title(old));
+    }
+    Some(id)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ghostty_id_for_pty(_pty: &str, _nonce: u64) -> Option<String> {
+    None
 }
 
 /// Fire a native macOS notification — Terminal.app has no notification escape,
