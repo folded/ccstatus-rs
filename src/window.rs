@@ -47,11 +47,16 @@ pub enum WindowTarget {
     /// the emulator) to its window via the jump command at focus time.
     LinuxWindow { claude_pid: u32 },
     /// A Ghostty terminal (macOS), focused via Ghostty's AppleScript `focus`
-    /// command. Matched by the tab title we set (`title`, the activity flag —
-    /// distinct from a plain shell tab in the same dir) and corroborated by
-    /// working directory; falls back to the first terminal in `cwd` when the
-    /// title doesn't match (e.g. the flag changed since the fleet was read).
-    Ghostty { cwd: String, title: Option<String> },
+    /// command. Prefer the scripting `id` the daemon learned for the surface
+    /// (`id`, stable and title-independent — precise even when Claude Code owns
+    /// the title); when it's absent (handshake not done yet), fall back to
+    /// matching the tab title we set (`title`, the activity flag) corroborated by
+    /// working directory, then to the first terminal in `cwd`.
+    Ghostty {
+        cwd: String,
+        title: Option<String>,
+        id: Option<String>,
+    },
 }
 
 /// Pure: derive a window target from a session's captured terminal identity.
@@ -66,6 +71,7 @@ pub fn target_for(
     claude_pid: Option<u32>,
     display: Option<&str>,
     cwd: Option<&str>,
+    ghostty_id: Option<&str>,
 ) -> Option<WindowTarget> {
     // A tmux session is jumped by switching its client (`focus_pane`), never by
     // raising a window — its `TERM_PROGRAM` is `tmux` on every platform.
@@ -83,14 +89,16 @@ pub fn target_for(
             Some("Apple_Terminal") => {
                 claude_pid.map(|p| WindowTarget::TerminalApp { claude_pid: p })
             }
-            // Ghostty exposes no per-session handle to its scripting API, so we
-            // address the terminal by working directory (+ the flag title, which
-            // the fleet fills in) at focus time.
+            // Ghostty exposes no per-session env handle, so we address the
+            // terminal by the scripting id the daemon learned (preferred) or, as
+            // a fallback, by working directory + the flag title the fleet fills
+            // in, at focus time.
             Some("ghostty") => cwd
                 .filter(|c| !c.is_empty())
                 .map(|c| WindowTarget::Ghostty {
                     cwd: c.to_string(),
                     title: None,
+                    id: ghostty_id.map(str::to_string),
                 }),
             _ => None,
         }
@@ -99,6 +107,7 @@ pub fn target_for(
     {
         let _ = iterm_session_id;
         let _ = cwd;
+        let _ = ghostty_id;
         // No portable per-session window handle on Linux; the jump command maps
         // the pid to its window at focus time. Addressable only with a
         // graphical display (else there's nothing to raise — headless/SSH).
@@ -111,7 +120,14 @@ pub fn target_for(
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (term_program, iterm_session_id, claude_pid, display, cwd);
+        let _ = (
+            term_program,
+            iterm_session_id,
+            claude_pid,
+            display,
+            cwd,
+            ghostty_id,
+        );
         None
     }
 }
@@ -156,10 +172,39 @@ mod macos {
                 Some(tty) => focus_terminal_app(&tty),
                 None => false,
             },
-            WindowTarget::Ghostty { cwd, title } => focus_ghostty(cwd, title.as_deref()),
+            WindowTarget::Ghostty { cwd, title, id } => {
+                // Prefer the exact scripting id the daemon learned (precise even
+                // when Claude Code owns the title); fall back to cwd + flag title.
+                id.as_deref().is_some_and(focus_ghostty_id) || focus_ghostty(cwd, title.as_deref())
+            }
             // Not produced on macOS (see `target_for`).
             WindowTarget::LinuxWindow { .. } => false,
         }
+    }
+
+    /// Focus the Ghostty terminal with this exact scripting `id` and bring
+    /// Ghostty forward. `id` is a Ghostty-issued GUID, safe to splice.
+    fn focus_ghostty_id(id: &str) -> bool {
+        // Only Ghostty's own id alphabet (GUID) — refuse anything that could
+        // break out of the AppleScript literal.
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+        let script = format!(
+            r#"tell application "Ghostty"
+  repeat with w in windows
+    repeat with t in terminals of w
+      if id of t is "{id}" then
+        focus t
+        activate
+        return "1"
+      end if
+    end repeat
+  end repeat
+end tell
+return "0""#
+        );
+        run_osascript(&script)
     }
 
     /// Focus the Ghostty terminal for this surface and bring Ghostty forward,
@@ -571,6 +616,7 @@ mod tests {
             Some(123),
             None,
             None,
+            None,
         );
         assert_eq!(
             t,
@@ -583,26 +629,46 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn target_for_terminal_uses_pid() {
-        let t = target_for(Some("Apple_Terminal"), None, Some(456), None, None);
+        let t = target_for(Some("Apple_Terminal"), None, Some(456), None, None, None);
         assert_eq!(t, Some(WindowTarget::TerminalApp { claude_pid: 456 }));
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn target_for_ghostty_uses_cwd() {
-        // Ghostty is addressed by working directory (title filled in by the
-        // fleet, so `None` here).
+        // Ghostty falls back to cwd when no id is known yet (title filled in by
+        // the fleet, so `None` here).
         assert_eq!(
-            target_for(Some("ghostty"), None, Some(9), None, Some("/repo/x")),
+            target_for(Some("ghostty"), None, Some(9), None, Some("/repo/x"), None),
             Some(WindowTarget::Ghostty {
                 cwd: "/repo/x".into(),
                 title: None,
+                id: None,
+            })
+        );
+        // With a learned id, it carries through for a precise focus.
+        assert_eq!(
+            target_for(
+                Some("ghostty"),
+                None,
+                Some(9),
+                None,
+                Some("/repo/x"),
+                Some("ABC-123")
+            ),
+            Some(WindowTarget::Ghostty {
+                cwd: "/repo/x".into(),
+                title: None,
+                id: Some("ABC-123".into()),
             })
         );
         // No cwd (or empty) — nothing to match on.
-        assert_eq!(target_for(Some("ghostty"), None, Some(9), None, None), None);
         assert_eq!(
-            target_for(Some("ghostty"), None, Some(9), None, Some("")),
+            target_for(Some("ghostty"), None, Some(9), None, None, None),
+            None
+        );
+        assert_eq!(
+            target_for(Some("ghostty"), None, Some(9), None, Some(""), None),
             None
         );
     }
@@ -611,11 +677,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn target_for_unrecognised_terminal_is_none() {
         // Inside tmux TERM_PROGRAM is "tmux" — not a window we address here.
-        assert_eq!(target_for(Some("tmux"), None, Some(1), None, None), None);
-        assert_eq!(target_for(None, None, Some(1), None, None), None);
+        assert_eq!(
+            target_for(Some("tmux"), None, Some(1), None, None, None),
+            None
+        );
+        assert_eq!(target_for(None, None, Some(1), None, None, None), None);
         // iTerm with no session id can't be addressed.
         assert_eq!(
-            target_for(Some("iTerm.app"), None, Some(1), None, None),
+            target_for(Some("iTerm.app"), None, Some(1), None, None, None),
             None
         );
     }
@@ -625,7 +694,7 @@ mod tests {
     fn target_for_linux_needs_a_display() {
         // A non-tmux Claude with a pid and a display is window-jumpable.
         assert_eq!(
-            target_for(None, None, Some(42), Some(":0"), None),
+            target_for(None, None, Some(42), Some(":0"), None, None),
             Some(WindowTarget::LinuxWindow { claude_pid: 42 })
         );
         // Wayland display works too; TERM_PROGRAM is irrelevant on Linux (a
@@ -636,16 +705,17 @@ mod tests {
                 None,
                 Some(7),
                 Some("wayland-1"),
-                Some("/repo/x")
+                Some("/repo/x"),
+                None
             ),
             Some(WindowTarget::LinuxWindow { claude_pid: 7 })
         );
         // No display (headless/SSH), no pid, empty display, or tmux -> none.
-        assert_eq!(target_for(None, None, Some(42), None, None), None);
-        assert_eq!(target_for(None, None, Some(42), Some(""), None), None);
-        assert_eq!(target_for(None, None, None, Some(":0"), None), None);
+        assert_eq!(target_for(None, None, Some(42), None, None, None), None);
+        assert_eq!(target_for(None, None, Some(42), Some(""), None, None), None);
+        assert_eq!(target_for(None, None, None, Some(":0"), None, None), None);
         assert_eq!(
-            target_for(Some("tmux"), None, Some(42), Some(":0"), None),
+            target_for(Some("tmux"), None, Some(42), Some(":0"), None, None),
             None
         );
     }

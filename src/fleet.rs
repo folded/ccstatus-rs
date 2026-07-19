@@ -164,6 +164,7 @@ pub fn build_views(
                         s.claude_pid,
                         s.display.as_deref(),
                         s.cwd.as_deref(),
+                        s.ghostty_id.as_deref(),
                     )
                 })
                 .flatten();
@@ -284,7 +285,7 @@ pub fn collect() -> Vec<SessionView> {
 fn fill_ghostty_titles(views: &mut [SessionView]) {
     let flag = crate::config::WindowFlag::load();
     for v in views.iter_mut() {
-        if let Some(WindowTarget::Ghostty { cwd, title }) = &mut v.window {
+        if let Some(WindowTarget::Ghostty { cwd, title, .. }) = &mut v.window {
             let git = crate::git::status(cwd);
             *title = Some(flag.render(v.activity, v.attention, git.as_ref(), Some(cwd)));
         }
@@ -429,6 +430,7 @@ mod tests {
             iterm_session_id: None,
             display: None,
             cc_title_disabled: false,
+            ghostty_id: None,
         }
     }
 
@@ -473,6 +475,7 @@ mod tests {
             iterm_session_id: None,
             display: None,
             cc_title_disabled: false,
+            ghostty_id: None,
         }
     }
 

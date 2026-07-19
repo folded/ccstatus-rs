@@ -411,6 +411,15 @@ impl Daemon {
                         "mapped surface {} -> ghostty {}",
                         ps.pane_tty, gid
                     ));
+                    // Persist the id on the session so a window jump (a separate
+                    // process) can address the terminal directly, and it survives
+                    // a daemon restart.
+                    if let Some(mut s) = state::read_session(&ps.session_id)
+                        && s.ghostty_id.as_deref() != Some(gid.as_str())
+                    {
+                        s.ghostty_id = Some(gid.clone());
+                        let _ = state::write_session(&ps.session_id, &s);
+                    }
                     self.ghostty_ids.insert(ps.pane_tty.clone(), gid);
                 } else if self.ghostty_missed.insert(ps.pane_tty.clone()) {
                     // Log the miss once per surface (not every retry): usually

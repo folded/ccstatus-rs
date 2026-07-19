@@ -102,6 +102,12 @@ pub struct SessionState {
     /// when it isn't, Claude Code owns the title and the daemon stays out of it
     /// (it fights nobody — see [`crate::surface`]).
     pub cc_title_disabled: bool,
+    /// The Ghostty scripting terminal `id` for this session's surface, learned
+    /// by the daemon's title handshake and persisted here so a window jump can
+    /// address the terminal directly — the Ghostty analog of
+    /// [`iterm_session_id`](Self::iterm_session_id), and title-independent so the
+    /// jump stays precise even when Claude Code owns the tab title.
+    pub ghostty_id: Option<String>,
 }
 
 pub fn pane_path(server_id: &str, pane_id: &str) -> PathBuf {
@@ -199,6 +205,10 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
             .get("cc_title_disabled")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        ghostty_id: v
+            .get("ghostty_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -219,6 +229,7 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
         "iterm_session_id": s.iterm_session_id,
         "display": s.display,
         "cc_title_disabled": s.cc_title_disabled,
+        "ghostty_id": s.ghostty_id,
     });
     cache::write_atomic(&session_path(session_id), &v.to_string())
 }
