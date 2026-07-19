@@ -428,6 +428,7 @@ mod tests {
             term_program: None,
             iterm_session_id: None,
             display: None,
+            cc_title_disabled: false,
         }
     }
 
@@ -471,6 +472,7 @@ mod tests {
             term_program: None,
             iterm_session_id: None,
             display: None,
+            cc_title_disabled: false,
         }
     }
 

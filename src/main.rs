@@ -218,6 +218,20 @@ fn is_tmux_cmd(cmd: &str) -> bool {
     base == "tmux" || base == "tmux:"
 }
 
+/// Pure: whether an env value reads as "on" — set to something other than the
+/// usual falsey spellings. `None`/empty/`0`/`false`/`no`/`off` are off;
+/// everything else (notably `1`, `true`) is on. Lenient so a user who writes
+/// `true` instead of `1` still gets the intended behaviour.
+fn env_truthy(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) if !s.is_empty() => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        _ => false,
+    }
+}
+
 /// Write per-pane state so the daemon can compose the tmux surfaces from
 /// the rendered elements. Coalesces writes that arrive within 500 ms of an
 /// identical prior write so a streaming statusline call doesn't hammer the
@@ -348,6 +362,13 @@ fn write_session_presence(input: &Value) {
         .ok()
         .filter(|v| !v.is_empty())
         .or(s.iterm_session_id);
+    // Whether Claude Code has ceded the terminal title to us. Constant for the
+    // process; captured every render so a settings change is picked up promptly.
+    s.cc_title_disabled = env_truthy(
+        env::var("CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
+            .ok()
+            .as_deref(),
+    );
     // The graphical display, for a non-tmux window jump on Linux. Wayland
     // takes precedence (a session can carry a stale X11 `DISPLAY` under
     // Wayland). Also constant for the process.
@@ -733,6 +754,17 @@ mod tests {
         assert!(is_tmux_cmd("tmux attach -t 0"));
         // Linux server form.
         assert!(is_tmux_cmd("tmux: server (default)"));
+    }
+
+    #[test]
+    fn env_truthy_reads_on_off_spellings() {
+        for on in ["1", "true", "TRUE", "yes", "on", "enabled"] {
+            assert!(env_truthy(Some(on)), "{on} should be truthy");
+        }
+        for off in ["", "  ", "0", "false", "False", "no", "off"] {
+            assert!(!env_truthy(Some(off)), "{off:?} should be falsey");
+        }
+        assert!(!env_truthy(None));
     }
 
     #[test]

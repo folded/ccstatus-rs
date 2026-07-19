@@ -318,6 +318,9 @@ struct Daemon {
     git: HashMap<String, Option<crate::git::GitState>>,
     /// When the caches were last refreshed (`None` forces a refresh next tick).
     last_heavy: Option<Instant>,
+    /// Whether we've already logged the "Claude Code owns the title" hint (once
+    /// per daemon life, so the log isn't spammed each tick).
+    title_hinted: bool,
 }
 
 impl Daemon {
@@ -330,6 +333,7 @@ impl Daemon {
             signals: crate::flag::PsSignals::capture(&HashSet::new()),
             git: HashMap::new(),
             last_heavy: None,
+            title_hinted: false,
         }
     }
 
@@ -380,10 +384,23 @@ impl Daemon {
                 .and_then(|g| g.as_ref());
             let title = crate::flag::render_label(flag, &sess, activity, git);
 
-            if self.applied.get(id).map(|(_, t)| t.as_str()) != Some(title.as_str()) {
-                write_pty(&ps.pane_tty, &osc_title(&title));
-                self.applied
-                    .insert(id.clone(), (ps.pane_tty.clone(), title));
+            // Stamp the flag into the tab title only when Claude Code has ceded
+            // it (CLAUDE_CODE_DISABLE_TERMINAL_TITLE). Otherwise Claude owns the
+            // title and we don't fight over the same OSC 2 — the flag glyph just
+            // waits on the title being free. (Surface identity for view/jump
+            // doesn't ride on the visible flag; see the id handshake.)
+            if sess.cc_title_disabled {
+                if self.applied.get(id).map(|(_, t)| t.as_str()) != Some(title.as_str()) {
+                    write_pty(&ps.pane_tty, &osc_title(&title));
+                    self.applied
+                        .insert(id.clone(), (ps.pane_tty.clone(), title));
+                }
+            } else if !self.title_hinted {
+                self.log.write(
+                    "windowFlag on but Claude Code owns the tab title; set \
+                     CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 to show the flag there",
+                );
+                self.title_hinted = true;
             }
 
             // Edge-triggered completion notification: fire once when attention

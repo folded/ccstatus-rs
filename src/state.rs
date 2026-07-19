@@ -96,6 +96,12 @@ pub struct SessionState {
     /// Linux this is what makes a non-tmux session window-jumpable: with no
     /// display there is no window to raise (see [`crate::window`]).
     pub display: Option<String>,
+    /// Whether Claude Code's own terminal-title writing is disabled for this
+    /// session (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`). When it is, the tab title
+    /// is free for the direct-terminal daemon to stamp the activity flag into;
+    /// when it isn't, Claude Code owns the title and the daemon stays out of it
+    /// (it fights nobody — see [`crate::surface`]).
+    pub cc_title_disabled: bool,
 }
 
 pub fn pane_path(server_id: &str, pane_id: &str) -> PathBuf {
@@ -189,6 +195,10 @@ pub fn read_session(session_id: &str) -> Option<SessionState> {
             .get("display")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        cc_title_disabled: v
+            .get("cc_title_disabled")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -208,6 +218,7 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
         "term_program": s.term_program,
         "iterm_session_id": s.iterm_session_id,
         "display": s.display,
+        "cc_title_disabled": s.cc_title_disabled,
     });
     cache::write_atomic(&session_path(session_id), &v.to_string())
 }
