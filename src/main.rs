@@ -158,12 +158,32 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Returns `Some(pane_id)` if Claude Code was launched inside tmux. Both
-/// `$TMUX` and `$TMUX_PANE` must be set; either one missing means we render
-/// for stdout as usual.
+/// Returns `Some(pane_id)` if Claude Code was launched inside tmux. Reads the
+/// env; the decision lives in [`tmux_pane`].
 fn active_tmux_pane() -> Option<String> {
-    env::var("TMUX").ok().filter(|s| !s.is_empty())?;
-    env::var("TMUX_PANE").ok().filter(|s| !s.is_empty())
+    tmux_pane(
+        env::var("TMUX").ok().as_deref(),
+        env::var("TMUX_PANE").ok().as_deref(),
+        env::var("TERM_PROGRAM").ok().as_deref(),
+    )
+}
+
+/// Pure: whether we're in a tmux pane, from the three env values. Both `$TMUX`
+/// and `$TMUX_PANE` must be non-empty — but that alone isn't enough, because a
+/// GUI terminal (iTerm2, Terminal.app, …) launched from a tmux context inherits
+/// a *stale* `$TMUX` that its process keeps handing to every window it opens,
+/// long after (or regardless of whether) that tmux is ours. The tell is
+/// `TERM_PROGRAM`: a real tmux pane reports `tmux`, while a GUI terminal reports
+/// its own name — so a non-empty `TERM_PROGRAM` that isn't `tmux` means the
+/// `$TMUX` is stale and we're really on that terminal's stdout. An absent
+/// `TERM_PROGRAM` (very old tmux) is left trusted, preserving prior behaviour.
+fn tmux_pane(tmux: Option<&str>, pane: Option<&str>, term_program: Option<&str>) -> Option<String> {
+    tmux.filter(|s| !s.is_empty())?;
+    let pane = pane.filter(|s| !s.is_empty())?;
+    match term_program {
+        Some(tp) if !tp.is_empty() && tp != "tmux" => None,
+        _ => Some(pane.to_string()),
+    }
 }
 
 /// Write per-pane state so the daemon can compose the tmux surfaces from
@@ -669,6 +689,46 @@ mod tests {
     #[test]
     fn line_left_only_is_unpadded() {
         assert_eq!(compose_claude_line("abc", "", 80).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn tmux_pane_requires_both_vars() {
+        // Real tmux pane: TERM_PROGRAM is `tmux`.
+        assert_eq!(
+            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("tmux")).as_deref(),
+            Some("%3")
+        );
+        // Missing either var -> not in tmux.
+        assert_eq!(tmux_pane(None, Some("%3"), Some("tmux")), None);
+        assert_eq!(tmux_pane(Some("/tmp/sock,1,0"), None, Some("tmux")), None);
+        assert_eq!(tmux_pane(Some(""), Some("%3"), Some("tmux")), None);
+    }
+
+    #[test]
+    fn tmux_pane_rejects_stale_tmux_in_gui_terminal() {
+        // A GUI terminal launched from a tmux context inherits a stale $TMUX,
+        // but reports its own TERM_PROGRAM -> not a real tmux pane.
+        assert_eq!(
+            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("Apple_Terminal")),
+            None
+        );
+        assert_eq!(
+            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("iTerm.app")),
+            None
+        );
+        assert_eq!(
+            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("ghostty")),
+            None
+        );
+        // Absent TERM_PROGRAM (very old tmux) stays trusted.
+        assert_eq!(
+            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), None).as_deref(),
+            Some("%3")
+        );
+        assert_eq!(
+            tmux_pane(Some("/tmp/sock,1,0"), Some("%3"), Some("")).as_deref(),
+            Some("%3")
+        );
     }
 
     #[test]
