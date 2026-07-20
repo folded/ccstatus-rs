@@ -462,7 +462,7 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     out.push((E::Model, format!("{BLUE}{model_name}{RESET}")));
 
     if cfg.cwd && !cwd.is_empty() {
-        let display_dir = cwd.rsplit('/').next().unwrap_or(cwd);
+        let display_dir = util::dir_label(cwd);
         let mut s = format!("{CYAN}{display_dir}{RESET}");
         if cfg.git
             && let Some(g) = git::collect(cwd)

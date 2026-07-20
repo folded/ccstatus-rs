@@ -619,11 +619,8 @@ impl WindowFlag {
         git: Option<&crate::git::GitState>,
         cwd: Option<&str>,
     ) -> String {
-        let dir = cwd
-            .map(|p| p.trim_end_matches('/'))
-            .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
-            .filter(|c| !c.is_empty())
-            .unwrap_or("claude");
+        let dir_owned = cwd.map(crate::util::dir_label).filter(|d| !d.is_empty());
+        let dir = dir_owned.as_deref().unwrap_or("claude");
         let claude = if attention {
             &self.done
         } else {

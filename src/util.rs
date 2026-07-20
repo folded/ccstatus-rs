@@ -230,10 +230,62 @@ pub fn resolve_session_id(input: &Value) -> Option<String> {
     }
 }
 
+/// `(parent_repo, leaf)` when `cwd` is a Claude Code worktree — Claude creates
+/// them at `<repo>/.claude/worktrees/<leaf>[/…]`, so the parent repo is the
+/// directory holding `.claude/worktrees` and `leaf` is the worktree's own name.
+/// `None` for a normal checkout or any path without that marker.
+pub fn worktree_of(cwd: &str) -> Option<(&str, &str)> {
+    const MARKER: &str = "/.claude/worktrees/";
+    let i = cwd.find(MARKER)?;
+    let parent = cwd[..i].rsplit('/').find(|c| !c.is_empty())?;
+    let leaf = cwd[i + MARKER.len()..].split('/').find(|c| !c.is_empty())?;
+    Some((parent, leaf))
+}
+
+/// The last non-empty path component of `cwd` (its basename), or `""`.
+pub fn dir_basename(cwd: &str) -> &str {
+    cwd.trim_end_matches('/')
+        .rsplit('/')
+        .find(|c| !c.is_empty())
+        .unwrap_or("")
+}
+
+/// A readable status-bar label for a working directory: `⎇ <repo>/<leaf>` for a
+/// Claude Code worktree (so it reads as "worktree <leaf> of <repo>", with the
+/// parent no longer lost to the basename), else the plain basename. Empty only
+/// when `cwd` has no path components.
+pub fn dir_label(cwd: &str) -> String {
+    match worktree_of(cwd) {
+        Some((parent, leaf)) => format!("⎇ {parent}/{leaf}"),
+        None => dir_basename(cwd).to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_interactive_claude_cmd as ic;
-    use super::normalize_tty;
+    use super::{dir_label, normalize_tty, worktree_of};
+
+    #[test]
+    fn worktree_label_reads_repo_and_leaf() {
+        let wt = "/Users/tjs/populationgenomics/themis-internal/.claude/worktrees/logo";
+        assert_eq!(worktree_of(wt), Some(("themis-internal", "logo")));
+        assert_eq!(dir_label(wt), "⎇ themis-internal/logo");
+        // A path deeper inside the worktree still resolves to the worktree leaf.
+        let sub = format!("{wt}/web/assets");
+        assert_eq!(worktree_of(&sub), Some(("themis-internal", "logo")));
+        assert_eq!(dir_label(&sub), "⎇ themis-internal/logo");
+    }
+
+    #[test]
+    fn dir_label_falls_back_to_basename_off_worktrees() {
+        assert_eq!(worktree_of("/Users/tjs/repo/ccstatus-rs"), None);
+        assert_eq!(dir_label("/Users/tjs/repo/ccstatus-rs"), "ccstatus-rs");
+        // Trailing slash and root/empty edge cases.
+        assert_eq!(dir_label("/Users/tjs/repo/ccstatus-rs/"), "ccstatus-rs");
+        assert_eq!(dir_label("/"), "");
+        assert_eq!(dir_label(""), "");
+    }
 
     #[test]
     fn normalize_tty_prefixes_and_rejects_no_terminal() {

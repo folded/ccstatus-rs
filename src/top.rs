@@ -373,10 +373,16 @@ fn dir_width(total: u16) -> usize {
 }
 
 fn session_row<'a>(v: &'a SessionView, my_server: Option<&str>, dir_w: usize) -> Row<'a> {
-    let dir = Span::styled(
-        elide_left(v.cwd.as_deref().unwrap_or(""), dir_w),
-        Style::default().fg(C_CYAN),
-    );
+    // A worktree shows its compact `⎇ repo/leaf` label (the parent repo is lost
+    // if we elide the raw `.claude/worktrees/…` path from the head); a normal
+    // checkout keeps its full path, elided from the head to keep the useful tail.
+    let raw = v.cwd.as_deref().unwrap_or("");
+    let dir_text = if crate::util::worktree_of(raw).is_some() {
+        elide_left(&crate::util::dir_label(raw), dir_w)
+    } else {
+        elide_left(raw, dir_w)
+    };
+    let dir = Span::styled(dir_text, Style::default().fg(C_CYAN));
     // Finished while you weren't looking floats up with a flag, the same ⚑ cue
     // as NeedsInput — the word (waiting/idle) says why it's flagged.
     let activity = if v.attention {
