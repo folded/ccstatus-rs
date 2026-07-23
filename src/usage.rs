@@ -103,6 +103,7 @@ pub fn render(input: &Value, config_dir: &str) -> Option<String> {
 fn load_usage(input: &Value, config_dir: &str) -> Option<String> {
     let cfg_hash = oauth::config_dir_hash(config_dir);
     let cache_path = cache::cache_dir().join(format!("statusline-usage-cache-{cfg_hash}.json"));
+    let history_path = cache::cache_dir().join(format!("usage-history-{cfg_hash}.jsonl"));
     let cache_max_age = Duration::from_secs(60);
 
     let mut usage_data = cache::read_if_fresh(&cache_path, cache_max_age);
@@ -114,6 +115,9 @@ fn load_usage(input: &Value, config_dir: &str) -> Option<String> {
             && let Some(body) = api::fetch_usage(&token)
         {
             let _ = cache::write_atomic(&cache_path, &body);
+            // Record a sample for burn-rate modelling (the `@reset` follow-up).
+            // The 60s fetch gate paces this to ~1 sample/min while active.
+            log_usage_sample(&body, &history_path);
             usage_data = Some(body);
         }
         cache::remove_if_empty(&cache_path);
@@ -462,6 +466,66 @@ fn write_builtin_cache(input: &Value, path: &Path, prior: Option<&str>) {
     let _ = cache::write_atomic(path, &v.to_string());
 }
 
+/// Pure: build one usage-history record from a fetched API body + timestamp.
+/// `None` when the body isn't real usage (no `five_hour`). Unlike the display
+/// path, this keeps *every* scoped entry — including 0%/dormant ones — because
+/// the burn-rate model wants the full time series (when a quota was idle is as
+/// informative as when it burned).
+fn build_usage_sample(body: &str, ts: i64) -> Option<Value> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    v.get("five_hour")?;
+    let pct = |k: &str| {
+        v.pointer(&format!("/{k}/utilization"))
+            .and_then(|x| x.as_f64())
+            .map(|n| n.round() as i64)
+    };
+    let reset = |k: &str| {
+        v.pointer(&format!("/{k}/resets_at"))
+            .and_then(|x| x.as_str())
+            .and_then(iso_to_epoch)
+    };
+    let scoped: Vec<Value> = v
+        .get("limits")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let label = e.pointer("/scope/model/display_name")?.as_str()?;
+                    let pct = e.get("percent")?.as_f64()?.round() as i64;
+                    let group = e.get("group").and_then(|x| x.as_str()).unwrap_or_default();
+                    let reset = e
+                        .get("resets_at")
+                        .and_then(|x| x.as_str())
+                        .and_then(iso_to_epoch);
+                    Some(serde_json::json!({
+                        "label": label, "pct": pct, "group": group, "reset": reset,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "ts": ts,
+        "five_h": { "pct": pct("five_hour"), "reset": reset("five_hour") },
+        "seven_d": { "pct": pct("seven_day"), "reset": reset("seven_day") },
+        "scoped": scoped,
+    }))
+}
+
+/// Append one usage sample as a JSON line to the history log. Best-effort — a
+/// failed parse or write is dropped, like the caches. Append-only; at ~1/min
+/// while active it stays small over the weeks the model needs (revisit rotation
+/// if it's ever left running unattended for very long).
+fn log_usage_sample(body: &str, path: &Path) {
+    use std::io::Write;
+    let Some(rec) = build_usage_sample(body, crate::util::now_unix()) else {
+        return;
+    };
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{rec}");
+    }
+}
+
 /// Strip a single leading inline separator (` | `). The segment is built with
 /// a separator before each item; as a standalone element it must not start
 /// with one (surface composition adds separators).
@@ -795,6 +859,40 @@ mod tests {
         let s = format_segment(&json!({}), Some(&usage));
         assert!(!s.contains('X'));
         assert!(!s.contains("6%"));
+    }
+
+    #[test]
+    fn usage_sample_captures_windows_and_all_scoped() {
+        // Real oauth/usage shape, including a dormant 0% scoped entry — the
+        // history keeps it (the display path drops it) so the model can see
+        // when a quota was idle.
+        let body = json!({
+            "five_hour": { "utilization": 26.0, "resets_at": "2026-07-21T12:20:00+00:00" },
+            "seven_day": { "utilization": 58.0, "resets_at": "2026-07-21T16:00:00+00:00" },
+            "limits": [
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 0,
+                  "resets_at": null, "is_active": false,
+                  "scope": { "model": { "display_name": "Fable" } } }
+            ]
+        })
+        .to_string();
+        let rec = build_usage_sample(&body, 1_784_500_000).expect("real usage parses");
+        assert_eq!(rec.pointer("/ts"), Some(&json!(1_784_500_000)));
+        assert_eq!(rec.pointer("/five_h/pct"), Some(&json!(26)));
+        assert_eq!(rec.pointer("/seven_d/pct"), Some(&json!(58)));
+        // resets normalised from ISO to an epoch integer.
+        assert!(
+            rec.pointer("/seven_d/reset")
+                .and_then(|v| v.as_i64())
+                .is_some()
+        );
+        // The 0% scoped entry is retained (with a null reset).
+        assert_eq!(rec.pointer("/scoped/0/label"), Some(&json!("Fable")));
+        assert_eq!(rec.pointer("/scoped/0/pct"), Some(&json!(0)));
+        assert_eq!(rec.pointer("/scoped/0/reset"), Some(&json!(null)));
+
+        // An error/empty body yields no sample.
+        assert!(build_usage_sample(&json!({ "error": "rate limited" }).to_string(), 0).is_none());
     }
 
     #[test]
