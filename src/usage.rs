@@ -245,24 +245,23 @@ fn effective_builtin(input: &Value) -> bool {
 /// Display format for weekly reset times (`7d` and scoped quotas alike).
 const WEEKLY_RESET_FMT: &str = "%a %b %-d, %H:%M";
 
-/// Scoped resets within this of the 7d reset count as "the same window".
-/// The live endpoint reports the same weekly boundary with seconds of
-/// jitter across entries (`20:59:59` vs `21:00:00.47`); genuinely distinct
-/// windows differ by hours or days.
-const RESET_GROUP_TOLERANCE_SECS: i64 = 60;
-
 /// A model-scoped quota from the API's `limits` array — a per-model window
-/// with no key of its own (e.g. Fable's weekly limit, `kind:
-/// "weekly_scoped"` with `scope.model.display_name: "Fable"`).
+/// with no key of its own (e.g. Fable's weekly limit, `kind: "weekly_scoped"`,
+/// `group: "weekly"`, `scope.model.display_name: "Fable"`).
 struct ScopedLimit {
     label: String,
     pct: i64,
-    /// Reset epoch, kept numeric so grouping can tolerate reporting jitter.
+    /// The API's coarse bucket (`session` / `weekly`) — folds the entry into
+    /// the matching account-wide segment.
+    group: String,
+    /// Reset epoch for the standalone render (a scoped quota not folded into a
+    /// shared segment wears its own reset).
     reset: Option<i64>,
 }
 
 /// Parse the model-scoped entries of a usage payload. Unscoped entries
-/// (`session`, `weekly_all`) duplicate the 5h/7d segments and are skipped.
+/// (`session`, `weekly_all`) duplicate the 5h/7d segments and are skipped, as
+/// are dormant quotas with nothing to track (0%).
 fn scoped_limits(data: &str) -> Vec<ScopedLimit> {
     let Ok(v) = serde_json::from_str::<Value>(data) else {
         return Vec::new();
@@ -282,20 +281,36 @@ fn scoped_limits(data: &str) -> Vec<ScopedLimit> {
                 return None;
             }
             let pct = entry.get("percent")?.as_f64()?.round() as i64;
+            // Skip a quota with nothing to track: the live endpoint carries a
+            // dormant per-model entry (e.g. Fable at 0%, `is_active: false`,
+            // `resets_at: null`) that would otherwise render a standing
+            // `Fable 0%`.
+            if pct <= 0 {
+                return None;
+            }
+            let group = entry
+                .get("group")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
             let reset = entry
                 .get("resets_at")
                 .and_then(|x| x.as_str())
                 .and_then(iso_to_epoch);
-            Some(ScopedLimit { label, pct, reset })
+            Some(ScopedLimit {
+                label,
+                pct,
+                group,
+                reset,
+            })
         })
         .collect()
 }
 
 /// Render the weekly cluster: the account-wide `7d` window with any scoped
-/// quotas resetting at (tolerably) the same moment folded into the same
-/// segment — `7d 10%; Fable 7% @Thu Jul 16, 07:00`, one `@` for the group,
-/// wearing the 7d reset — and the remaining scoped quotas standalone with
-/// their own reset.
+/// quotas in the same weekly `group` folded into the segment —
+/// `7d 10% · Fable 7% @Thu Jul 16, 07:00`, one `@` for the group wearing the
+/// 7d reset — and any non-weekly scoped quotas standalone with their own reset.
 fn push_weekly(
     out: &mut String,
     sep: &str,
@@ -303,22 +318,20 @@ fn push_weekly(
     reset_7d: Option<i64>,
     scoped: Vec<ScopedLimit>,
 ) {
-    let grouped = |s: &ScopedLimit| match (reset_7d, s.reset) {
-        (Some(a), Some(b)) => (a - b).abs() <= RESET_GROUP_TOLERANCE_SECS,
-        _ => false,
-    };
     let mut rest = Vec::new();
     if let Some(p) = pct_7d {
         let c = usage_color(p);
         out.push_str(sep);
         push_fmt(out, format_args!("{WHITE}7d{RESET} {c}{p}%{RESET}"));
         for s in scoped {
-            if grouped(&s) {
+            // The API groups each limit; a weekly-scoped one belongs to the 7d
+            // window and shares its reset (no need to compare reset times).
+            if s.group == "weekly" {
                 let c = usage_color(s.pct);
                 push_fmt(
                     out,
                     format_args!(
-                        "{DIM};{RESET} {WHITE}{}{RESET} {c}{}%{RESET}",
+                        " {DIM}·{RESET} {WHITE}{}{RESET} {c}{}%{RESET}",
                         s.label, s.pct
                     ),
                 );
@@ -421,9 +434,11 @@ fn write_builtin_cache(input: &Value, path: &Path, prior: Option<&str>) {
         .and_then(value_as_epoch);
 
     // Carry the API-only sections through the normalisation: the builtin
-    // input has no equivalent of extra-usage or the scoped `limits` array,
-    // and dropping them here would blank those segments until the next
-    // real fetch.
+    // input has no equivalent of extra-usage or the scoped `limits` array, and
+    // dropping them here would blank those segments until the next real fetch.
+    // They only refresh on that ~60s fetch (unlike 5h/7d, which the builtin
+    // input refreshes every render), so a scoped % can lag by up to the cache
+    // TTL — acceptable for a slow-moving weekly quota.
     let prior_v = prior.and_then(|s| serde_json::from_str::<Value>(s).ok());
     let carry = |k: &str| {
         prior_v
@@ -673,10 +688,10 @@ mod tests {
     #[test]
     fn scoped_limits_render_model_percent() {
         // Shape from the live oauth/usage endpoint: unscoped entries mirror
-        // 5h/7d; the scoped one is Fable's own weekly quota.
+        // 5h/7d; the scoped one is Fable's own weekly quota, folded into 7d.
         let usage = json!({
             "five_hour": { "utilization": 31.0 },
-            "seven_day": { "utilization": 9.0 },
+            "seven_day": { "utilization": 9.0, "resets_at": "2026-07-15T21:00:00.473026+00:00" },
             "limits": [
                 { "kind": "session", "group": "session", "percent": 31, "scope": null },
                 { "kind": "weekly_all", "group": "weekly", "percent": 9, "scope": null },
@@ -690,9 +705,9 @@ mod tests {
         let s = format_segment(&json!({}), Some(&usage));
         assert!(s.contains("Fable"));
         assert!(s.contains("6%"));
-        // The scoped window's own reset time renders (the only resets_at in
-        // this payload — fractional-seconds ISO form from the live endpoint).
-        assert!(s.contains('@'));
+        assert!(s.contains('·')); // folded into the 7d segment
+        // One shared weekly reset (5h has none in this payload).
+        assert_eq!(s.matches('@').count(), 1);
         // Unscoped entries don't render twice: exactly one 9% (the 7d).
         assert_eq!(s.matches("9%").count(), 1);
 
@@ -706,50 +721,64 @@ mod tests {
         let s = format_segment(&input, Some(&usage));
         assert!(s.contains("Fable"));
         assert!(s.contains("6%"));
+        assert!(s.contains('·'));
     }
 
     #[test]
-    fn scoped_limit_groups_into_7d_when_displayed_reset_matches() {
-        // API branch: the scoped reset differs from 7d's by a second of
-        // reporting jitter (observed live: 20:59:59 vs 21:00:00.47) ->
-        // same window -> folded into the 7d segment with a single shared
-        // `@` (`7d 9%; Fable 6% @...`).
+    fn scoped_limit_folds_by_group_not_reset_time() {
+        // Folding is by the API's `group`, not reset-time proximity: a weekly
+        // scoped quota folds into 7d even when its own reset differs — one
+        // shared `@` wearing the 7d reset (`7d 9% · Fable 6% @...`).
         let usage = json!({
             "five_hour": { "utilization": 31.0 },
-            "seven_day": { "utilization": 9.0,
-                           "resets_at": "2026-07-15T21:00:00.473026+00:00" },
+            "seven_day": { "utilization": 9.0, "resets_at": "2026-07-15T21:00:00+00:00" },
             "limits": [
-                { "kind": "weekly_scoped", "percent": 6,
-                  "resets_at": "2026-07-15T20:59:59+00:00",
+                // resets_at days off 7d's, yet same `group` -> still folds.
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 6,
+                  "resets_at": "2026-07-20T09:00:00+00:00",
                   "scope": { "model": { "display_name": "Fable" } } }
             ]
         })
         .to_string();
         let s = format_segment(&json!({}), Some(&usage));
         assert!(s.contains("Fable"));
-        assert!(s.contains(';')); // grouped, not a standalone segment
-        assert_eq!(s.matches('@').count(), 1); // one shared weekly reset
+        assert!(s.contains('·')); // folded, not a standalone segment
+        assert_eq!(s.matches('@').count(), 1); // one shared weekly reset (7d's)
 
-        // Builtin branch: stdin epoch matches the scoped ISO reset (same
-        // second) -> grouped there too. 5h contributes the second `@`.
-        let input = json!({
-            "rate_limits": {
-                "five_hour": { "used_percentage": 31.0, "resets_at": 1_700_000_000 },
-                "seven_day": { "used_percentage": 9.0, "resets_at": 1_784_149_200 }
-            }
-        });
+        // A scoped quota with no `group` isn't assumed weekly -> standalone,
+        // wearing its own reset.
         let usage = json!({
+            "five_hour": { "utilization": 31.0 },
+            "seven_day": { "utilization": 9.0, "resets_at": "2026-07-15T21:00:00+00:00" },
             "limits": [
                 { "kind": "weekly_scoped", "percent": 6,
-                  "resets_at": "2026-07-15T21:00:00.473515+00:00",
+                  "resets_at": "2026-07-20T09:00:00+00:00",
                   "scope": { "model": { "display_name": "Fable" } } }
             ]
         })
         .to_string();
-        let s = format_segment(&input, Some(&usage));
+        let s = format_segment(&json!({}), Some(&usage));
         assert!(s.contains("Fable"));
-        assert!(s.contains(';'));
-        assert_eq!(s.matches('@').count(), 2); // 5h + the shared weekly
+        assert!(!s.contains('·')); // no group -> not folded
+        assert_eq!(s.matches('@').count(), 2); // 7d's + Fable's own reset
+    }
+
+    #[test]
+    fn scoped_limit_zero_percent_skipped() {
+        // Live shape: a per-model quota you aren't using is 0% / inactive ->
+        // don't render a standing `Fable 0%`.
+        let usage = json!({
+            "five_hour": { "utilization": 31.0 },
+            "seven_day": { "utilization": 9.0 },
+            "limits": [
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 0,
+                  "resets_at": null, "is_active": false,
+                  "scope": { "model": { "display_name": "Fable" } } }
+            ]
+        })
+        .to_string();
+        let s = format_segment(&json!({}), Some(&usage));
+        assert!(!s.contains("Fable"));
     }
 
     #[test]
