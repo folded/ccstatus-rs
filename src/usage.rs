@@ -98,19 +98,26 @@ pub fn render(input: &Value, config_dir: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// EFFECT: oauth token -> cache freshness -> fetch -> stale fallback ->
+/// EFFECT: fetch-stamp freshness -> oauth token -> fetch -> cache fallback ->
 /// `write_builtin_cache`. The only part that touches network/fs.
 fn load_usage(input: &Value, config_dir: &str) -> Option<String> {
     let cfg_hash = oauth::config_dir_hash(config_dir);
     let cache_path = cache::cache_dir().join(format!("statusline-usage-cache-{cfg_hash}.json"));
     let history_path = cache::cache_dir().join(format!("usage-history-{cfg_hash}.jsonl"));
+    let stamp_path = cache::cache_dir().join(format!("statusline-usage-fetch-{cfg_hash}.stamp"));
     let cache_max_age = Duration::from_secs(60);
 
-    let mut usage_data = cache::read_if_fresh(&cache_path, cache_max_age);
-    if usage_data.is_none() {
+    // The fetch gate lives on a dedicated stamp file, not the cache itself:
+    // `write_builtin_cache` below rewrites the cache on every builtin render,
+    // so gating on the cache's own mtime keeps it perpetually "fresh" and
+    // starves the fetch — the API-only sections (scoped `limits`, extra-usage)
+    // never populate and the usage history logs nothing. Only this fetch path
+    // touches the stamp.
+    let mut usage_data = None;
+    if !cache::is_fresh(&stamp_path, cache_max_age) {
         // Stampede guard: touch first so concurrent renders see a fresh
-        // mtime and skip the fetch, then fetch and write the body.
-        let _ = cache::touch(&cache_path);
+        // stamp and skip the fetch, then fetch and write the body.
+        let _ = cache::touch(&stamp_path);
         if let Some(token) = oauth::get_oauth_token(config_dir)
             && let Some(body) = api::fetch_usage(&token)
         {
@@ -120,10 +127,9 @@ fn load_usage(input: &Value, config_dir: &str) -> Option<String> {
             log_usage_sample(&body, &history_path);
             usage_data = Some(body);
         }
-        cache::remove_if_empty(&cache_path);
-        if usage_data.is_none() {
-            usage_data = cache::read_stale(&cache_path);
-        }
+    }
+    if usage_data.is_none() {
+        usage_data = cache::read_stale(&cache_path);
     }
 
     // When the input carries usable builtin rate-limits, normalise them (plus

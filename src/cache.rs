@@ -17,11 +17,21 @@ pub fn ensure_cache_dir() -> io::Result<()> {
     fs::create_dir_all(cache_dir())
 }
 
+/// Whether `path` exists and its mtime is younger than `max_age`.
+pub fn is_fresh(path: &Path, max_age: Duration) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(mtime)
+        .is_ok_and(|age| age < max_age)
+}
+
 pub fn read_if_fresh(path: &Path, max_age: Duration) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    let age = SystemTime::now().duration_since(mtime).ok()?;
-    if age < max_age {
+    if is_fresh(path, max_age) {
         fs::read_to_string(path).ok()
     } else {
         None
@@ -73,4 +83,29 @@ fn filetime_set(path: &Path, t: SystemTime) -> io::Result<()> {
     let f = fs::OpenOptions::new().write(true).open(path)?;
     f.set_times(ft)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_fresh_tracks_mtime_age() {
+        let dir = std::env::temp_dir().join(format!("ccstatus-test-cache-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("stamp");
+        let _ = fs::remove_file(&path);
+        assert!(
+            !is_fresh(&path, Duration::from_secs(60)),
+            "missing file is not fresh"
+        );
+        touch(&path).unwrap();
+        assert!(is_fresh(&path, Duration::from_secs(60)));
+        filetime_set(&path, SystemTime::now() - Duration::from_secs(120)).unwrap();
+        assert!(
+            !is_fresh(&path, Duration::from_secs(60)),
+            "aged mtime is stale"
+        );
+        let _ = fs::remove_file(&path);
+    }
 }
