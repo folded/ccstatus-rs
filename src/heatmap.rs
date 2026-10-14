@@ -75,7 +75,7 @@ pub fn render(cwd: &str, transcript_path: Option<&str>, term_cols: u16) -> Optio
 
     Some(HeatmapResult {
         main_row: render_row(
-            "main",
+            MAIN_LABEL,
             &data.today_main_weighted,
             &data.today_main_raw,
             &data.main_samples,
@@ -83,7 +83,7 @@ pub fn render(cwd: &str, transcript_path: Option<&str>, term_cols: u16) -> Optio
             n_cells,
         ),
         sub_row: render_row(
-            "sub ",
+            SUB_LABEL,
             &data.today_sub_weighted,
             &data.today_sub_raw,
             &data.sub_samples,
@@ -95,8 +95,14 @@ pub fn render(cwd: &str, transcript_path: Option<&str>, term_cols: u16) -> Optio
     })
 }
 
-/// Visible chars per row outside the cells: label (4) + space (1) + 2 spaces + total (5) + 1 slack.
-const ROW_CHROME: u16 = 13;
+/// Row labels reuse the glyphs Claude Code's agent panel draws for the main
+/// session and its subagents, so the two surfaces share one vocabulary rather
+/// than both saying "main"/"sub" for different things.
+const MAIN_LABEL: &str = "●";
+const SUB_LABEL: &str = "○";
+
+/// Visible chars per row outside the cells: label (1) + space (1) + 2 spaces + total (5) + 1 slack.
+const ROW_CHROME: u16 = 10;
 
 fn pick_cells(term_cols: u16) -> usize {
     let budget = term_cols.saturating_sub(ROW_CHROME) as usize;

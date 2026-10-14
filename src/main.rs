@@ -504,9 +504,7 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
             "{ORANGE}{used_str}/{total_str}{RESET} {DIM}({RESET}{GREEN}{pct_used}%{RESET} {DIM}·{RESET} {WHITE}cache{RESET} {cache_color}{cache_pct}%{RESET}"
         );
         if let Some(p) = sub_pct {
-            s.push_str(&format!(
-                " {DIM}·{RESET} {WHITE}sub{RESET} {WHITE}{p}%{RESET}"
-            ));
+            s.push_str(&format!(" {DIM}·{RESET} {WHITE}○ {p}%{RESET}"));
         }
         s.push_str(&format!("{DIM}){RESET}"));
         out.push((E::Tokens, s));
