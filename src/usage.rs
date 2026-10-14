@@ -119,7 +119,8 @@ fn load_usage(input: &Value, config_dir: &str) -> Option<String> {
         // stamp and skip the fetch, then fetch and write the body.
         let _ = cache::touch(&stamp_path);
         if let Some(token) = oauth::get_oauth_token(config_dir)
-            && let Some(body) = api::fetch_usage(&token)
+            && let Some(body) =
+                api::fetch_usage(&token, input.get("version").and_then(|v| v.as_str()))
         {
             let _ = cache::write_atomic(&cache_path, &body);
             // Record a sample for burn-rate modelling (the `@reset` follow-up).

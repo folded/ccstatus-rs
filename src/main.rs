@@ -715,7 +715,7 @@ fn update_check_line() -> Option<String> {
     let tag = v.get("tag_name").and_then(|t| t.as_str())?;
     if version_gt(tag.trim_start_matches('v'), SELF_VERSION) {
         Some(format!(
-            "\n{DIM}Update available: {tag} → Tell Claude: \"Find my installed status bar and update it\"{RESET}"
+            "\n{DIM}Update available: {tag} → run `cargo install --git https://github.com/folded/ccstatus-rs --locked` then `ccstatus --install`{RESET}"
         ))
     } else {
         None
