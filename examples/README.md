@@ -44,13 +44,13 @@ Inside tmux (status at the bottom):
 and on Claude's own statusline (above the prompt):
 
 ```
-~/demo@main (+3 -1) | effort: high                       v2.1.0
+~/demo@main (+3 -1) | refactor | #7 approved | effort: high                     v2.1.0
 ```
 
 Outside tmux, the `default` layout puts everything on Claude's statusline:
 
 ```
-Opus 4.8 | demo@main (+3 -1) | effort: high              v2.1.0
+Opus 4.8 | fast | demo@main (+3 -1) | refactor | #7 approved | effort: high     v2.1.0
 44k/200k (22% · cache 90%) | 5h 12% | 7d 40%
 <heatmap_main>
 ```
@@ -137,7 +137,10 @@ Use these names in a region's element list.
 | element | shows |
 |---------|-------|
 | `model` | the (shortened) model display name, e.g. `Opus 4.8` |
+| `fast` | `fast` while fast mode is on; nothing otherwise |
 | `cwd` | current directory basename, with git branch and `+added -deleted` counts |
+| `session` | the session name (`--name` / `/rename`, else Claude's AI-generated title), dimmed, capped at 32 characters; nothing until one exists |
+| `pr` | the branch's open PR as `#N` plus its review state (`approved` green, `changes` red, others dim: `pending`, `draft`); a GitLab merge request shows as `!N`; nothing without an open PR |
 | `tokens` | context usage: `used/total (pct% · cache hit% · sub-agent%)` |
 | `effort` | reasoning effort level (`low`/`med`/`high`/`xhigh`/`max`) |
 | `limits` | rate-limit windows (5h / 7d usage % and reset times) |
@@ -150,6 +153,13 @@ Use these names in a region's element list.
 The two heatmaps are full-width: they ignore `left`/`right` and take the whole
 line they're placed on. Everything else is an inline segment that joins its
 region's siblings with ` | `.
+
+`fast`, `session` and `pr` read fields Claude Code puts in the
+statusline payload, and show nothing when the payload lacks them. On the
+`claude` surface `pr` links `#N` to the PR with an OSC 8 hyperlink in terminals
+that render them (iTerm2, Kitty, WezTerm, Ghostty; set `FORCE_HYPERLINK=1` to
+force it on, `0` off). On the `tmux` surface the link is dropped and only the
+text shows.
 
 ## Jumping to a non-tmux session (Linux)
 

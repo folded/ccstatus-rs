@@ -7,10 +7,14 @@
 //! `status-format` for `#[…]` directives and would otherwise print escape
 //! soup. The backend-neutral composition helpers live in [`crate::render`].
 
+use crate::render::osc_end;
+
 /// Translate the (small) subset of ANSI SGR sequences emitted by `color.rs`
 /// and `format.rs` into tmux format directives. Unrecognised sequences are
 /// dropped silently — tmux prints garbage if any leak through, so we'd
-/// rather lose colour than corrupt the status row.
+/// rather lose colour than corrupt the status row. That includes OSC
+/// sequences such as the `pr` element's hyperlink: the link is lost, its
+/// visible text stays.
 ///
 /// Also escapes literal `#` to `##` so tmux doesn't reinterpret content text
 /// as a format-string introducer.
@@ -20,6 +24,10 @@ pub fn ansi_to_tmux(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
+        if let Some(end) = osc_end(bytes, i) {
+            i = end;
+            continue;
+        }
         if b == 0x1b && bytes.get(i + 1) == Some(&b'[') {
             let mut j = i + 2;
             while j < bytes.len() && bytes[j] != b'm' {
@@ -106,6 +114,15 @@ mod tests {
         // tmux strftime-expands status strings, so % must be doubled.
         assert_eq!(ansi_to_tmux("22% cache"), "22%% cache");
         assert_eq!(ansi_to_tmux("\x1b[2m100%\x1b[0m"), "#[dim]100%%#[default]");
+    }
+
+    #[test]
+    fn ansi_drops_osc8_link_but_keeps_its_text() {
+        let linked = "\x1b[2m\x1b]8;;https://example.com/pull/7\x1b\\#7\x1b]8;;\x1b\\\x1b[0m";
+        assert_eq!(ansi_to_tmux(linked), "#[dim]##7#[default]");
+        // BEL-terminated form; a `#` or `%` in the URL must not leak out.
+        let bel = "\x1b]8;;https://example.com/#a%20b\x07x\x1b]8;;\x07";
+        assert_eq!(ansi_to_tmux(bel), "x");
     }
 
     #[test]

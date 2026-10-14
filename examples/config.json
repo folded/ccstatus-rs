@@ -1,11 +1,11 @@
 {
   "tmux": {
     "claude": {
-      "left": "cwd, effort",
+      "left": "cwd, session, pr, effort",
       "right": "version"
     },
     "tmux": {
-      "left": "model",
+      "left": "model, fast",
       "right": "warmth",
       "left.1": "heatmap_main",
       "left.2": "tokens, limits"
@@ -13,7 +13,7 @@
   },
   "default": {
     "claude": {
-      "left": "model, cwd, effort",
+      "left": "model, fast, cwd, session, pr, effort",
       "right": "version",
       "left.1": "tokens, limits",
       "left.2": "heatmap_main"

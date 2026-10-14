@@ -24,8 +24,9 @@ nouns below are specific to ccstatus.
 ## Concepts
 
 - **element** — a named, independently routable piece of the statusline
-  (`model`, `cwd`, `tokens`, `effort`, `limits`, `version`, `updates`,
-  `warmth`, `heatmap_main`, `heatmap_sub`). See `config::Element`.
+  (`model`, `fast`, `cwd`, `session`, `pr`, `tokens`, `effort`, `limits`,
+  `version`, `updates`, `warmth`, `heatmap_main`, `heatmap_sub`). See
+  `config::Element`.
 - **surface** — where an element can land: a dedicated tmux **row**, a
   **base-row edge** (the user's existing status row's `status-left` /
   `status-right`), Claude's own statusline (stdout), or `off`. See

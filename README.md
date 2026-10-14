@@ -93,12 +93,12 @@ bar), then **region** (`left`/`right` with an optional line index, e.g.
 ```json
 {
   "tmux": {
-    "claude": { "left": "cwd, effort", "right": "version" },
-    "tmux":   { "left": "model", "right": "warmth",
+    "claude": { "left": "cwd, session, pr, effort", "right": "version" },
+    "tmux":   { "left": "model, fast", "right": "warmth",
                 "left.1": "heatmap_main", "left.2": "tokens, limits" }
   },
   "default": {
-    "claude": { "left": "model, cwd, effort", "right": "version",
+    "claude": { "left": "model, fast, cwd, session, pr, effort", "right": "version",
                 "left.1": "tokens, limits", "left.2": "heatmap_main" }
   }
 }

@@ -63,19 +63,52 @@ pub fn warmth_segment(session: &SessionState) -> Option<String> {
     Some(format!("{color}{label}{RESET}"))
 }
 
-/// The visible (printed) width of an ANSI string: every `\x1b[…m` SGR run is
-/// skipped, and the remaining glyphs are counted one column each. Shares the
-/// escape-skipping skeleton with [`crate::render_tmux::ansi_to_tmux`]. Correct
-/// for the content this crate emits, which is ASCII plus width-1 symbols (`·`,
-/// `█`, `─`, …); it does not account for wide (CJK) or zero-width characters, so
-/// a directory or branch name containing them would mis-measure by a column or
-/// two.
+/// Wrap `text` in an OSC 8 hyperlink to `url`, terminated with ST (`ESC \`).
+/// Returns `text` unchanged when `url` is empty or holds a control character:
+/// an embedded ESC or BEL would end the sequence early and let the rest of the
+/// string be interpreted as terminal input.
+pub fn hyperlink(url: &str, text: &str) -> String {
+    if url.is_empty() || url.chars().any(char::is_control) {
+        return text.to_string();
+    }
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+/// If an OSC sequence (`ESC ]` …) starts at `bytes[i]`, the index just past its
+/// terminator, which is BEL or ST (`ESC \`). An unterminated sequence runs to
+/// the end of `bytes`, like an unterminated SGR run. `None` when no OSC starts
+/// at `i`. Both terminators are accepted because Claude Code's docs emit BEL
+/// while the standard form is ST.
+pub fn osc_end(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&0x1b) || bytes.get(i + 1) != Some(&b']') {
+        return None;
+    }
+    let mut j = i + 2;
+    while j < bytes.len() {
+        match bytes[j] {
+            0x07 => return Some(j + 1),
+            0x1b if bytes.get(j + 1) == Some(&b'\\') => return Some(j + 2),
+            _ => j += 1,
+        }
+    }
+    Some(bytes.len())
+}
+
+/// The visible (printed) width of an ANSI string: every `\x1b[…m` SGR run and
+/// every OSC sequence (hyperlinks, see [`hyperlink`]) is skipped, and the
+/// remaining glyphs are counted one column each. Shares the escape-skipping
+/// skeleton with [`crate::render_tmux::ansi_to_tmux`]. Correct for the content
+/// this crate emits, which is ASCII plus width-1 symbols (`·`, `█`, `─`, …); it
+/// does not account for wide (CJK) or zero-width characters, so a directory or
+/// branch name containing them would mis-measure by a column or two.
 pub fn visible_width(s: &str) -> usize {
     let bytes = s.as_bytes();
     let mut i = 0;
     let mut w = 0;
     while i < bytes.len() {
-        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+        if let Some(end) = osc_end(bytes, i) {
+            i = end;
+        } else if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
             i += 2;
             while i < bytes.len() && bytes[i] != b'm' {
                 i += 1;
@@ -103,6 +136,37 @@ mod tests {
         assert_eq!(visible_width(""), 0);
         // an unterminated escape contributes nothing.
         assert_eq!(visible_width("ab\x1b[2"), 2);
+    }
+
+    #[test]
+    fn visible_width_skips_osc8_hyperlinks() {
+        // ST-terminated link around "#7": only the two glyphs are visible.
+        let st = "\x1b]8;;https://example.com/pull/7\x1b\\#7\x1b]8;;\x1b\\";
+        assert_eq!(visible_width(st), 2);
+        // BEL-terminated, as in Claude Code's own docs, inside SGR colour.
+        let bel = "\x1b[2m\x1b]8;;https://example.com/pull/7\x07#7\x1b]8;;\x07\x1b[0m";
+        assert_eq!(visible_width(bel), 2);
+        // text on either side of the link still counts.
+        assert_eq!(visible_width(&format!("a {st} b")), 6);
+        // an unterminated OSC swallows the rest, like an unterminated SGR run.
+        assert_eq!(visible_width("ab\x1b]8;;https://example.com"), 2);
+    }
+
+    #[test]
+    fn hyperlink_wraps_text_and_measures_as_text() {
+        let l = hyperlink("https://example.com/pull/7", "#7");
+        assert_eq!(
+            l,
+            "\x1b]8;;https://example.com/pull/7\x1b\\#7\x1b]8;;\x1b\\"
+        );
+        assert_eq!(visible_width(&l), 2);
+    }
+
+    #[test]
+    fn hyperlink_refuses_urls_that_could_end_the_sequence() {
+        assert_eq!(hyperlink("", "#7"), "#7");
+        assert_eq!(hyperlink("https://x\x07evil", "#7"), "#7");
+        assert_eq!(hyperlink("https://x\x1b\\evil", "#7"), "#7");
     }
 
     #[test]

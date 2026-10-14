@@ -9,12 +9,12 @@
 //! ```json
 //! {
 //!   "tmux": {
-//!     "claude": { "left": "cwd, effort", "right": "version" },
-//!     "tmux":   { "left": "model", "right": "warmth",
+//!     "claude": { "left": "cwd, session, pr, effort", "right": "version" },
+//!     "tmux":   { "left": "model, fast", "right": "warmth",
 //!                 "left.1": "heatmap_main", "left.2": "tokens, limits" }
 //!   },
 //!   "default": {
-//!     "claude": { "left": "model, cwd, effort", "right": "version",
+//!     "claude": { "left": "model, fast, cwd, session, pr, effort", "right": "version",
 //!                 "left.1": "tokens, limits", "left.2": "heatmap_main" }
 //!   }
 //! }
@@ -56,6 +56,12 @@ pub enum Element {
     Warmth,
     HeatmapMain,
     HeatmapSub,
+    /// Fast-mode indicator; absent while fast mode is off.
+    Fast,
+    /// Session name (`--name` / `/rename`, else the AI-generated title).
+    Session,
+    /// Open pull request (or GitLab merge request) for the current branch.
+    Pr,
 }
 
 /// How an element occupies a surface.
@@ -68,7 +74,7 @@ pub enum Kind {
 }
 
 impl Element {
-    pub const ALL: [Element; 10] = [
+    pub const ALL: [Element; 13] = [
         Element::Model,
         Element::Cwd,
         Element::Tokens,
@@ -79,6 +85,9 @@ impl Element {
         Element::Warmth,
         Element::HeatmapMain,
         Element::HeatmapSub,
+        Element::Fast,
+        Element::Session,
+        Element::Pr,
     ];
 
     pub fn key(self) -> &'static str {
@@ -93,6 +102,9 @@ impl Element {
             Element::Warmth => "warmth",
             Element::HeatmapMain => "heatmap_main",
             Element::HeatmapSub => "heatmap_sub",
+            Element::Fast => "fast",
+            Element::Session => "session",
+            Element::Pr => "pr",
         }
     }
 
@@ -170,13 +182,32 @@ fn parse_region(key: &str) -> Option<(Align, u8)> {
 /// element to a destination and a render order, and carries the per-surface
 /// background colours.
 pub struct Routing {
-    dests: [Dest; 10],
+    dests: [Dest; Element::ALL.len()],
     /// Render order within a region (lower = earlier), from the config list
     /// order. Elements not placed sort last but are filtered out anyway.
-    order: [u32; 10],
+    order: [u32; Element::ALL.len()],
     claude_bg: Option<(u8, u8, u8)>,
     tmux_bg: Option<(u8, u8, u8)>,
 }
+
+/// Render order within a built-in region. Differs from the enum order, which
+/// only appends: `fast` reads as part of the model, and `session`/`pr` as
+/// part of where you are, so they sit right after `model` and `cwd`.
+const BUILTIN_ORDER: [Element; Element::ALL.len()] = [
+    Element::Model,
+    Element::Fast,
+    Element::Cwd,
+    Element::Session,
+    Element::Pr,
+    Element::Tokens,
+    Element::Effort,
+    Element::Limits,
+    Element::Version,
+    Element::Updates,
+    Element::Warmth,
+    Element::HeatmapMain,
+    Element::HeatmapSub,
+];
 
 impl Default for Routing {
     fn default() -> Self {
@@ -187,8 +218,8 @@ impl Default for Routing {
 impl Routing {
     fn empty() -> Self {
         Routing {
-            dests: [Dest::Off; 10],
-            order: [u32::MAX; 10],
+            dests: [Dest::Off; Element::ALL.len()],
+            order: [u32::MAX; Element::ALL.len()],
             claude_bg: None,
             tmux_bg: None,
         }
@@ -201,12 +232,12 @@ impl Routing {
     /// unless explicitly placed on Claude with `refreshInterval`).
     fn builtin(in_tmux: bool) -> Self {
         let mut r = Routing::empty();
-        let place = |r: &mut Routing, e: Element, d: Dest| {
+        let place = |r: &mut Routing, order: usize, e: Element, d: Dest| {
             r.dests[e as usize] = d;
-            r.order[e as usize] = e as u32;
+            r.order[e as usize] = order as u32;
         };
         if in_tmux {
-            for e in Element::ALL {
+            for (i, e) in BUILTIN_ORDER.into_iter().enumerate() {
                 let d = match e {
                     Element::Updates => Dest::Off,
                     Element::HeatmapSub => Dest::Tmux {
@@ -222,10 +253,10 @@ impl Routing {
                         align: Align::Left,
                     },
                 };
-                place(&mut r, e, d);
+                place(&mut r, i, e, d);
             }
         } else {
-            for e in Element::ALL {
+            for (i, e) in BUILTIN_ORDER.into_iter().enumerate() {
                 let d = match e {
                     Element::Warmth => Dest::Off,
                     Element::HeatmapMain => Dest::Claude {
@@ -241,7 +272,7 @@ impl Routing {
                         align: Align::Left,
                     },
                 };
-                place(&mut r, e, d);
+                place(&mut r, i, e, d);
             }
         }
         r
@@ -789,6 +820,23 @@ mod tests {
         assert_eq!(r.dest(Element::Updates), Dest::Off);
         assert_eq!(r.tmux_lines(), vec![1, 2, 3]);
         assert!(r.any_tmux());
+        // The new elements join the segment row, ordered by the built-in
+        // order rather than the enum's append order.
+        assert_eq!(
+            r.tmux_at(3, Align::Left),
+            vec![
+                Element::Model,
+                Element::Fast,
+                Element::Cwd,
+                Element::Session,
+                Element::Pr,
+                Element::Tokens,
+                Element::Effort,
+                Element::Limits,
+                Element::Version,
+                Element::Warmth,
+            ]
+        );
     }
 
     #[test]
@@ -804,6 +852,45 @@ mod tests {
         assert_eq!(r.dest(Element::Updates), line0()); // shown outside tmux
         assert_eq!(r.dest(Element::Warmth), Dest::Off); // no live surface
         assert!(!r.any_tmux());
+        assert_eq!(
+            r.claude_at(0, Align::Left),
+            vec![
+                Element::Model,
+                Element::Fast,
+                Element::Cwd,
+                Element::Session,
+                Element::Pr,
+                Element::Tokens,
+                Element::Effort,
+                Element::Limits,
+                Element::Version,
+                Element::Updates,
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_order_lists_every_element_once() {
+        for e in Element::ALL {
+            assert_eq!(
+                BUILTIN_ORDER.iter().filter(|&&o| o == e).count(),
+                1,
+                "{e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_element_keys_round_trip() {
+        for (key, e) in [
+            ("fast", Element::Fast),
+            ("session", Element::Session),
+            ("pr", Element::Pr),
+        ] {
+            assert_eq!(Element::from_key(key), Some(e));
+            assert_eq!(e.key(), key);
+            assert_eq!(e.kind(), Kind::Segment);
+        }
     }
 
     fn line0() -> Dest {
@@ -964,6 +1051,11 @@ mod tests {
         assert_eq!(t.dest(Element::Version), c(0, Align::Right));
         assert_eq!(t.dest(Element::HeatmapSub), Dest::Off); // unlisted
         assert_eq!(t.dest(Element::Updates), Dest::Off);
+        assert_eq!(t.dest(Element::Fast), l(0, Align::Left)); // beside model
+        assert_eq!(
+            t.claude_at(0, Align::Left),
+            vec![Element::Cwd, Element::Session, Element::Pr, Element::Effort]
+        );
 
         let d = Routing::from_value(Some(v), false);
         assert_eq!(d.dest(Element::Model), c(0, Align::Left));
@@ -971,6 +1063,17 @@ mod tests {
         assert_eq!(d.dest(Element::Tokens), c(1, Align::Left));
         assert_eq!(d.dest(Element::HeatmapMain), c(2, Align::Left));
         assert_eq!(d.dest(Element::Warmth), Dest::Off); // not listed -> off
+        assert_eq!(
+            d.claude_at(0, Align::Left),
+            vec![
+                Element::Model,
+                Element::Fast,
+                Element::Cwd,
+                Element::Session,
+                Element::Pr,
+                Element::Effort
+            ]
+        );
         assert!(!d.any_tmux());
     }
 }
