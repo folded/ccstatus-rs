@@ -1,9 +1,9 @@
 //! Claude Code hook entry points (`ccstatus --hook <kind>`).
 //!
 //! Hooks read their own JSON payload from stdin (a different schema from
-//! the statusline payload) and update `session/<session_id>.json`. They
-//! must never block Claude: parse failures, missing fields, IO errors all
-//! return success.
+//! the statusline payload) and update (or, on SessionEnd, remove)
+//! `session/<session_id>.json`. They must never block Claude: parse failures,
+//! missing fields, IO errors all return success.
 
 use std::io::Read;
 
@@ -24,6 +24,12 @@ pub enum HookKind {
     /// A tool call finished — Claude is making forward progress, so any pending
     /// "waiting on you" latch is stale.
     PostToolUse,
+    /// Claude is about to show a permission dialog — blocked on the user
+    /// mid-turn. The precise form of the signal `Notification` reports ~6s
+    /// later, and only on clients that type their notifications.
+    PermissionRequest,
+    /// The session ended (exit, `/clear`, or `/resume`): its state is dead.
+    SessionEnd,
 }
 
 pub fn run(kind: HookKind) -> std::process::ExitCode {
@@ -36,6 +42,8 @@ pub fn run(kind: HookKind) -> std::process::ExitCode {
         HookKind::UserPromptSubmit => handle_prompt(&input),
         HookKind::Notification => handle_notification(&input),
         HookKind::PostToolUse => handle_post_tool_use(&input),
+        HookKind::PermissionRequest => handle_permission_request(&input),
+        HookKind::SessionEnd => handle_session_end(&input),
     }
     std::process::ExitCode::SUCCESS
 }
@@ -85,6 +93,42 @@ fn handle_notification(input: &Value) {
     }
     s.last_notify_ts = Some(now_unix());
     let _ = state::write_session(&session_id, &s);
+}
+
+/// Latch the "waiting on you" state the moment Claude is about to ask for a
+/// permission — the same latch as [`handle_notification`], set earlier and
+/// without its guesswork. The event fires only for a pending permission
+/// decision, mid-turn by construction, so there is no idle nudge to filter out
+/// and no [`should_latch`] check. Cleared by the same later signs of progress.
+///
+/// Prints nothing on stdout, deliberately. A PermissionRequest hook grants or
+/// denies only by printing a `hookSpecificOutput.decision` object; with no
+/// output Claude Code treats the hook as having made no decision and shows its
+/// normal permission dialog. The hooks reference states exit 0 with no output
+/// is "no decision" under PreToolUse, and describes the `decision` object as the
+/// only way a PermissionRequest hook allows or denies (exit 2 without one
+/// leaves the flow unchanged). `run` never prints, so this can't answer a
+/// prompt by accident.
+fn handle_permission_request(input: &Value) {
+    let Some(session_id) = resolve_session_id(input) else {
+        return;
+    };
+    let mut s = state::read_session(&session_id).unwrap_or_default();
+    s.last_notify_ts = Some(now_unix());
+    let _ = state::write_session(&session_id, &s);
+}
+
+/// Drop the session's state file so `fleet` needn't wait to notice the pid is
+/// gone. Also fires for `/clear` and `/resume`, where the process lives on under
+/// another session id: the old id's record is stale then too, and would
+/// otherwise outrank the new, not-yet-prompted session in `fleet`'s one-per-pid
+/// collapse. SessionEnd has a 1.5s budget and can't block, so this is a single
+/// unlink.
+fn handle_session_end(input: &Value) {
+    let Some(session_id) = resolve_session_id(input) else {
+        return;
+    };
+    state::remove_session(&session_id);
 }
 
 /// Whether a notification should latch `NeedsInput`: a blocking kind, raised
@@ -150,6 +194,42 @@ mod tests {
         assert!(!is_blocking_notification(Some("auth_success")));
         assert!(!is_blocking_notification(Some("elicitation_complete")));
         assert!(!is_blocking_notification(Some("elicitation_response")));
+    }
+
+    /// A session id unique to this test process, so the handler tests (which
+    /// use the real state directory) neither collide nor leave files behind.
+    fn test_session(tag: &str) -> String {
+        format!("hooks-test-{tag}-{}", std::process::id())
+    }
+
+    #[test]
+    fn permission_request_latches_even_when_idle() {
+        // Turn newer than prompt (idle): `should_latch` would refuse a
+        // Notification here, but a PermissionRequest is unambiguous.
+        let id = test_session("permreq");
+        let idle = state::SessionState {
+            last_prompt_ts: Some(100),
+            last_turn_ts: Some(200),
+            ..Default::default()
+        };
+        state::write_session(&id, &idle).unwrap();
+        handle_permission_request(&serde_json::json!({ "session_id": id }));
+        let latched = state::read_session(&id).unwrap();
+        state::remove_session(&id);
+        assert!(latched.last_notify_ts.is_some());
+        // The turn fields are preserved (read-modify-write, not a fresh record).
+        assert_eq!(latched.last_turn_ts, Some(200));
+    }
+
+    #[test]
+    fn session_end_removes_the_session_file() {
+        let id = test_session("sessend");
+        state::write_session(&id, &state::SessionState::default()).unwrap();
+        assert!(state::session_path(&id).exists());
+        handle_session_end(&serde_json::json!({ "session_id": id }));
+        assert!(!state::session_path(&id).exists());
+        // Already gone (or never written): still fine, no panic.
+        handle_session_end(&serde_json::json!({ "session_id": id }));
     }
 
     #[test]

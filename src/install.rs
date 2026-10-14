@@ -55,19 +55,7 @@ pub fn run() -> Result<(), String> {
         "refreshInterval": 60,
     });
 
-    // Wire the hooks that feed per-session activity in `ccstatus top`: Stop
-    // (turn finished → waiting), UserPromptSubmit (turn started → working),
-    // Notification (blocking prompt → needs input), and PostToolUse (forward
-    // progress → clears the needs-input latch).
-    ensure_hook(&mut settings, "Stop", "stop", exe_str);
-    ensure_hook(
-        &mut settings,
-        "UserPromptSubmit",
-        "user-prompt-submit",
-        exe_str,
-    );
-    ensure_hook(&mut settings, "Notification", "notification", exe_str);
-    ensure_hook(&mut settings, "PostToolUse", "post-tool-use", exe_str);
+    ensure_activity_hooks(&mut settings, exe_str);
 
     let pretty = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("serializing settings: {e}"))?;
@@ -138,6 +126,21 @@ fn on_path(bin: &str) -> bool {
     env::var_os("PATH")
         .map(|path| env::split_paths(&path).any(|dir| dir.join(bin).is_file()))
         .unwrap_or(false)
+}
+
+/// Wire the hooks that feed per-session activity in `ccstatus top`: Stop
+/// (turn finished → waiting), UserPromptSubmit (turn started → working),
+/// PermissionRequest (about to ask for permission → needs input), Notification
+/// (blocking prompt → needs input, for older CLIs without PermissionRequest),
+/// PostToolUse (forward progress → clears the needs-input latch), and SessionEnd
+/// (session over → remove its state).
+fn ensure_activity_hooks(settings: &mut Value, exe_str: &str) {
+    ensure_hook(settings, "Stop", "stop", exe_str);
+    ensure_hook(settings, "UserPromptSubmit", "user-prompt-submit", exe_str);
+    ensure_hook(settings, "Notification", "notification", exe_str);
+    ensure_hook(settings, "PostToolUse", "post-tool-use", exe_str);
+    ensure_hook(settings, "PermissionRequest", "permission-request", exe_str);
+    ensure_hook(settings, "SessionEnd", "session-end", exe_str);
 }
 
 /// Ensure `settings.hooks.<event>` runs `<exe> --hook <kind>`, idempotently:
@@ -250,6 +253,47 @@ mod tests {
                 .unwrap()
                 .contains("Wayland")
         );
+    }
+
+    fn event_commands(settings: &Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+                    .flatten()
+                    .filter_map(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn activity_hooks_cover_every_event_and_are_idempotent() {
+        let events = [
+            ("Stop", "stop"),
+            ("UserPromptSubmit", "user-prompt-submit"),
+            ("Notification", "notification"),
+            ("PostToolUse", "post-tool-use"),
+            ("PermissionRequest", "permission-request"),
+            ("SessionEnd", "session-end"),
+        ];
+        let mut s = json!({});
+        ensure_activity_hooks(&mut s, "/old/ccstatus");
+        ensure_activity_hooks(&mut s, "/new/ccstatus"); // re-run, new path
+        for (event, kind) in events {
+            // Updated in place, not duplicated.
+            assert_eq!(
+                event_commands(&s, event),
+                vec![format!("/new/ccstatus --hook {kind}")],
+                "{event}"
+            );
+        }
     }
 
     #[test]

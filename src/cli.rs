@@ -99,6 +99,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                     Some("user-prompt-submit") => HookKind::UserPromptSubmit,
                     Some("notification") => HookKind::Notification,
                     Some("post-tool-use") => HookKind::PostToolUse,
+                    Some("permission-request") => HookKind::PermissionRequest,
+                    Some("session-end") => HookKind::SessionEnd,
                     Some(other) => {
                         return ParseOutcome::Error(format!("unknown hook kind: {other}"));
                     }
@@ -143,7 +145,8 @@ Options:
   --install         Wire this binary into ~/.claude/settings.json
                     (statusLine + activity hooks) and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop,
-                    user-prompt-submit, notification, post-tool-use)
+                    user-prompt-submit, notification, post-tool-use,
+                    permission-request, session-end)
   --session <id>    Run the per-session control-mode handler for tmux
                     session <id>. Spawned automatically by the registrar;
                     not meant to be run by hand.
@@ -163,3 +166,28 @@ Environment:
 
 CLI flags take precedence over environment variables.
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> ParseOutcome {
+        parse_args(args.iter().map(|a| a.to_string()))
+    }
+
+    #[test]
+    fn parses_every_hook_kind() {
+        assert!(matches!(
+            parse(&["--hook", "permission-request"]),
+            ParseOutcome::Hook(HookKind::PermissionRequest)
+        ));
+        assert!(matches!(
+            parse(&["--hook", "session-end"]),
+            ParseOutcome::Hook(HookKind::SessionEnd)
+        ));
+        assert!(matches!(
+            parse(&["--hook", "no-such-kind"]),
+            ParseOutcome::Error(_)
+        ));
+    }
+}

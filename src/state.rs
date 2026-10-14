@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! pane/<server_id>/<TMUX_PANE>.json    written by registrar mode
-//! session/<session_id>.json            written by hook mode
+//! session/<session_id>.json            written by hook mode; removed on SessionEnd
 //! ```
 //!
 //! `<server_id>` is an 8-char hash of the tmux socket path so pane ids
@@ -59,9 +59,10 @@ pub struct SessionState {
     pub last_prompt_ts: Option<i64>,
     /// Set when Claude raised a *blocking* notification mid-turn (a permission
     /// prompt or an elicitation) and is waiting on the user — see the
-    /// `Notification` hook. A latch: it's `Some` only while the wait is pending,
-    /// cleared by the next sign of forward progress (`PostToolUse`,
-    /// `UserPromptSubmit`, `Stop`). Drives [`crate::fleet::Activity::NeedsInput`].
+    /// `PermissionRequest` and `Notification` hooks. A latch: it's `Some` only
+    /// while the wait is pending, cleared by the next sign of forward progress
+    /// (`PostToolUse`, `UserPromptSubmit`, `Stop`). Drives
+    /// [`crate::fleet::Activity::NeedsInput`].
     pub last_notify_ts: Option<i64>,
     /// When the session's pane was last *viewed* — stamped by the per-session
     /// handler each tick while its tmux pane is focused. Drives the "finished
@@ -236,6 +237,12 @@ pub fn write_session(session_id: &str, s: &SessionState) -> std::io::Result<()> 
 
 pub fn remove_pane(server_id: &str, pane_id: &str) {
     let _ = std::fs::remove_file(pane_path(server_id, pane_id));
+}
+
+/// Delete a session's record (the `SessionEnd` hook). Best-effort: a missing
+/// file is the already-removed case, not an error.
+pub fn remove_session(session_id: &str) {
+    let _ = std::fs::remove_file(session_path(session_id));
 }
 
 /// The pane/surface ids with state under `server_id` (the `.json` basenames in

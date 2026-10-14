@@ -16,11 +16,13 @@ ccstatus --install
 ```
 
 The first command drops a `ccstatus` binary into `~/.cargo/bin/` (make sure
-that's on `PATH`). The second writes `statusLine.command` plus the `Stop` and
-`UserPromptSubmit` hooks into `~/.claude/settings.json` (respecting
+that's on `PATH`). The second writes `statusLine.command` plus the `Stop`,
+`UserPromptSubmit`, `Notification`, `PostToolUse`, `PermissionRequest` and
+`SessionEnd` hooks into `~/.claude/settings.json` (respecting
 `$CLAUDE_CONFIG_DIR`), preserving any other keys already in the file. The hooks
 feed the per-session state that `ccstatus top` and the tmux warmth indicator
-read; they leave any non-`ccstatus` hooks you've configured untouched.
+read (`SessionEnd` removes a finished session's state); they leave any
+non-`ccstatus` hooks you've configured untouched.
 Re-running `ccstatus --install` after an upgrade refreshes the path; it refuses
 to clobber a `statusLine` set to a non-`ccstatus` command.
 

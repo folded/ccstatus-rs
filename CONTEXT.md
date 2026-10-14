@@ -14,8 +14,12 @@ nouns below are specific to ccstatus.
   **session** that hosts Claude. Holds a control-mode connection to that
   session and drives the bar. Spawned on demand by the registrar; exits on
   `%exit` (session killed) or after an idle grace with no Claude panes.
-- **hook** — `ccstatus --hook stop` (`hooks.rs`). Updates per-session
-  **state** (last turn timestamp, model) on Claude's Stop event.
+- **hook** — `ccstatus --hook <kind>` (`hooks.rs`). Updates per-session
+  **state** on Claude's hook events: `Stop` and `UserPromptSubmit` (turn
+  timestamps, model), `PermissionRequest` and `Notification` (set the
+  needs-input latch; `Notification` is the fallback for older CLIs),
+  `PostToolUse` (clears the latch), and `SessionEnd` (removes the session's
+  state file). Prints nothing, so Claude sees no permission decision.
 - **top** — `ccstatus top` (`top.rs`). An interactive aggregate surface over
   **all** live Claude sessions (not one tmux session): reads the **fleet**,
   renders a table, and **jumps** to a selected session. Pull-based — it needs
