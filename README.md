@@ -16,8 +16,9 @@ ccstatus --install
 ```
 
 The first command drops a `ccstatus` binary into `~/.cargo/bin/` (make sure
-that's on `PATH`). The second writes `statusLine.command` plus the `Stop` and
-`UserPromptSubmit` hooks into `~/.claude/settings.json` (respecting
+that's on `PATH`). The second writes `statusLine.command` (with
+`refreshInterval` 60) plus the `Stop`, `UserPromptSubmit`, `Notification` and
+`PostToolUse` hooks into `~/.claude/settings.json` (respecting
 `$CLAUDE_CONFIG_DIR`), preserving any other keys already in the file. The hooks
 feed the per-session state that `ccstatus top` and the tmux warmth indicator
 read; they leave any non-`ccstatus` hooks you've configured untouched.
@@ -46,8 +47,22 @@ To customise which blocks render, edit `statusLine.command` in
 --no-limits       Hide rate-limit and quota info
 --no-cli-version  Hide installed Claude CLI version
 --no-heatmap      Hide the per-day token-usage heatmap rows
+--heatmap         Show the heatmap rows even if STATUSLINE_HEATMAP=false
 --updates         Check for newer ccstatus releases (off by default)
---install         Wire this binary into ~/.claude/settings.json and exit
+--no-updates      Disable update check (default)
+--install         Wire this binary into ~/.claude/settings.json
+                  (statusLine + activity hooks) and exit
+--hook <kind>     Run as a Claude Code hook (kinds: stop,
+                  user-prompt-submit, notification, post-tool-use)
+--session <id>    Run the per-session control-mode handler for tmux
+                  session <id>. Spawned automatically by the registrar;
+                  not meant to be run by hand.
+--surface-daemon  Run the direct-terminal title daemon (stamps tab titles
+                  with the activity flag for Ghostty/iTerm2/Terminal.app).
+                  Spawned automatically; not run by hand.
+--tmux-reset      Restore the global status bar to tmux defaults
+                  (status-format[0] window list, higher slots unset,
+                  status=on). Cleans up after a crashed daemon.
 -h, --help        Show help
 -V, --version     Show version
 ```
@@ -55,9 +70,14 @@ To customise which blocks render, edit `statusLine.command` in
 Subcommands:
 
 ```
-ccstatus top      Interactive table of every live Claude session, with
-                  jump-to-session (Enter). j/k or arrows move, r refreshes,
-                  q quits. "htop for Claude sessions."
+ccstatus top [--lru]  Interactive table of every live Claude session, with
+                      jump-to-session (Enter). j/k or arrows move, r
+                      refreshes, q quits. --lru orders by most-recently-seen
+                      (tab-switcher) instead of by urgency.
+                      "htop for Claude sessions."
+ccstatus log          Follow the backend daemon logs live (tmux handlers and
+                      the direct-terminal daemon), merged and tagged by
+                      source.
 ```
 
 Enter jumps to the selected session: in tmux it switches panes; for a Claude
@@ -68,7 +88,7 @@ iTerm2/Terminal out of the box; Linux X11 via `wmctrl`/`xdotool`, with a
 
 Environment variables (overridden by CLI flags):
 
-- `STATUSLINE_HEATMAP=false` — same as `--no-heatmap`
+- `STATUSLINE_HEATMAP=false` — same as `--no-heatmap` (`--heatmap` overrides it)
 - `STATUSLINE_CHECK_UPDATES=true` — same as `--updates`
 - `CLAUDE_CODE_EFFORT_LEVEL=<level>` — fallback when input JSON omits effort
 
