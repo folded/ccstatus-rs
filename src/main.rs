@@ -378,24 +378,21 @@ fn write_session_presence(input: &Value) {
         .or_else(|| env::var("DISPLAY").ok().filter(|v| !v.is_empty()))
         .or(s.display);
 
-    let usage = input.pointer("/context_window/current_usage");
-    let size = input
-        .pointer("/context_window/context_window_size")
-        .and_then(|v| v.as_u64())
-        .filter(|&n| n > 0)
-        .unwrap_or(200_000);
-    let input_tokens = u64_at(usage, "input_tokens");
-    let cache_create = u64_at(usage, "cache_creation_input_tokens");
-    let cache_read = u64_at(usage, "cache_read_input_tokens");
-    let current = input_tokens + cache_create + cache_read;
-    s.context_pct_used = Some((current * 100 / size).min(100) as u32);
-    let denom = input_tokens + cache_create + cache_read;
-    s.cache_read_pct = Some((cache_read * 100).checked_div(denom).unwrap_or(0) as u32);
+    s.context_pct_used = Some(context_snapshot(input).pct_used);
+    s.cache_read_pct = Some(cache_hit_pct(input));
 
     // The granted cache TTL (5m API key vs 1h subscription) drives how long the
-    // warmth indicator stays warm. It's stable for a session, so detect it once
-    // from the transcript — a tail read — and never again.
-    if s.cache_ttl_secs.is_none()
+    // warmth indicator stays warm. A CLI that sends `prompt_cache` reports it
+    // directly, so use that and skip the transcript. Only a payload without
+    // `prompt_cache` (an older CLI) falls back to reading the transcript tail,
+    // once, since the tier is stable for a session.
+    if let Some(pc) = input.get("prompt_cache").filter(|v| v.is_object()) {
+        s.cache_ttl_secs = pc
+            .get("ttl")
+            .and_then(|v| v.as_str())
+            .and_then(parse_cache_ttl)
+            .or(s.cache_ttl_secs);
+    } else if s.cache_ttl_secs.is_none()
         && let Some(path) = input.get("transcript_path").and_then(|v| v.as_str())
     {
         s.cache_ttl_secs = usage::detect_cache_ttl_secs(path);
@@ -439,21 +436,10 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
         .unwrap_or("Claude");
     let model_name = shorten_model_name(model_name_raw);
 
-    let size = input
-        .pointer("/context_window/context_window_size")
-        .and_then(|v| v.as_u64())
-        .filter(|&n| n > 0)
-        .unwrap_or(200_000);
-
-    let usage = input.pointer("/context_window/current_usage");
-    let input_tokens = u64_at(usage, "input_tokens");
-    let cache_create = u64_at(usage, "cache_creation_input_tokens");
-    let cache_read = u64_at(usage, "cache_read_input_tokens");
-    let current = input_tokens + cache_create + cache_read;
-
-    let used_str = format_tokens(current);
-    let total_str = format_tokens(size);
-    let pct_used = (current * 100 / size).min(100);
+    let ctx = context_snapshot(input);
+    let used_str = format_tokens(ctx.used_tokens);
+    let total_str = format_tokens(ctx.size);
+    let pct_used = ctx.pct_used;
 
     let cwd = input.pointer("/cwd").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -487,10 +473,7 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     };
 
     if cfg.tokens {
-        let cache_pct = {
-            let denom = input_tokens + cache_create + cache_read;
-            (cache_read * 100).checked_div(denom).unwrap_or(0) as i64
-        };
+        let cache_pct = cache_hit_pct(input);
         let cache_color = match cache_pct {
             p if p >= 80 => GREEN,
             p if p >= 50 => YELLOW,
@@ -532,7 +515,11 @@ fn render_elements(input: &Value, cfg: &Config) -> Vec<(config::Element, String)
     }
 
     if cfg.cli_version
-        && let Some(v) = cli_version_cached()
+        && let Some(v) = input
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
     {
         out.push((E::Version, format!("{ORANGE}v{v}{RESET}")));
     }
@@ -658,6 +645,77 @@ fn u64_at(v: Option<&Value>, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Context-window fill as shown in the `tokens` element and recorded in the
+/// session presence.
+struct ContextSnapshot {
+    used_tokens: u64,
+    size: u64,
+    pct_used: u32,
+}
+
+/// Window size assumed when the payload has none (or reports 0).
+const DEFAULT_CONTEXT_SIZE: u64 = 200_000;
+
+/// Input-side tokens of the last API call as `(fresh, cache_create, cache_read)`,
+/// or `None` when `current_usage` is null: Claude Code nulls it before the first
+/// API call and again after `/compact` until the next call.
+fn last_call_tokens(input: &Value) -> Option<(u64, u64, u64)> {
+    let usage = input
+        .pointer("/context_window/current_usage")
+        .filter(|v| v.is_object())?;
+    Some((
+        u64_at(Some(usage), "input_tokens"),
+        u64_at(Some(usage), "cache_creation_input_tokens"),
+        u64_at(Some(usage), "cache_read_input_tokens"),
+    ))
+}
+
+/// Pure: how full the context window is. The percentage is Claude Code's own
+/// `used_percentage` when it sends one (it is the authority and stays correct
+/// when `current_usage` is null); otherwise it is computed from the summed
+/// `current_usage`. The token count is that sum, or — when `current_usage` is
+/// null — back-derived from the percentage, so a render right after `/compact`
+/// shows a sensible `82k/200k` instead of `0/200k`.
+fn context_snapshot(input: &Value) -> ContextSnapshot {
+    let size = input
+        .pointer("/context_window/context_window_size")
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CONTEXT_SIZE);
+    let summed = last_call_tokens(input).map(|(fresh, create, read)| fresh + create + read);
+    let pct_used = input
+        .pointer("/context_window/used_percentage")
+        .and_then(|v| v.as_f64())
+        .map(|p| p.round().clamp(0.0, 100.0) as u32)
+        .unwrap_or_else(|| (summed.unwrap_or(0) * 100 / size).min(100) as u32);
+    let used_tokens = summed.unwrap_or_else(|| u64::from(pct_used) * size / 100);
+    ContextSnapshot {
+        used_tokens,
+        size,
+        pct_used,
+    }
+}
+
+/// Pure: share of the last call's input served from cache (0..=100). This is
+/// deliberately per-call, not the session-wide `prompt_cache.hit_ratio`: a
+/// miss on this turn should drop the number (and its colour) immediately, and
+/// a session average would smooth that away.
+fn cache_hit_pct(input: &Value) -> u32 {
+    let (fresh, create, read) = last_call_tokens(input).unwrap_or_default();
+    (read * 100).checked_div(fresh + create + read).unwrap_or(0) as u32
+}
+
+/// Pure: the payload's `prompt_cache.ttl` string as seconds. Claude Code sends
+/// `"5m"` or `"1h"`; anything else is unknown, so the caller keeps what it had
+/// rather than guessing a tier.
+fn parse_cache_ttl(ttl: &str) -> Option<i64> {
+    match ttl {
+        "5m" => Some(300),
+        "1h" => Some(3600),
+        _ => None,
+    }
+}
+
 fn resolve_effort(input: &Value, config_dir: &str) -> String {
     if let Some(s) = input.pointer("/effort/level").and_then(|v| v.as_str())
         && !s.is_empty()
@@ -678,24 +736,6 @@ fn resolve_effort(input: &Value, config_dir: &str) -> String {
         return level.to_string();
     }
     "medium".to_string()
-}
-
-fn cli_version_cached() -> Option<String> {
-    let path = cache::cache_dir().join("statusline-cli-version");
-    if let Some(s) = cache::read_if_fresh(&path, Duration::from_secs(3600)) {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    let out = Command::new("claude").arg("--version").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let version = text.split_whitespace().next()?.to_string();
-    let _ = cache::write_atomic(&path, &version);
-    Some(version)
 }
 
 fn update_check_line() -> Option<String> {
@@ -738,6 +778,132 @@ fn version_gt(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use config::{Align, Dest, Element, Routing};
+    use serde_json::json;
+
+    #[test]
+    fn parse_cache_ttl_maps_known_tiers() {
+        assert_eq!(parse_cache_ttl("5m"), Some(300));
+        assert_eq!(parse_cache_ttl("1h"), Some(3600));
+    }
+
+    #[test]
+    fn parse_cache_ttl_rejects_unknown_strings() {
+        for bad in ["", "10m", "2h", "1H", " 1h", "300", "null"] {
+            assert_eq!(parse_cache_ttl(bad), None, "{bad:?} should be unknown");
+        }
+    }
+
+    #[test]
+    fn context_snapshot_full_payload_sums_current_usage() {
+        let input = json!({"context_window": {
+            "context_window_size": 200000,
+            "used_percentage": 8,
+            "current_usage": {
+                "input_tokens": 8500,
+                "output_tokens": 1200,
+                "cache_creation_input_tokens": 5000,
+                "cache_read_input_tokens": 2000
+            }
+        }});
+        let c = context_snapshot(&input);
+        // Output tokens are excluded, matching Claude Code's own percentage.
+        assert_eq!(c.used_tokens, 15_500);
+        assert_eq!(c.size, 200_000);
+        assert_eq!(c.pct_used, 8);
+    }
+
+    #[test]
+    fn context_snapshot_rounds_reported_percentage() {
+        let input = json!({"context_window": {
+            "context_window_size": 200000,
+            "used_percentage": 41.6,
+            "current_usage": {"input_tokens": 1}
+        }});
+        assert_eq!(context_snapshot(&input).pct_used, 42);
+    }
+
+    #[test]
+    fn context_snapshot_null_usage_derives_tokens_from_percentage() {
+        // Right after /compact: no current_usage, but a percentage.
+        let input = json!({"context_window": {
+            "context_window_size": 200000,
+            "used_percentage": 41.2,
+            "current_usage": null
+        }});
+        let c = context_snapshot(&input);
+        assert_eq!(c.pct_used, 41);
+        assert_eq!(c.used_tokens, 82_000);
+        assert_eq!(c.size, 200_000);
+    }
+
+    #[test]
+    fn context_snapshot_without_percentage_computes_from_usage() {
+        // Older CLI: no used_percentage, only current_usage.
+        let input = json!({"context_window": {
+            "context_window_size": 1000000,
+            "used_percentage": null,
+            "current_usage": {
+                "input_tokens": 100000,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 150000
+            }
+        }});
+        let c = context_snapshot(&input);
+        assert_eq!(c.used_tokens, 250_000);
+        assert_eq!(c.pct_used, 25);
+        assert_eq!(c.size, 1_000_000);
+    }
+
+    #[test]
+    fn context_snapshot_with_neither_is_zero() {
+        for input in [
+            json!({}),
+            json!({"context_window": {"current_usage": null, "used_percentage": null}}),
+        ] {
+            let c = context_snapshot(&input);
+            assert_eq!(c.used_tokens, 0);
+            assert_eq!(c.pct_used, 0);
+            assert_eq!(c.size, 200_000);
+        }
+    }
+
+    #[test]
+    fn context_snapshot_zero_size_uses_default() {
+        let input = json!({"context_window": {
+            "context_window_size": 0,
+            "current_usage": {"input_tokens": 50000}
+        }});
+        let c = context_snapshot(&input);
+        assert_eq!(c.size, 200_000);
+        assert_eq!(c.pct_used, 25);
+        assert_eq!(c.used_tokens, 50_000);
+    }
+
+    #[test]
+    fn context_snapshot_clamps_percentage_to_100() {
+        let input = json!({"context_window": {
+            "context_window_size": 1000,
+            "current_usage": {"input_tokens": 5000}
+        }});
+        assert_eq!(context_snapshot(&input).pct_used, 100);
+        let input = json!({"context_window": {"used_percentage": 130.0}});
+        assert_eq!(context_snapshot(&input).pct_used, 100);
+    }
+
+    #[test]
+    fn cache_hit_pct_is_last_call_share() {
+        let usage = json!({"current_usage": {
+            "input_tokens": 100, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 300
+        }});
+        let input = json!({"prompt_cache": {"hit_ratio": 0.93}, "context_window": usage});
+        // The session-wide hit_ratio is ignored; only the last call counts.
+        assert_eq!(cache_hit_pct(&input), 60);
+        assert_eq!(
+            cache_hit_pct(&json!({"context_window": {"current_usage": null}})),
+            0
+        );
+        assert_eq!(cache_hit_pct(&json!({})), 0);
+    }
 
     #[test]
     fn line_left_only_is_unpadded() {
