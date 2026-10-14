@@ -20,6 +20,7 @@ mod render;
 mod render_tmux;
 mod server_dir;
 mod state;
+mod subagents;
 mod surface;
 mod term;
 mod tmux;
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
     let cfg = match cli::parse_args(env::args().skip(1)) {
         ParseOutcome::Run(c) => c,
         ParseOutcome::Hook(kind) => return hooks::run(kind),
+        ParseOutcome::Subagents => return subagents::run(),
         ParseOutcome::Handler(session) => return daemon::run(session),
         ParseOutcome::TmuxReset => {
             tmux::reset(&tmux::CliTmux);

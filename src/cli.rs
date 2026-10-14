@@ -45,6 +45,10 @@ pub enum ParseOutcome {
     /// daemon is running.
     TmuxReset,
     Install,
+    /// Render subagent rows for Claude Code's `subagentStatusLine` command:
+    /// one JSON object of tasks on stdin, one `{"id","content"}` line per row
+    /// on stdout.
+    Subagents,
     /// Run the singleton direct-terminal title daemon (Ghostty/iTerm2/
     /// Terminal.app). Spawned on demand by the registrar; not meant to be run
     /// by hand.
@@ -81,6 +85,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--updates" => cfg.updates = true,
             "--no-updates" => cfg.updates = false,
             "--install" => return ParseOutcome::Install,
+            "--subagents" => return ParseOutcome::Subagents,
             "--session" => match iter.next() {
                 Some(s) if !s.is_empty() => return ParseOutcome::Handler(s),
                 _ => return ParseOutcome::Error("--session requires a tmux session id".into()),
@@ -141,9 +146,12 @@ Options:
   log               Follow the backend daemon logs live (tmux handlers and
                     the direct-terminal daemon), merged and tagged by source.
   --install         Wire this binary into ~/.claude/settings.json
-                    (statusLine + activity hooks) and exit
+                    (statusLine, subagentStatusLine + activity hooks) and exit
   --hook <kind>     Run as a Claude Code hook (kinds: stop,
                     user-prompt-submit, notification, post-tool-use)
+  --subagents       Render the subagent panel rows: reads Claude's
+                    subagentStatusLine JSON from stdin, prints one
+                    {\"id\",\"content\"} line per row. Set by --install.
   --session <id>    Run the per-session control-mode handler for tmux
                     session <id>. Spawned automatically by the registrar;
                     not meant to be run by hand.

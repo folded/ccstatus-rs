@@ -20,9 +20,13 @@ that's on `PATH`). The second writes `statusLine.command` plus the `Stop` and
 `UserPromptSubmit` hooks into `~/.claude/settings.json` (respecting
 `$CLAUDE_CONFIG_DIR`), preserving any other keys already in the file. The hooks
 feed the per-session state that `ccstatus top` and the tmux warmth indicator
-read; they leave any non-`ccstatus` hooks you've configured untouched.
-Re-running `ccstatus --install` after an upgrade refreshes the path; it refuses
-to clobber a `statusLine` set to a non-`ccstatus` command.
+read; they leave any non-`ccstatus` hooks you've configured untouched. It also
+wires `subagentStatusLine` to `ccstatus --subagents`, which renders the rows of
+the subagent panel below the prompt (name, progress label, tokens against the
+context window, a token sparkline, elapsed time).
+Re-running `ccstatus --install` after an upgrade refreshes the paths; it refuses
+to clobber a `statusLine` or `subagentStatusLine` set to a non-`ccstatus`
+command.
 
 To customise which blocks render, edit `statusLine.command` in
 `settings.json` afterwards:
@@ -48,6 +52,9 @@ To customise which blocks render, edit `statusLine.command` in
 --no-heatmap      Hide the per-day token-usage heatmap rows
 --updates         Check for newer ccstatus releases (off by default)
 --install         Wire this binary into ~/.claude/settings.json and exit
+--subagents       Render the subagent panel rows: reads Claude's
+                  subagentStatusLine JSON on stdin, prints one
+                  {"id","content"} line per row (set up by --install)
 -h, --help        Show help
 -V, --version     Show version
 ```

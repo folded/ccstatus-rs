@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -33,17 +33,7 @@ pub fn run() -> Result<(), String> {
         return Err(format!("{} is not a JSON object", settings_path.display()));
     }
 
-    if let Some(existing) = settings
-        .get("statusLine")
-        .and_then(|v| v.get("command"))
-        .and_then(|v| v.as_str())
-        && !existing.contains("ccstatus")
-    {
-        return Err(format!(
-            "{} already configures statusLine.command = {existing:?}; remove or edit it by hand before re-running --install",
-            settings_path.display()
-        ));
-    }
+    refuse_foreign_command(&settings, "statusLine", &settings_path)?;
 
     // refreshInterval re-runs the command every N seconds on top of
     // event-driven renders, so the live `warmth` indicator (and clock-like
@@ -54,6 +44,11 @@ pub fn run() -> Result<(), String> {
         "command": exe_str,
         "refreshInterval": 60,
     });
+
+    // The subagent panel rows, same overwrite-or-refuse policy as statusLine.
+    // Nothing is written until the end of `run`, so a refusal here leaves the
+    // file untouched.
+    wire_subagent_status_line(&mut settings, exe_str, &settings_path)?;
 
     // Wire the hooks that feed per-session activity in `ccstatus top`: Stop
     // (turn finished → waiting), UserPromptSubmit (turn started → working),
@@ -75,7 +70,7 @@ pub fn run() -> Result<(), String> {
         .map_err(|e| format!("writing {}: {e}", settings_path.display()))?;
 
     println!(
-        "ccstatus: wired statusLine.command + activity hooks -> {exe_str} in {}",
+        "ccstatus: wired statusLine.command + subagentStatusLine.command + activity hooks -> {exe_str} in {}",
         settings_path.display()
     );
 
@@ -90,6 +85,39 @@ pub fn run() -> Result<(), String> {
     if let Some(note) = jump_note() {
         println!("{note}");
     }
+    Ok(())
+}
+
+/// Error out when `settings.<key>.command` is set to something that isn't
+/// ccstatus, so `--install` never clobbers a status line the user wrote by
+/// hand. An absent key, or one with no string command, passes.
+fn refuse_foreign_command(settings: &Value, key: &str, settings_path: &Path) -> Result<(), String> {
+    if let Some(existing) = settings
+        .get(key)
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_str())
+        && !existing.contains("ccstatus")
+    {
+        return Err(format!(
+            "{} already configures {key}.command = {existing:?}; remove or edit it by hand before re-running --install",
+            settings_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Point `settings.subagentStatusLine` at `<exe> --subagents`, overwriting an
+/// absent or ccstatus-owned entry and refusing a foreign one.
+fn wire_subagent_status_line(
+    settings: &mut Value,
+    exe_str: &str,
+    settings_path: &Path,
+) -> Result<(), String> {
+    refuse_foreign_command(settings, "subagentStatusLine", settings_path)?;
+    settings["subagentStatusLine"] = json!({
+        "type": "command",
+        "command": format!("{exe_str} --subagents"),
+    });
     Ok(())
 }
 
@@ -199,6 +227,42 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn subagent_command(settings: &Value) -> Option<&str> {
+        settings["subagentStatusLine"]["command"].as_str()
+    }
+
+    #[test]
+    fn subagent_status_line_is_added_when_absent() {
+        let mut s = json!({ "model": "opus" });
+        wire_subagent_status_line(&mut s, "/bin/ccstatus", Path::new("settings.json")).unwrap();
+        assert_eq!(subagent_command(&s), Some("/bin/ccstatus --subagents"));
+        assert_eq!(s["subagentStatusLine"]["type"], json!("command"));
+        // other keys are left alone.
+        assert_eq!(s["model"], json!("opus"));
+    }
+
+    #[test]
+    fn subagent_status_line_is_overwritten_when_ccstatus_owns_it() {
+        let mut s = json!({
+            "subagentStatusLine": { "type": "command", "command": "/old/ccstatus --subagents" }
+        });
+        wire_subagent_status_line(&mut s, "/new/ccstatus", Path::new("settings.json")).unwrap();
+        assert_eq!(subagent_command(&s), Some("/new/ccstatus --subagents"));
+    }
+
+    #[test]
+    fn subagent_status_line_refuses_a_foreign_command() {
+        let mut s = json!({
+            "subagentStatusLine": { "type": "command", "command": "~/.claude/mine.sh" }
+        });
+        let err = wire_subagent_status_line(&mut s, "/bin/ccstatus", Path::new("settings.json"))
+            .unwrap_err();
+        assert!(err.contains("subagentStatusLine.command"));
+        assert!(err.contains("~/.claude/mine.sh"));
+        // untouched.
+        assert_eq!(subagent_command(&s), Some("~/.claude/mine.sh"));
     }
 
     #[test]

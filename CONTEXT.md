@@ -16,6 +16,11 @@ nouns below are specific to ccstatus.
   `%exit` (session killed) or after an idle grace with no Claude panes.
 - **hook** — `ccstatus --hook stop` (`hooks.rs`). Updates per-session
   **state** (last turn timestamp, model) on Claude's Stop event.
+- **subagents** — `ccstatus --subagents` (`subagents.rs`). Claude Code's
+  `subagentStatusLine.command`: reads the visible subagent rows as one JSON
+  object, prints one `{"id","content"}` line per row to override. Stateless;
+  `render_rows` is the pure core. Any bad input prints nothing, so Claude
+  keeps its default rows.
 - **top** — `ccstatus top` (`top.rs`). An interactive aggregate surface over
   **all** live Claude sessions (not one tmux session): reads the **fleet**,
   renders a table, and **jumps** to a selected session. Pull-based — it needs
